@@ -6,6 +6,25 @@ import re
 from io import BytesIO
 from datetime import datetime
 
+from io import BytesIO
+
+def df_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+def dfs_to_xlsx_bytes(dfs: dict):
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for name, d in dfs.items():
+            d.to_excel(writer, sheet_name=name[:31], index=False)
+    bio.seek(0)
+    return bio.getvalue()
+
+# one-time init of session keys
+for k in ["full_export_df", "pos_update_df", "gs1_df", "unmatched_df", "ts"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+
 st.set_page_config(page_title="Unified → POS Processor", page_icon="🧾", layout="wide")
 
 IGNORE_UPCS = set(["000000000000", "003760010302", "023700052551"])
@@ -184,22 +203,64 @@ st.caption("Upload Unified invoice(s) + POS CSV to generate POS updates, full ex
 pos_file = st.file_uploader("Upload POS pricebook CSV", type=["csv"], accept_multiple_files=False, key="pos")
 inv_files = st.file_uploader("Upload Unified invoice file(s) (XLSX/XLS/CSV)", type=["xlsx","xls","csv"], accept_multiple_files=True, key="inv")
 
-if st.button("Process", type="primary") and pos_file and inv_files:
-    with st.spinner("Processing…"):
-        full_export_df, pos_update_df, gs1_out, unmatched = process(pos_file, inv_files)
-    st.success(f"Done! FULL rows: {len(full_export_df)}  |  Only-changed: {len(pos_update_df)}  |  Unmatched: {len(unmatched)}")
+process_clicked = st.button("Process", type="primary")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button("⬇️ POS Update (only changed) — CSV", df_to_csv_bytes(pos_update_df), f"POS_Update_OnlyChanged_{ts}.csv", "text/csv")
-    st.download_button("⬇️ FULL Export (all matched) — CSV", df_to_csv_bytes(full_export_df), f"POS_Full_AllItems_{ts}.csv", "text/csv")
-    audit_xlsx = df_to_xlsx_bytes({"Changes Only": pos_update_df, "Goal Sheet 1": gs1_out, "Unmatched": unmatched})
-    st.download_button("⬇️ Audit Workbook (xlsx)", audit_xlsx, f"Unified_Audit_{ts}_with_GoalSheet1.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if process_clicked:
+    if not pos_file or not inv_files:
+        st.warning("Upload a POS CSV and at least one Unified invoice file.")
+    else:
+        with st.spinner("Processing…"):
+            results = process(pos_file, inv_files)
+            full_export_df, pos_update_df, gs1_out, unmatched = results[:4]
+
+        # persist results across reruns
+        st.session_state["full_export_df"] = full_export_df
+        st.session_state["pos_update_df"]  = pos_update_df
+        st.session_state["gs1_df"]         = gs1_out
+        st.session_state["unmatched_df"]   = unmatched
+        st.session_state["ts"]             = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        st.success(f"Done! FULL rows: {len(full_export_df)}  |  Only-changed: {len(pos_update_df)}  |  Unmatched: {len(unmatched)}")
+
+# show downloads if results exist; otherwise show a gentle prompt
+if st.session_state.get("full_export_df") is not None:
+    ts = st.session_state["ts"]
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button(
+            "⬇️ POS Update (only changed) — CSV",
+            data=df_to_csv_bytes(st.session_state["pos_update_df"]),
+            file_name=f"POS_Update_OnlyChanged_{ts}.csv",
+            mime="text/csv",
+            key="dl_changed_csv",
+        )
+    with col2:
+        st.download_button(
+            "⬇️ FULL Export (all matched) — CSV",
+            data=df_to_csv_bytes(st.session_state["full_export_df"]),
+            file_name=f"POS_Full_AllItems_{ts}.csv",
+            mime="text/csv",
+            key="dl_full_csv",
+        )
+    with col3:
+        st.download_button(
+            "⬇️ Audit Workbook (xlsx)",
+            data=dfs_to_xlsx_bytes({
+                "Changes Only": st.session_state["pos_update_df"],
+                "Goal Sheet 1": st.session_state["gs1_df"],
+                "Unmatched":    st.session_state["unmatched_df"],
+            }),
+            file_name=f"Unified_Audit_{ts}_with_GoalSheet1.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_audit_xlsx",
+        )
 
     st.subheader("Preview — FULL Export (first 200)")
-    st.dataframe(full_export_df.head(200))
+    st.dataframe(st.session_state["full_export_df"].head(200), use_container_width=True)
     st.subheader("Preview — Goal Sheet 1 (first 100)")
-    st.dataframe(gs1_out.head(100))
+    st.dataframe(st.session_state["gs1_df"].head(100), use_container_width=True)
     st.subheader("Unmatched (first 200)")
-    st.dataframe(unmatched.head(200))
+    st.dataframe(st.session_state["unmatched_df"].head(200), use_container_width=True)
 else:
-    st.info("Upload POS CSV and at least one Unified invoice file, then click **Process**.")
+    st.info("Upload a POS CSV and at least one Unified invoice file, then click **Process**.")
