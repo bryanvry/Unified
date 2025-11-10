@@ -1,11 +1,13 @@
 # parsers/nevada_beverage.py
-# Nevada Beverage PDF-only parser with robust UPC extraction
-# and explicit preference for D.PRICE (unit price) over EXT and DEP=0.00.
+# Nevada Beverage PDF-only parser with:
+#  • Robust UPC extraction (prevents glued digits)
+#  • Unit price (D.PRICE) selection over EXT and DEP=0.00
+#  • Out-of-Stock detection (OOS/O.S./OUT OF STOCK/NO SHIP/BACK ORDER) → Cases=0 (excluded)
 #
-# Stages:
+# Pipeline:
 #   1) Tables via pdfplumber.extract_tables()
 #   2) Word-grid reconstruction (header-detected column bucketing)
-#   3) Text/regex sweep per line (with unit-price logic)
+#   3) Text/regex sweep per line (with unit-price logic + OOS detection)
 #
 # Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
 
@@ -84,13 +86,38 @@ class NevadaBeverageParser:
     def _canon(s: str) -> str:
         return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
 
+    # ----------------- OOS detection -----------------
+    @staticmethod
+    def _is_oos(text: str) -> bool:
+        """
+        Detect out-of-stock markers commonly seen on NV PDFs.
+        Examples matched (case-insensitive, flexible spacing/punct):
+          - OUT OF STOCK, OUT-OF-STOCK, OUTOFSTOCK
+          - O/S, O. S., O S
+          - OOS
+          - NO SHIP, NO-SHIP, NOSHIP
+          - BACK ORDER, BACKORDER, BACK-ORDER, BACK ORDERED
+        """
+        if not text:
+            return False
+        t = text.lower()
+        patterns = [
+            r"out\s*[- ]?\s*of\s*[- ]?\s*stock",
+            r"\bo\s*/\s*s\b",          # O/S or O / S
+            r"\boos\b",                # OOS
+            r"\bno\s*[- ]?\s*ship\b",  # NO SHIP
+            r"back\s*[- ]?\s*order",   # BACK ORDER / BACK-ORDER / BACKORDER / BACK ORDERED
+            r"back\s*[- ]?\s*ordered",
+        ]
+        return any(re.search(p, t) for p in patterns)
+
     # ----------------- price selection -----------------
     def _select_unit_price(self, prices: List[float], qty: int) -> Optional[float]:
         """
         Given all price-like tokens on a line and the parsed qty:
           - Drop zeros/near-zeros (< _MIN_PRICE).
           - If multiple remain, prefer the smallest (likely unit D.PRICE).
-          - If both small and large and large ≈ small * qty, pick small.
+          - If we have both small and large and large ≈ small * qty, pick small.
         """
         vals = [p for p in prices if (not np.isnan(p)) and (p >= self._MIN_PRICE)]
         if not vals:
@@ -179,11 +206,17 @@ class NevadaBeverageParser:
                         name    = r.get(colmap["DESCRIPTION"], "")
                         price   = r.get(colmap["D.PRICE"], "")
                         qty     = r.get(colmap["QTY"], "")
+                        # gather row text for OOS check
+                        row_text = " ".join(str(x) for x in [qty, name, upc_raw, price] if pd.notna(x))
 
                         upc   = self._extract_upc_token(upc_raw)
                         cost  = self._to_float(price)
                         cases = self._to_int(qty)
                         name  = str(name).strip()
+
+                        # Out-of-stock override: zero cases if OOS marker appears anywhere in row
+                        if self._is_oos(row_text):
+                            cases = 0
 
                         if upc and not np.isnan(cost) and cost >= self._MIN_PRICE and cases > 0:
                             rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
@@ -278,14 +311,17 @@ class NevadaBeverageParser:
 
         rows = []
         for key in sorted(lines.keys()):
-            buck = self._bucket_line(lines[key], col_x)
+            line_words = lines[key]
+            buck = self._bucket_line(line_words, col_x)
             qty_txt   = buck.get("qty", "")
             desc_txt  = buck.get("desc", "")
             upc_txt   = buck.get("upc", "")
             price_txt = buck.get("price", "")
 
-            # If price bucket contains multiple tokens (e.g., "0.00 15.00 75.00"),
-            # choose unit (non-zero, smallest; check EXT ≈ unit*qty if both present).
+            # Build full-line text for OOS detection
+            full_line_text = " ".join([w["text"] for w in sorted(line_words, key=lambda x: x["x0"])])
+
+            # If price bucket mixes values (e.g., "0.00 15.00 75.00"), choose unit (non-zero, smallest)
             prices_in_bucket = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", price_txt or "")]
             qty_val = self._to_int(qty_txt)
 
@@ -304,11 +340,15 @@ class NevadaBeverageParser:
             # If bucket had no good price, try all prices on the line
             unit_price = self._select_unit_price(prices_in_bucket, qty_val)
             if unit_price is None:
-                all_prices = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", " ".join(buck.values()))]
+                all_prices = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", full_line_text)]
                 unit_price = self._select_unit_price(all_prices, qty_val)
 
             cases = qty_val
             name  = desc_txt.strip()
+
+            # Out-of-stock override
+            if self._is_oos(full_line_text):
+                cases = 0
 
             if upc and (unit_price is not None) and unit_price >= self._MIN_PRICE and cases > 0:
                 rows.append({"UPC": upc, "Item Name": name, "Cost": float(unit_price), "Cases": int(cases)})
@@ -341,12 +381,19 @@ class NevadaBeverageParser:
             if not upc:
                 continue
 
+            # OOS detection
+            if self._is_oos(line):
+                # Mark as zero-arrival -> exclude later
+                oos_cases = 0
+            else:
+                oos_cases = None  # not OOS
+
             # All price tokens on the line; ignore zeros
             price_matches = list(re.finditer(r"(\d+\.\d{2})", line))
             prices = [self._to_float(mm.group(1)) for mm in price_matches]
-            qty = None
 
             # Qty (use first small integer; refine using pos relative to UPC if needed)
+            qty = None
             ints = list(re.finditer(r"\b(\d{1,4})\b", line))
             if ints:
                 try:
@@ -377,7 +424,10 @@ class NevadaBeverageParser:
             if not desc:
                 desc = line[:upc_start].strip()
 
-            rows.append({"UPC": upc, "Item Name": desc, "Cost": float(unit_price), "Cases": int(qty), "_order": li})
+            cases = qty if (oos_cases is None) else 0
+
+            if cases > 0:
+                rows.append({"UPC": upc, "Item Name": desc, "Cost": float(unit_price), "Cases": int(cases), "_order": li})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
@@ -413,7 +463,7 @@ class NevadaBeverageParser:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
 
-                # Stage 3: text/regex sweep (with unit-price logic and zero filtering)
+                # Stage 3: text/regex sweep (with unit-price logic + OOS detection)
                 if items is None or items.empty:
                     rows = []
                     for page in pdf.pages:
@@ -433,6 +483,7 @@ class NevadaBeverageParser:
         items["Cost"] = pd.to_numeric(items["Cost"], errors="coerce")
         items["Cases"] = pd.to_numeric(items["Cases"], errors="coerce").fillna(0).astype(int)
 
+        # Keep only arrived items (Cases > 0) and valid costs
         items = items[(items["UPC"] != "") & items["Cost"].notna() & (items["Cost"] >= self._MIN_PRICE) & (items["Cases"] > 0)].copy()
         items.reset_index(drop=True, inplace=True)
         return items[self.WANT_COLS]
