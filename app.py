@@ -6,19 +6,18 @@ import re
 from io import BytesIO
 from datetime import datetime
 
-# ===== vendor parsers for SG & NV =====
+# ===== vendor parsers =====
+# Expect: parsers/__init__.py exposes SouthernGlazersParser, NevadaBeverageParser
 from parsers import SouthernGlazersParser, NevadaBeverageParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 
-# ===================== Constants / helpers =====================
-# Unified ignore list (your rule)
+# ---------------- shared helpers ----------------
 UNIFIED_IGNORE_UPCS = set(["000000000000", "003760010302", "023700052551"])
 
 def digits_only(s):
     return re.sub(r"\D", "", str(s)) if pd.notna(s) else ""
 
-# --- Unified’s UPC rule: rightmost 11 + computed check digit ---
 def upc_check_digit(core11: str) -> str:
     core11 = re.sub(r"\D","",core11).zfill(11)[:11]
     if len(core11) != 11:
@@ -110,13 +109,13 @@ def _resolve_col(df: pd.DataFrame, candidates, default_name):
     return default_name
 
 def _download_csv_with_upc_text(df: pd.DataFrame, filename: str, upc_col="UPC"):
-    # Force Excel to keep leading zeros by exporting UPC as ="001234..."
     df2 = df.copy()
     if upc_col in df2.columns:
+        # Force spreadsheet apps to treat UPC as text and keep leading zeros
         df2[upc_col] = df2[upc_col].astype(str).map(lambda x: f'="{x}"')
     st.download_button(f"⬇️ Download {filename}", df2.to_csv(index=False).encode("utf-8"), filename)
 
-# ===================== SG/NV shared helpers =====================
+# -------- SG/NV shared helpers --------
 def _ensure_invoice_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases"])
@@ -161,9 +160,12 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
     master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
     master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
 
-    invoice_unique = (invoice_df
+    # Group invoice rows by UPC (sum cases, keep last cost/name), preserve latest by natural order
+    invoice_unique = (
+        invoice_df
         .groupby("UPC", as_index=False)
-        .agg({"Item Name":"last","Cost":"last","Cases":"sum"}))
+        .agg({"Item Name":"last","Cost":"last","Cases":"sum"})
+    )
 
     inv_map = invoice_unique.set_index("UPC")[["Item Name","Cost","Cases"]].to_dict(orient="index")
     inv_upcs = set(invoice_unique["UPC"])
@@ -282,7 +284,7 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
 
     return pos_update.drop(columns=["__upc_norm"]), missing
 
-# ===================== Unified parsing (unchanged) =====================
+# ---------------- Unified functions ----------------
 def parse_unified(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
@@ -434,13 +436,11 @@ def process_unified(pos_csv_file, unified_files):
 
     return full_export_df, pos_update_df, gs1_out, unmatched
 
-# ===================== Session state =====================
-# Unified
+# ---------------- session state ----------------
 for k in ["full_export_df", "pos_update_df", "gs1_df", "unmatched_df", "ts"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
-# Southern Glazer's (persist)
 for k in [
     "sg_invoice_items_df", "sg_updated_master", "sg_cost_changes",
     "sg_not_in_master", "sg_pack_missing", "sg_pos_update", "sg_pb_missing", "sg_ts"
@@ -448,7 +448,6 @@ for k in [
     if k not in st.session_state:
         st.session_state[k] = None
 
-# Nevada Beverage (persist like SG)
 for k in [
     "nv_invoice_items_df", "nv_updated_master", "nv_cost_changes",
     "nv_not_in_master", "nv_pack_missing", "nv_pos_update", "nv_pb_missing", "nv_ts"
@@ -456,10 +455,10 @@ for k in [
     if k not in st.session_state:
         st.session_state[k] = None
 
-# ===================== UI: three tabs =====================
+# ---------------- UI ----------------
 tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage"])
 
-# ---------- Unified (SVMERCH) ----------
+# Unified tab
 with tabs[0]:
     st.title("🧾 Unified → POS Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
@@ -529,7 +528,7 @@ with tabs[0]:
     else:
         st.info("Upload a POS CSV and at least one Unified invoice file, then click **Process Unified**.")
 
-# ---------- Southern Glazer's ----------
+# Southern Glazer's tab
 with tabs[1]:
     st.title("Southern Glazer's Processor")
     inv_files = st.file_uploader("Upload SG invoice PDF(s) or CSV/XLSX", type=["pdf","csv","xlsx","xls"], accept_multiple_files=True, key="sg_inv")
@@ -655,30 +654,35 @@ with tabs[1]:
     else:
         st.info("Upload SG invoice(s) and Master, then click **Process SG**. Downloads will persist afterward.")
 
-# ---------- Nevada Beverage ----------
+# Nevada Beverage tab (NOW PDF or CSV)
 with tabs[2]:
     st.title("Nevada Beverage Processor")
-    # CSV ONLY per your new approach; semicolon-delimited
-    inv_files_nv = st.file_uploader("Upload NV invoice CSV file(s) (semicolon ';' separated)", type=["csv"], accept_multiple_files=True, key="nv_inv")
+    st.caption("Prefer the original PDF if their CSV UPCs look wrong — this tab accepts either.")
+    inv_files_nv = st.file_uploader(
+        "Upload NV invoice PDF(s) or CSV file(s) (semicolon ';' or comma)",
+        type=["pdf","csv"],
+        accept_multiple_files=True,
+        key="nv_inv"
+    )
     master_xlsx_nv = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="nv_master")
     pricebook_csv_nv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="nv_pb")
 
     if st.button("Process NV", type="primary"):
         if not inv_files_nv or not master_xlsx_nv:
-            st.error("Please upload at least one NV CSV and the Master workbook.")
+            st.error("Please upload at least one NV PDF/CSV and the Master workbook.")
         else:
             nv_parser = NevadaBeverageParser()
             parts_nv = []
             for f in inv_files_nv:
                 f.seek(0)
                 df = nv_parser.parse(f)
-                if not df.empty:
+                if df is not None and not df.empty:
                     parts_nv.append(df)
             invoice_items_nv = pd.concat(parts_nv, ignore_index=True) if parts_nv else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
             invoice_items_nv = _ensure_invoice_cols(invoice_items_nv)
 
             if invoice_items_nv.empty:
-                st.error("Could not parse any NV items (no UPC/Item Name/Cost/Cases).")
+                st.error("Could not parse any NV items (no UPC/Item Name/Cost/Cases). If you uploaded CSV, try the PDF.")
             else:
                 updated_master_nv, cost_changes_nv, not_in_master_nv, pack_missing_nv, invoice_unique_nv = _update_master_from_invoice(master_xlsx_nv, invoice_items_nv)
                 pos_update_nv = None
@@ -686,7 +690,6 @@ with tabs[2]:
                 if pricebook_csv_nv is not None and updated_master_nv is not None:
                     pos_update_nv, pb_missing_nv = _build_pricebook_update(pricebook_csv_nv, updated_master_nv)
 
-                # Persist like SG
                 st.session_state["nv_invoice_items_df"] = invoice_items_nv
                 st.session_state["nv_updated_master"]   = updated_master_nv
                 st.session_state["nv_cost_changes"]     = cost_changes_nv
@@ -704,7 +707,6 @@ with tabs[2]:
         st.subheader("Invoice Items (parsed, in-invoice order)")
         st.dataframe(st.session_state["nv_invoice_items_df"].head(100), use_container_width=True)
 
-        # Download: Invoice Items CSV (keep leading zeros in Excel)
         inv_items_df = st.session_state["nv_invoice_items_df"].copy()
         if "UPC" in inv_items_df.columns:
             inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
@@ -782,4 +784,4 @@ with tabs[2]:
                 key="nv_dl_pb_missing"
             )
     else:
-        st.info("Upload NV CSV and Master, then click **Process NV**. Downloads will persist afterward.")
+        st.info("Upload NV PDF/CSV and Master, then click **Process NV**. Downloads will persist afterward.")
