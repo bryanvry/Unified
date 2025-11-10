@@ -1,8 +1,9 @@
 # parsers/nevada_beverage.py
-# Nevada Beverage PDF-only parser with 3-stage extraction:
-# 1) Table extraction via pdfplumber.extract_tables()
-# 2) Word-grid reconstruction (header-detected column bucketing)
-# 3) Text/regex line sweep (no table required)
+# Nevada Beverage PDF-only parser with robust UPC extraction.
+# 3-stage pipeline:
+#  1) Tables via pdfplumber.extract_tables()
+#  2) Word-grid reconstruction (header-based column bucketing)
+#  3) Text/regex sweep per line
 #
 # Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
 
@@ -26,11 +27,39 @@ class NevadaBeverageParser:
         return re.sub(r"\D", "", str(s)) if s is not None else ""
 
     @classmethod
-    def _norm_upc_12(cls, s: str) -> str:
-        d = cls._digits_only(s)
-        if len(d) > 12:
-            d = d[-12:]
-        return d.zfill(12)
+    def _extract_upc_token(cls, s: str) -> str:
+        """
+        Find a 12–13 digit token *bounded by non-digits* (prevents gluing qty/price).
+        Rules:
+          - If 13 digits and starts with '0' (EAN-13 wrapper), return last 12 (UPC-A).
+          - Else if 13 digits and doesn't start with '0', return first 12.
+          - If 12 digits, return as-is.
+          - Otherwise return "".
+        """
+        if not s:
+            return ""
+        text = str(s)
+
+        # Look for a clean 12/13-digit token bounded by non-digits
+        m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", text)
+        if not m:
+            # lenient rescue: take the first 12+ digit run but stop before spaces/dots
+            m = re.search(r"(\d{10,})", text)
+            if not m:
+                return ""
+            run = m.group(1)
+        else:
+            run = m.group(1)
+
+        # Now normalize that run to 12 digits safely
+        if len(run) == 12:
+            return run
+        if len(run) == 13:
+            if run.startswith("0"):
+                return run[1:]      # last 12 is correct UPC-A when leading EAN '0'
+            return run[:12]         # otherwise take the first 12, avoid trailing qty/price
+        # If someone gave a longer blob, prefer the first 12 to avoid glue-at-end
+        return run[:12]
 
     @staticmethod
     def _to_float(x):
@@ -38,8 +67,7 @@ class NevadaBeverageParser:
             return np.nan
         if isinstance(x, (int, float, np.number)):
             return float(x)
-        s = str(x)
-        s = s.replace("$", "").replace(",", "").strip()
+        s = str(x).replace("$", "").replace(",", "").strip()
         s = re.sub(r"[^\d.\-]", "", s)
         try:
             return float(s)
@@ -76,8 +104,8 @@ class NevadaBeverageParser:
         col_qty   = pick("QTY", "Qty", "Quantity")
         col_desc  = pick("DESCRIPTION", "Description", "Item Description", "Desc")
         col_upc   = pick("U.P.C.", "UPC", "U P C", "U.P.C")
-        # Price header varies a LOT on NV: D.PRICE, D PRICE, PRICE, UNIT PRICE, D-PRICE, DPRC
-        col_price = pick("D.PRICE", "DPRICE", "D PRICE", "PRICE", "UNITPRICE", "UNIT PRICE", "D-PRICE", "DPRC", "PRC")
+        # Price header varies a LOT on NV PDFs
+        col_price = pick("D.PRICE", "D PRICE", "DPRICE", "PRICE", "UNITPRICE", "UNIT PRICE", "D-PRICE", "DPRC", "PRC")
 
         if all([col_qty, col_desc, col_upc, col_price]):
             return {
@@ -92,18 +120,15 @@ class NevadaBeverageParser:
     def _parse_pdf_tables(self, pdf: "pdfplumber.PDF") -> pd.DataFrame:
         rows = []
 
-        table_settings = {
-            "vertical_strategy": "lines",    # try lines first
-            "horizontal_strategy": "lines",
-            "intersection_tolerance": 5,
-            "snap_tolerance": 3,
-            "join_tolerance": 3,
-            "edge_min_length": 3,
-        }
+        table_settings_list = [
+            # prefer line-based first
+            {"vertical_strategy": "lines", "horizontal_strategy": "lines", "intersection_tolerance": 5, "snap_tolerance": 3, "join_tolerance": 3, "edge_min_length": 3},
+            # then text-based
+            {"vertical_strategy": "text", "horizontal_strategy": "text"},
+        ]
 
         for page in pdf.pages:
-            # fallback with 'text' strategies if line-based fails
-            for settings in (table_settings, {"vertical_strategy": "text", "horizontal_strategy": "text"}):
+            for settings in table_settings_list:
                 try:
                     tables = page.extract_tables(table_settings=settings)
                 except Exception:
@@ -111,7 +136,8 @@ class NevadaBeverageParser:
                 for tbl in tables or []:
                     if not tbl or len(tbl) < 2:
                         continue
-                    # find plausible header
+
+                    # plausible header in first few rows
                     header = None
                     header_idx = 0
                     for i, row in enumerate(tbl[:6]):
@@ -121,29 +147,30 @@ class NevadaBeverageParser:
                             break
                     if header is None:
                         continue
+
                     colmap = self._match_header(header)
                     if not colmap:
                         continue
+
                     body = tbl[header_idx + 1 :]
                     if not body:
                         continue
+
                     df = pd.DataFrame(body, columns=header)
+
                     for _, r in df.iterrows():
                         upc_raw = r.get(colmap["U.P.C."], "")
                         name    = r.get(colmap["DESCRIPTION"], "")
                         price   = r.get(colmap["D.PRICE"], "")
                         qty     = r.get(colmap["QTY"], "")
-                        upc   = self._norm_upc_12(upc_raw)
+
+                        upc   = self._extract_upc_token(upc_raw)
                         cost  = self._to_float(price)
                         cases = self._to_int(qty)
                         name  = str(name).strip()
+
                         if upc and not np.isnan(cost) and cases > 0:
-                            rows.append({
-                                "UPC": upc,
-                                "Item Name": name,
-                                "Cost": float(cost),
-                                "Cases": int(cases),
-                            })
+                            rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
@@ -178,13 +205,11 @@ class NevadaBeverageParser:
         header_words = sorted(lines[header_key], key=lambda x: x["x0"])
 
         def nearest_xcenter(*aliases):
-            # exact/contains search
             for target in aliases:
                 tgt = self._canon(target)
                 for w in header_words:
                     if tgt in self._canon(w["text"]):
                         return (w["x0"] + w["x1"]) / 2.0
-            # fallback: median
             if header_words:
                 return float(np.median([(w["x0"] + w["x1"]) / 2.0 for w in header_words]))
             return None
@@ -243,23 +268,23 @@ class NevadaBeverageParser:
             upc_txt   = buck.get("upc", "")
             price_txt = buck.get("price", "")
 
+            # Rescue UPC if shoved into desc
             if not upc_txt and re.search(r"\d", desc_txt or ""):
-                m = re.search(r"(\d[\d\-\s]{8,})$", desc_txt)
+                m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", desc_txt)
                 if m:
                     upc_txt = m.group(1)
+                else:
+                    m2 = re.search(r"(\d{10,})", desc_txt)
+                    if m2:
+                        upc_txt = m2.group(1)
 
-            upc   = self._norm_upc_12(upc_txt)
+            upc   = self._extract_upc_token(upc_txt)
             cases = self._to_int(qty_txt)
             cost  = self._to_float(price_txt)
             name  = desc_txt.strip()
 
             if upc and not np.isnan(cost) and cases > 0:
-                rows.append({
-                    "UPC": upc,
-                    "Item Name": name,
-                    "Cost": float(cost),
-                    "Cases": int(cases),
-                })
+                rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
@@ -267,103 +292,79 @@ class NevadaBeverageParser:
 
     # ----------------- Stage 3: text/regex sweep -----------------
     def _parse_text_regex(self, page) -> pd.DataFrame:
-        """
-        Last-resort: use extract_text() and heuristics per line.
-        Strategy:
-          - Find a 10–14 digit UPC chunk on the line.
-          - Find a price-like token (last decimal with 2 digits).
-          - Find an integer QTY near the start or just before/after price.
-          - Description is what's between qty and UPC (or start .. UPC).
-        """
         txt = page.extract_text() or ""
         if not txt.strip():
             return pd.DataFrame(columns=self.WANT_COLS)
 
         rows = []
-        for li, line in enumerate(txt.splitlines()):
-            raw = line.strip()
-            if len(raw) < 6:
+        for li, raw in enumerate(txt.splitlines()):
+            line = raw.strip()
+            if len(line) < 6:
                 continue
 
-            # find UPC candidate
-            upc_match = re.search(r"(\d[\d\-\s]{10,})", raw)
-            if not upc_match:
-                continue
-            upc_raw = upc_match.group(1)
-            upc = self._norm_upc_12(upc_raw)
+            # UPC token
+            upc = ""
+            m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", line)
+            if m:
+                upc = self._extract_upc_token(m.group(1))
+            else:
+                m2 = re.search(r"(\d{10,})", line)
+                if m2:
+                    upc = self._extract_upc_token(m2.group(1))
             if not upc:
                 continue
 
-            # find a price (prefer the last price token)
-            price_matches = list(re.finditer(r"(\d+\.\d{2})", raw))
+            # Price (last 2-decimal token)
+            price_matches = list(re.finditer(r"(\d+\.\d{2})", line))
             if not price_matches:
                 continue
             price = self._to_float(price_matches[-1].group(1))
             if np.isnan(price):
                 continue
 
-            # find qty: first integer token, or nearest integer to price/UPC
-            int_tokens = list(re.finditer(r"\b(\d{1,4})\b", raw))
+            # Qty (prefer the first small integer on the line or last int before UPC)
             qty = None
-            if int_tokens:
+            ints = list(re.finditer(r"\b(\d{1,4})\b", line))
+            if ints:
                 try:
-                    qty = int(int_tokens[0].group(1))
+                    qty = int(ints[0].group(1))
                 except Exception:
                     qty = None
-
-            # refine qty: prefer integer appearing before description/UPC if plausible
-            if qty is None or qty == 0:
-                # try token before UPC
-                prev = raw[:upc_match.start()]
-                m2 = list(re.finditer(r"\b(\d{1,4})\b", prev))
-                if m2:
+            if (qty is None or qty <= 0):
+                left = line[:m.start()] if 'm' in locals() and m else line
+                ints2 = list(re.finditer(r"\b(\d{1,4})\b", left))
+                if ints2:
                     try:
-                        qty = int(m2[-1].group(1))
+                        qty = int(ints2[-1].group(1))
                     except Exception:
                         qty = None
-
             if qty is None or qty <= 0:
                 continue
 
-            # description: between first qty occurrence and UPC
-            desc = raw
-            # clip left at qty end
-            left_clip = 0
-            qm = re.search(r"\b" + re.escape(str(qty)) + r"\b", raw)
-            if qm:
-                left_clip = qm.end()
-            # description window
-            desc = raw[left_clip:upc_match.start()].strip()
-            # clean redundant spaces and trailing separators
-            desc = re.sub(r"\s{2,}", " ", desc)
-            desc = desc.strip(" -–—|;,")
-
-            # sometimes price sits before qty; if desc ended up empty, try between UPC and price
+            # Description between qty and UPC if possible
+            desc = line
+            if 'm' in locals() and m:
+                upc_start = m.start()
+            else:
+                upc_start = line.find(upc)
+            qm = re.search(r"\b" + re.escape(str(qty)) + r"\b", line)
+            left_clip = (qm.end() if qm else 0)
+            desc = line[left_clip:upc_start].strip()
+            desc = re.sub(r"\s{2,}", " ", desc).strip(" -–—|;,")
             if not desc:
-                desc = raw[:upc_match.start()].strip()
+                desc = line[:upc_start].strip()
 
             if desc and upc and not np.isnan(price) and qty > 0:
-                rows.append({
-                    "UPC": upc,
-                    "Item Name": desc,
-                    "Cost": float(price),
-                    "Cases": int(qty),
-                    "_order": (li)  # keep original line order
-                })
+                rows.append({"UPC": upc, "Item Name": desc, "Cost": float(price), "Cases": int(qty), "_order": li})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
 
-        out = pd.DataFrame(rows)
-        out = out.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        out = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
         return out[self.WANT_COLS]
 
     # ----------------- public API -----------------
     def parse(self, uploaded_file) -> pd.DataFrame:
-        """
-        PDF-only parser. Returns DataFrame with columns:
-        ["UPC", "Item Name", "Cost", "Cases"]
-        """
         if pdfplumber is None:
             return pd.DataFrame(columns=self.WANT_COLS)
 
@@ -380,8 +381,9 @@ class NevadaBeverageParser:
             with pdfplumber.open(uploaded_file) as pdf:
                 # Stage 1: table extraction
                 items = self._parse_pdf_tables(pdf)
+
+                # Stage 2: word-grid fallback
                 if items is None or items.empty:
-                    # Stage 2: word-grid per page
                     rows = []
                     for page in pdf.pages:
                         pg = self._parse_word_grid(page)
@@ -389,8 +391,8 @@ class NevadaBeverageParser:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
 
+                # Stage 3: text/regex sweep
                 if items is None or items.empty:
-                    # Stage 3: text/regex line sweep
                     rows = []
                     for page in pdf.pages:
                         pg = self._parse_text_regex(page)
@@ -403,9 +405,9 @@ class NevadaBeverageParser:
         if items is None or items.empty:
             return pd.DataFrame(columns=self.WANT_COLS)
 
-        # Defensive normalization
-        items["UPC"] = items["UPC"].astype(str).str.zfill(12)
-        items["Item Name"] = items["Item Name"].astype(str)
+        # Defensive normalization (should already be 12-digit)
+        items["UPC"] = items["UPC"].astype(str).str.replace(r"\D", "", regex=True).str[:12].str.zfill(12)
+        items["Item Name"] = items["Item Name"].astype(str).str.strip()
         items["Cost"] = pd.to_numeric(items["Cost"], errors="coerce")
         items["Cases"] = pd.to_numeric(items["Cases"], errors="coerce").fillna(0).astype(int)
 
