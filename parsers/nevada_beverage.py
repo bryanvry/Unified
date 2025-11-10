@@ -2,12 +2,13 @@
 # Nevada Beverage PDF-only parser with:
 #  • Robust UPC extraction (prevents glued digits)
 #  • Unit price (D.PRICE) selection over EXT and DEP=0.00
-#  • Out-of-Stock detection (OOS/O.S./OUT OF STOCK/NO SHIP/BACK ORDER) → Cases=0 (excluded)
+#  • Out-of-Stock detection (OOS/O.S./OOS/NO SHIP/BACK ORDER) → Cases=0 (excluded)
+#  • Regex-stage qty selection that honors an explicit "0" and ignores big item codes
 #
 # Pipeline:
 #   1) Tables via pdfplumber.extract_tables()
 #   2) Word-grid reconstruction (header-detected column bucketing)
-#   3) Text/regex sweep per line (with unit-price logic + OOS detection)
+#   3) Text/regex sweep per line (with unit-price logic + OOS detection + robust qty)
 #
 # Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
 
@@ -358,6 +359,24 @@ class NevadaBeverageParser:
         return pd.DataFrame(rows, columns=self.WANT_COLS)
 
     # ----------------- Stage 3: text/regex sweep -----------------
+    def _pick_qty_from_line_ints(self, line: str) -> Optional[int]:
+        """
+        Qty heuristic for regex stage:
+          - Collect all integers.
+          - Drop anything >= 1000 (likely product codes).
+          - If 0 present, return 0 (explicit zero-arrival).
+          - Else pick the first remaining int (<= 200).
+        """
+        ints = [int(m.group(1)) for m in re.finditer(r"\b(\d{1,4})\b", line)]
+        small = [v for v in ints if v <= 200]  # typical case counts
+        # remove likely product codes (>=1000)
+        small = [v for v in small if v < 1000]
+        if not small:
+            return None
+        if 0 in small:
+            return 0
+        return small[0]
+
     def _parse_text_regex(self, page) -> pd.DataFrame:
         txt = page.extract_text() or ""
         if not txt.strip():
@@ -383,51 +402,35 @@ class NevadaBeverageParser:
 
             # OOS detection
             if self._is_oos(line):
-                # Mark as zero-arrival -> exclude later
-                oos_cases = 0
+                qty = 0  # force zero-arrival
             else:
-                oos_cases = None  # not OOS
+                qty = self._pick_qty_from_line_ints(line)
 
-            # All price tokens on the line; ignore zeros
-            price_matches = list(re.finditer(r"(\d+\.\d{2})", line))
-            prices = [self._to_float(mm.group(1)) for mm in price_matches]
-
-            # Qty (use first small integer; refine using pos relative to UPC if needed)
-            qty = None
-            ints = list(re.finditer(r"\b(\d{1,4})\b", line))
-            if ints:
-                try:
-                    qty = int(ints[0].group(1))
-                except Exception:
-                    qty = None
-            if (qty is None or qty <= 0) and m:
-                left = line[:m.start()]
-                ints2 = list(re.finditer(r"\b(\d{1,4})\b", left))
-                if ints2:
-                    try:
-                        qty = int(ints2[-1].group(1))
-                    except Exception:
-                        qty = None
             if qty is None or qty <= 0:
+                # zero or unknown qty → exclude
                 continue
 
+            # All price tokens on the line; ignore zeros
+            prices = [self._to_float(mm.group(1)) for mm in re.finditer(r"(\d+\.\d{2})", line)]
             unit_price = self._select_unit_price(prices, qty)
             if unit_price is None or unit_price < self._MIN_PRICE:
                 continue
 
             # Description between qty and UPC if possible
-            upc_start = m.start() if m else line.find(upc)
-            qm = re.search(r"\b" + re.escape(str(qty)) + r"\b", line)
-            left_clip = (qm.end() if qm else 0)
-            desc = line[left_clip:upc_start].strip()
+            upc_pos = m.start() if m else line.find(upc)
+            # Try to find the chosen qty's position to clip description after it
+            qpos = None
+            for mm in re.finditer(r"\b(\d{1,4})\b", line):
+                if int(mm.group(1)) == qty:
+                    qpos = mm.end()
+                    break
+            left_clip = qpos if qpos is not None else 0
+            desc = line[left_clip:upc_pos].strip()
             desc = re.sub(r"\s{2,}", " ", desc).strip(" -–—|;,")
             if not desc:
-                desc = line[:upc_start].strip()
+                desc = line[:upc_pos].strip()
 
-            cases = qty if (oos_cases is None) else 0
-
-            if cases > 0:
-                rows.append({"UPC": upc, "Item Name": desc, "Cost": float(unit_price), "Cases": int(cases), "_order": li})
+            rows.append({"UPC": upc, "Item Name": desc, "Cost": float(unit_price), "Cases": int(qty), "_order": li})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
@@ -463,7 +466,7 @@ class NevadaBeverageParser:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
 
-                # Stage 3: text/regex sweep (with unit-price logic + OOS detection)
+                # Stage 3: text/regex sweep (with unit-price logic + OOS detection + robust qty)
                 if items is None or items.empty:
                     rows = []
                     for page in pdf.pages:
