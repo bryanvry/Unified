@@ -22,7 +22,9 @@ def _to_float_safe(x):
         return 0.0
 
 def _norm_upc_12(u: str) -> str:
-    s = str(u or "").replace("-", "").replace(" ", "")
+    """Rightmost-12 normalization, preserving leading zeros (UPC-A)."""
+    s = str(u or "").strip().replace("-", "").replace(" ", "")
+    s = "".join(ch for ch in s if ch.isdigit())
     if len(s) == 13 and s.startswith("0"):
         s = s[1:]
     if len(s) > 12:
@@ -177,42 +179,85 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
     )
 
 def _build_pricebook_update(pricebook_csv, updated_master_df):
+    """
+    Keep ONLY invoice items (Total > 0) and update:
+      - addstock = Master.Total
+      - cost_cents = Master.'Cost ¢'
+    Match on UPC using RIGHTMOST 12 digits with preserved leading zeros
+    on BOTH Master['Full Barcode'] and pricebook['Upc'].
+    """
     pb = pd.read_csv(pricebook_csv, dtype=str).fillna("")
 
-    # Make sure columns exist
-    for c in ["Upc","addstock","cost_cents"]:
+    # Resolve pricebook UPC column (handle Upc/UPC/upc)
+    upc_col = None
+    for cand in ["Upc","UPC","upc"]:
+        if cand in pb.columns:
+            upc_col = cand
+            break
+    if upc_col is None:
+        # Create it so downstream code doesn't crash; result will be empty anyway
+        upc_col = "Upc"
+        pb[upc_col] = ""
+
+    # Ensure addstock/cost_cents columns exist
+    for c in ["addstock","cost_cents"]:
         if c not in pb.columns:
             pb[c] = ""
 
-    # Resolve the master column names again (same logic)
+    # Resolve master column names (same logic as update fn)
     master = updated_master_df.copy()
     full_barcode_col = _resolve_col(master, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
     total_col        = _resolve_col(master, ["Total","TOTAL","total"], "Total")
     cost_cent_col    = _resolve_col(master, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
 
-    master[full_barcode_col] = master[full_barcode_col].astype(str)
+    # Normalize for matching (RIGHTMOST-12 on BOTH sides)
+    master["__fb_norm"]   = master[full_barcode_col].map(_norm_upc_12)
     master["__TotalNum"]  = master[total_col].apply(_to_float_safe)
     master["__CostCents"] = master[cost_cent_col].apply(_to_int_safe)
 
-    # Keep ONLY invoice items (Total > 0)
+    # Keep ONLY invoice items: Total > 0
     m = master[master["__TotalNum"] > 0].copy()
     if m.empty:
+        # No invoice items made it through — return empty and a note
         return pb.iloc[0:0].copy(), pd.DataFrame([{"note":"No items with Total > 0 in Master after update."}])
 
-    master_map = m.set_index(full_barcode_col)[["__TotalNum","__CostCents"]].to_dict(orient="index")
+    # Build map keyed by normalized Full Barcode
+    master_map = m.set_index("__fb_norm")[["__TotalNum","__CostCents"]].to_dict(orient="index")
 
-    keep_mask = pb["Upc"].isin(m[full_barcode_col])
+    # Normalize pricebook UPCs for the same 12-digit match
+    pb["__upc_norm"] = pb[upc_col].map(_norm_upc_12)
+
+    # Keep only pricebook rows that exist in the invoice (by normalized match)
+    keep_mask = pb["__upc_norm"].isin(m["__fb_norm"])
     pos_update = pb[keep_mask].copy()
 
-    pos_update["addstock"]   = pos_update["Upc"].map(lambda u: int(master_map[str(u)]["__TotalNum"]) if str(u) in master_map else 0)
-    pos_update["cost_cents"] = pos_update["Upc"].map(lambda u: int(master_map[str(u)]["__CostCents"]) if str(u) in master_map else 0)
+    # Fill outputs
+    def _addstock_from_map(k):
+        rec = master_map.get(k)
+        return int(rec["__TotalNum"]) if rec is not None else 0
+    def _cost_from_map(k):
+        rec = master_map.get(k)
+        return int(rec["__CostCents"]) if rec is not None else 0
 
+    pos_update["addstock"]   = pos_update["__upc_norm"].map(_addstock_from_map)
+    pos_update["cost_cents"] = pos_update["__upc_norm"].map(_cost_from_map)
+
+    # Missing report (normalized keys in Master but not found in pricebook normalized Upc)
     missing = None
-    if len(pos_update) != len(m):
-        miss = [{"Full Barcode (Master)": fb} for fb in set(m[full_barcode_col]) - set(pos_update["Upc"])]
-        missing = pd.DataFrame(miss)
+    pos_norm_set = set(pos_update["__upc_norm"])
+    master_norm_set = set(m["__fb_norm"])
+    if pos_norm_set != master_norm_set:
+        missing_norms = sorted(master_norm_set - pos_norm_set)
+        if missing_norms:
+            # Provide original Full Barcode and (optionally) Name if present
+            cols_to_show = ["__fb_norm", full_barcode_col]
+            if "Name" in master.columns:
+                cols_to_show.append("Name")
+            missing = m[m["__fb_norm"].isin(missing_norms)][cols_to_show].drop_duplicates().rename(
+                columns={"__fb_norm":"UPC (normalized)"}
+            )
 
-    return pos_update, missing
+    return pos_update.drop(columns=["__upc_norm"]), missing
 
 # ===================== UI =====================
 st.title("Unified — Multi-Vendor Invoice Processor")
