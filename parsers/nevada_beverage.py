@@ -1,30 +1,58 @@
+# parsers/nevada_beverage.py
 import re
 import pandas as pd
-import numpy as np
 
-from .utils import (
-    normalize_invoice_upc,
-    sanitize_columns,
-)
+def _normalize_upc_keep_zeros(u: str) -> str:
+    digits = re.sub(r"\D", "", str(u))
+    if len(digits) == 13 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) > 12:
+        digits = digits[-12:]
+    if len(digits) < 12:
+        digits = digits.zfill(12)
+    return digits
 
 class NevadaBeverageParser:
     """
-    Nevada Beverage invoice parser.
-    - Accepts PDF, TXT (pasted), XLSX/XLS, CSV
-    - Reads item rows after the header that contains 'ITEM#' and 'UPC'/'U.P.C.'
-    - Stops when a TOTAL/PAYMENT/SUMMARY section is detected
-    - Returns normalized columns:
-      ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
+    Parse Nevada Beverage invoices (PDF/CSV/XLSX) into:
+      [UPC, Item Name, Cost, Cases]
+    Rules:
+      - Find header line that includes 'ITEM#' and 'QTY' and 'U.P.C.' (case-insensitive).
+      - Extract rows until a totals/summary line appears.
+      - Cases = QTY (int).
+      - Cost = last numeric on the item line (unit/case net commonly sits at end).
+      - Preserve invoice order and UPC leading zeros.
+      - Size column intentionally ignored per prior instruction.
     """
-    name = "Nevada Beverage"
-    tokens = ["ITEM#", "U.P.C.", "UPC", "QTY", "DESCRIPTION"]
 
-    # --------- helpers ---------
-    def _read_lines_from_pdf(self, uploaded_file):
+    name = "Nevada Beverage"
+
+    def _is_pdf(self, f) -> bool:
+        try:
+            mt = (getattr(f, "type", "") or "").lower()
+            if "pdf" in mt:
+                return True
+        except Exception:
+            pass
+        pos = None
+        try:
+            pos = f.tell()
+            f.seek(0)
+            head = f.read(5)
+            return isinstance(head, (bytes, bytearray)) and head.startswith(b"%PDF")
+        except Exception:
+            return False
+        finally:
+            try:
+                f.seek(0 if pos is None else pos)
+            except Exception:
+                pass
+
+    def _read_lines_pdf(self, f):
         import pdfplumber
-        uploaded_file.seek(0)
+        f.seek(0)
         lines = []
-        with pdfplumber.open(uploaded_file) as pdf:
+        with pdfplumber.open(f) as pdf:
             for page in pdf.pages:
                 txt = page.extract_text() or ""
                 for ln in txt.splitlines():
@@ -33,86 +61,118 @@ class NevadaBeverageParser:
                         lines.append(ln)
         return lines
 
-    def _read_lines_from_txt(self, uploaded_file):
-        uploaded_file.seek(0)
-        txt = uploaded_file.read().decode("utf-8", errors="ignore")
-        return [ln.strip() for ln in txt.splitlines() if ln.strip()]
-
-    def _read_lines_from_table(self, uploaded_file):
-        name = uploaded_file.name.lower()
+    def _read_lines_table(self, f):
+        name = (getattr(f, "name", "") or "").lower()
+        f.seek(0)
         if name.endswith(".csv"):
-            df_raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
+            df = pd.read_csv(f, header=None, dtype=str, keep_default_na=False)
         else:
-            df_raw = pd.read_excel(uploaded_file, header=None, dtype=str)
+            df = pd.read_excel(f, header=None, dtype=str)
+        df = df.fillna("")
+        lines = df.apply(lambda r: " ".join([c for c in r if str(c).strip() != ""]).strip(), axis=1)
+        return [x for x in lines.tolist() if x]
 
-        # locate header with ITEM# and UPC/U.P.C.
-        header_row = None
-        for i in range(min(120, len(df_raw))):
-            row = " ".join([str(x) for x in df_raw.iloc[i].tolist()])
-            if "ITEM#" in row.upper() and ("U.P.C." in row.upper() or "UPC" in row.upper()):
-                header_row = i
-                break
-        if header_row is None:
-            header_row = 0
-
-        df = df_raw.iloc[header_row + 1 :].fillna("")
-        lines = df.apply(
-            lambda r: " ".join([str(x) for x in r.tolist() if str(x).strip() != ""]),
-            axis=1,
-        ).tolist()
-        return [ln.strip() for ln in lines if ln.strip()]
-
-    # --------- main parse ---------
     def parse(self, uploaded_file) -> pd.DataFrame:
-        name = uploaded_file.name.lower()
-
-        # 1) Load lines
+        # Read
         try:
-            if name.endswith(".pdf"):
-                lines = self._read_lines_from_pdf(uploaded_file)
-            elif name.endswith(".txt"):
-                lines = self._read_lines_from_txt(uploaded_file)
+            if self._is_pdf(uploaded_file):
+                lines = self._read_lines_pdf(uploaded_file)
             else:
-                lines = self._read_lines_from_table(uploaded_file)
+                lines = self._read_lines_table(uploaded_file)
         except Exception:
-            cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
 
-        # 2) Iterate lines and extract items
-        items = []
-        for ln in lines:
-            # stop when reaching totals/payment/summary area
-            if re.search(r"\b(TOTAL|PAYMENT|SUMMARY)\b", ln, re.I):
+        # find header row index
+        hdr_idx = -1
+        for idx, ln in enumerate(lines):
+            l = ln.lower()
+            if ("item#" in l or "item #" in l) and "qty" in l and ("u.p.c" in l or "upc" in l):
+                hdr_idx = idx
+                break
+        if hdr_idx == -1:
+            # fallback: parse all lines as potential items (best-effort)
+            start_idx = 0
+        else:
+            start_idx = hdr_idx + 1
+
+        out = []
+        order_idx = 0
+        stop_terms = ("subtotal", "total", "payment", "summary", "tax", "thank you")
+
+        for ln in lines[start_idx:]:
+            low = ln.lower()
+            if any(t in low for t in stop_terms):
                 break
 
-            m_upc  = re.search(r"(?:UPC|U\.P\.C\.)[:\s]*([0-9\- ]+)", ln, re.I)
-            m_desc = re.search(r"ITEM#\s*\S+\s+(.+)", ln)
-            m_cost = re.search(r"\$([0-9\.,]+)", ln)
-            m_date = re.search(r"Invoice Date[:\s]*([0-9/\-]+)", ln, re.I)
+            # Extract UPC: prefer an explicit 12-13 digit chunk or something after 'upc:'
+            upc = None
+            if "upc:" in low:
+                try:
+                    upc_raw = ln.split("UPC:", 1)[1]
+                except Exception:
+                    try:
+                        upc_raw = ln.split("upc:", 1)[1]
+                    except Exception:
+                        upc_raw = ""
+                upc = _normalize_upc_keep_zeros(upc_raw)
+            else:
+                # look for a long digit run (>= 11) as candidate UPC
+                cand = re.findall(r"\d{11,14}", ln)
+                if cand:
+                    upc = _normalize_upc_keep_zeros(cand[-1])
 
-            if m_upc:
-                upc = normalize_invoice_upc(m_upc.group(1))
-                desc = (m_desc.group(1).strip() if m_desc else "")
-                cost = float(m_cost.group(1).replace(",", "")) if m_cost else np.nan
-                items.append({
-                    "invoice_date": (m_date.group(1).strip() if m_date else None),
+            if not upc:
+                continue
+
+            # Extract QTY (cases)
+            qty = 0
+            # try "... ITEM# <id>  QTY <num>  DESCRIPTION ..." or any ' qty ' pattern
+            m_qty = re.search(r"\bqty\b\s*[:\-]?\s*(\d+)", low)
+            if m_qty:
+                qty = int(m_qty.group(1))
+            else:
+                # heuristic: look for an isolated small int near start
+                ints = [int(x) for x in re.findall(r"\b\d+\b", ln)]
+                if ints:
+                    qty = ints[0]
+
+            # Extract name (description): remove obvious tokens
+            name = ln
+            name = re.sub(r"\b(item#|item #)\b.*?\bqty\b", "", name, flags=re.I)
+            name = re.sub(r"\bqty\b\s*[:\-]?\s*\d+", "", name, flags=re.I)
+            name = re.sub(r"UPC:\s*[\d\-\s]+", "", name, flags=re.I)
+            # strip trailing numeric cluster (prices)
+            tail_nums = re.findall(r"[0-9]+(?:\.[0-9]+)?", name)
+            if tail_nums:
+                last_num = tail_nums[-1]
+            else:
+                last_num = None
+            # Cost: take last numeric token on line (typical NV formatting)
+            cost = None
+            nums_all = re.findall(r"[0-9]+(?:\.[0-9]+)?", ln)
+            if nums_all:
+                try:
+                    cost = float(nums_all[-1].replace(",", ""))
+                except Exception:
+                    cost = None
+
+            # refine name: drop all trailing numbers
+            name = re.sub(r"\s*[0-9\.,]+\s*$", "", name).strip()
+
+            if upc and cost is not None and qty >= 0:
+                out.append({
+                    "_order": order_idx,
                     "UPC": upc,
-                    "Brand": "",
-                    "Description": desc,
-                    "Pack": np.nan,    # NV process doesn't use a pack value
-                    "Size": "",
-                    "Cost": cost,
-                    "+Cost": cost,     # treat item amount as +Cost
-                    "Case Qty": pd.NA, # unknown/not needed for NV export
+                    "Item Name": name,
+                    "Cost": float(cost),
+                    "Cases": int(qty)
                 })
+                order_idx += 1
 
-        # 3) Normalize frame
-        out = pd.DataFrame(items)
-        if not out.empty:
-            out["invoice_date"] = pd.to_datetime(out["invoice_date"], errors="coerce").dt.date
-        cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-        for c in cols:
-            if c not in out.columns:
-                out[c] = "" if c in ["Brand","Description","Size"] else pd.NA
-        out = out[cols]
-        return sanitize_columns(out)
+        if not out:
+            return pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
+
+        df = pd.DataFrame(out)
+        df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        df["UPC"] = df["UPC"].astype(str)
+        return df
