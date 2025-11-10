@@ -1,55 +1,62 @@
+# parsers/southern_glazers.py
 import re
 import pandas as pd
-import numpy as np
 
-from .utils import (
-    normalize_invoice_upc,
-    first_int_from_text,
-    sanitize_columns,
-)
+def _normalize_upc_keep_zeros(u: str) -> str:
+    """
+    Normalize to 12-digit UPC-A while preserving leading zeros:
+    - Strip non-digits.
+    - If 13 digits starting with '0', drop the first digit (EAN-13 UPC-A).
+    - If >12, take RIGHTMOST 12 digits.
+    - If <12, left-pad with zeros.
+    """
+    digits = re.sub(r"\D", "", str(u))
+    if len(digits) == 13 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) > 12:
+        digits = digits[-12:]
+    if len(digits) < 12:
+        digits = digits.zfill(12)
+    return digits
 
 class SouthernGlazersParser:
     """
-    Southern Glazer's invoice parser.
-
-    - Accepts PDF, XLSX/XLS, CSV
-    - Uses Unit Net Amount as +Cost
-    - Pack from 'CS ORD/DLV' (first integer)
-    - Returns normalized columns:
-      ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
+    Parse Southern Glazer's PDF/XLSX/CSV into rows with columns:
+      [UPC, Item Name, Cost, Cases]
+    - Cost = Unit Net Amount (3rd number in price triplet on item line)
+    - Cases = delivered (second number in ORD/DLV; e.g., 12/8 -> 8)
+    - Preserves invoice order for the output CSV
     """
-    name = "Southern Glazer's"
-    tokens = ["ITEM#", "UPC", "SIZE:", "Unit Net Amount", "CS ORD/DLV", "Invoice"]
 
-    # ---------- robust file type checks ----------
-    def _is_pdf(self, uploaded_file) -> bool:
-        """Detect by magic header or mimetype; always seek(0) afterward."""
+    name = "Southern Glazer's"
+
+    def _is_pdf(self, f) -> bool:
+        # Best-effort PDF sniff
         try:
-            mt = getattr(uploaded_file, "type", "") or ""
-            if "pdf" in mt.lower():
+            mt = (getattr(f, "type", "") or "").lower()
+            if "pdf" in mt:
                 return True
         except Exception:
             pass
+        pos = None
         try:
-            pos = uploaded_file.tell()
-        except Exception:
-            pos = None
-        try:
-            uploaded_file.seek(0)
-            head = uploaded_file.read(5)
+            pos = f.tell()
+            f.seek(0)
+            head = f.read(5)
             return isinstance(head, (bytes, bytearray)) and head.startswith(b"%PDF")
+        except Exception:
+            return False
         finally:
             try:
-                uploaded_file.seek(0 if pos is None else pos)
+                f.seek(0 if pos is None else pos)
             except Exception:
                 pass
 
-    # ---------- readers ----------
-    def _read_lines_from_pdf(self, uploaded_file):
+    def _read_lines_pdf(self, f):
         import pdfplumber
-        uploaded_file.seek(0)
+        f.seek(0)
         lines = []
-        with pdfplumber.open(uploaded_file) as pdf:
+        with pdfplumber.open(f) as pdf:
             for page in pdf.pages:
                 txt = page.extract_text() or ""
                 for ln in txt.splitlines():
@@ -58,119 +65,74 @@ class SouthernGlazersParser:
                         lines.append(ln)
         return lines
 
-    def _read_lines_from_table(self, uploaded_file):
-        """Fallback for CSV/XLSX/XLS: collapse each row into a single string line."""
-        name = (uploaded_file.name or "").lower()
-        uploaded_file.seek(0)
+    def _read_lines_table(self, f):
+        # Fallback if user uploads CSV/XLS(X)
+        name = (getattr(f, "name", "") or "").lower()
+        f.seek(0)
         if name.endswith(".csv"):
-            df_raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
+            df = pd.read_csv(f, header=None, dtype=str, keep_default_na=False)
         else:
-            df_raw = pd.read_excel(uploaded_file, header=None, dtype=str)
+            df = pd.read_excel(f, header=None, dtype=str)
+        df = df.fillna("")
+        lines = df.apply(lambda r: " ".join([c for c in r if str(c).strip() != ""]).strip(), axis=1)
+        return [x for x in lines.tolist() if x]
 
-        # try to locate header area (row that contains ITEM# and UPC)
-        header_row = None
-        for i in range(min(100, len(df_raw))):
-            row = " ".join([str(x) for x in df_raw.iloc[i].tolist()])
-            if "ITEM#" in row.upper() and "UPC" in row.upper():
-                header_row = i
-                break
-        if header_row is None:
-            header_row = 0
-
-        df = df_raw.iloc[header_row + 1 :].fillna("")
-        lines = df.apply(
-            lambda r: " ".join([str(x) for x in r.tolist() if str(x).strip() != ""]),
-            axis=1,
-        ).tolist()
-        return [ln.strip() for ln in lines if ln.strip()]
-
-    # ---------- main parse ----------
     def parse(self, uploaded_file) -> pd.DataFrame:
-        # 1) Decide reader: prefer PDF if detected; otherwise table
+        # Get text lines
         try:
             if self._is_pdf(uploaded_file):
-                lines = self._read_lines_from_pdf(uploaded_file)
+                lines = self._read_lines_pdf(uploaded_file)
             else:
-                lines = self._read_lines_from_table(uploaded_file)
+                lines = self._read_lines_table(uploaded_file)
         except Exception:
-            cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases"])
 
-        # 2) Scan lines to extract items
-        items = []
-        current = {}  # holds fields for the current product block
+        item_re = re.compile(
+            r"^(\d+)\s*/\s*(\d+)\s+(.+?)\s+([0-9\.,]+\s+[0-9\.,]+\s+[0-9\.,]+)\s+[0-9\.,]+\s+[0-9\.,]+$"
+        )
 
-        for ln in lines:
-            # new block when we see ITEM#
-            if "ITEM#" in ln.upper():
-                if current.get("UPC"):
-                    items.append(current)
-                current = {"Size": "", "Brand": "", "Description": ""}
+        out = []
+        order_idx = 0
+        i = 0
+        n = len(lines)
 
-                # crude description right after ITEM#
-                mdesc = re.search(r"ITEM#\s*\S+\s+(.+)", ln)
-                if mdesc and not current.get("Description"):
-                    current["Description"] = mdesc.group(1).strip()
+        while i < n:
+            ln = lines[i]
+            m = item_re.match(ln)
+            if m:
+                ordered = int(m.group(1))
+                delivered = int(m.group(2))
+                name = m.group(3).strip()
+                triplet = m.group(4)
+                nums = re.findall(r"[0-9]+(?:\.[0-9]+)?", triplet)
+                unit_net = float(nums[2]) if len(nums) >= 3 else None
 
-            # field matches (order-independent)
-            m_upc   = re.search(r"\bUPC[:\s]*([0-9\- ]+)", ln, re.I)
-            m_size  = re.search(r"\bSIZE[:\s]*([A-Za-z0-9 .]+)", ln, re.I)
-            m_unit  = re.search(r"Unit Net Amount[:\s]*\$?([0-9\.,]+)", ln, re.I)
-            m_cs    = re.search(r"CS ORD/DLV[:\s]*([0-9]+(?:/[0-9]+)?)", ln, re.I)
-            m_date  = re.search(r"Invoice Date[:\s]*([0-9/\-]+)", ln, re.I)
+                # Find UPC nearby
+                upc = None
+                for j in range(1, 6):
+                    k = i + j
+                    if k < n and lines[k].upper().startswith("UPC:"):
+                        upc_raw = lines[k].split(":", 1)[1]
+                        upc = _normalize_upc_keep_zeros(upc_raw)
+                        break
 
-            if m_upc:
-                upc_raw = re.sub(r"[^0-9]", "", m_upc.group(1))
-                current["UPC"] = normalize_invoice_upc(upc_raw)
+                # Drop non-merch like Delivery Charge
+                if upc and unit_net is not None and "DELIVERY CHARGE" not in name.upper():
+                    out.append({
+                        "_order": order_idx,
+                        "UPC": upc,
+                        "Item Name": name,
+                        "Cost": unit_net,
+                        "Cases": delivered
+                    })
+                    order_idx += 1
+            i += 1
 
-            if m_size:
-                sz = m_size.group(1).strip()
-                sz = sz.replace(" z", " oz").replace("Z", "oz")  # light normalization
-                current["Size"] = sz
+        if not out:
+            return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases"])
 
-            if m_unit:
-                try:
-                    current["Cost"] = float(m_unit.group(1).replace(",", ""))
-                except Exception:
-                    current["Cost"] = np.nan
-
-            if m_cs:
-                current["Pack"] = first_int_from_text(m_cs.group(1))
-
-            if m_date and "invoice_date" not in current:
-                current["invoice_date"] = m_date.group(1).strip()
-
-            if not current.get("Description"):
-                mdesc2 = re.search(r"ITEM#.*?\s([A-Za-z0-9].+)", ln)
-                if mdesc2:
-                    current["Description"] = mdesc2.group(1).strip()
-
-        # flush last block
-        if current.get("UPC"):
-            items.append(current)
-
-        # 3) Build normalized DataFrame (robust to empty/missing cols)
-        out = pd.DataFrame(items)
-
-        if out.empty:
-            cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-            return pd.DataFrame(columns=cols)
-
-        # Ensure required columns exist before conversions
-        for col in ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]:
-            if col not in out.columns:
-                out[col] = "" if col in ["Brand","Description","Size"] else pd.NA
-
-        # +Cost := Unit Net Amount (same as Cost above for SG)
-        if out["+Cost"].isna().all():
-            out["+Cost"] = out["Cost"]
-
-        # Safe conversions
-        out["invoice_date"] = pd.to_datetime(out["invoice_date"], errors="coerce").dt.date
-        out["Pack"] = pd.to_numeric(out["Pack"], errors="coerce")
-        out.loc[out["Pack"].isna() | (out["Pack"] <= 0), "Pack"] = 1
-        out["Case Qty"] = pd.Series([pd.NA] * len(out), dtype="Int64")
-
-        cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-        out = out[cols]
-        return sanitize_columns(out)
+        df = pd.DataFrame(out)
+        df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        # Ensure textual UPC so leading zeros persist in CSV
+        df["UPC"] = df["UPC"].astype(str)
+        return df
