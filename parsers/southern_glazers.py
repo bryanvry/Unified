@@ -2,7 +2,6 @@ import re
 import pandas as pd
 import numpy as np
 
-# shared helpers
 from .utils import (
     normalize_invoice_upc,
     first_int_from_text,
@@ -12,7 +11,8 @@ from .utils import (
 class SouthernGlazersParser:
     """
     Southern Glazer's invoice parser.
-    - Accepts PDF, TXT (pasted), XLSX/XLS, CSV
+
+    - Accepts PDF, XLSX/XLS, CSV  (TXT is optional; not required)
     - Uses Unit Net Amount as +Cost
     - Pack from 'CS ORD/DLV' (first integer)
     - Returns normalized columns:
@@ -21,7 +21,31 @@ class SouthernGlazersParser:
     name = "Southern Glazer's"
     tokens = ["ITEM#", "UPC", "SIZE:", "Unit Net Amount", "CS ORD/DLV", "Invoice"]
 
-    # --------- helpers ---------
+    # ---------- robust file type checks ----------
+    def _is_pdf(self, uploaded_file) -> bool:
+        """Detect by magic header or mimetype; always seek(0) afterward."""
+        try:
+            # some streamlit UploadFile objects expose .type
+            mt = getattr(uploaded_file, "type", "") or ""
+            if "pdf" in mt.lower():
+                return True
+        except Exception:
+            pass
+        try:
+            pos = uploaded_file.tell()
+        except Exception:
+            pos = None
+        try:
+            uploaded_file.seek(0)
+            head = uploaded_file.read(5)
+            return isinstance(head, (bytes, bytearray)) and head.startswith(b"%PDF")
+        finally:
+            try:
+                uploaded_file.seek(0 if pos is None else pos)
+            except Exception:
+                pass
+
+    # ---------- readers ----------
     def _read_lines_from_pdf(self, uploaded_file):
         import pdfplumber
         uploaded_file.seek(0)
@@ -35,14 +59,10 @@ class SouthernGlazersParser:
                         lines.append(ln)
         return lines
 
-    def _read_lines_from_txt(self, uploaded_file):
-        uploaded_file.seek(0)
-        txt = uploaded_file.read().decode("utf-8", errors="ignore")
-        return [ln.strip() for ln in txt.splitlines() if ln.strip()]
-
     def _read_lines_from_table(self, uploaded_file):
-        # Fallback for CSV/XLSX/XLS: collapse each row into a single string line
-        name = uploaded_file.name.lower()
+        """Fallback for CSV/XLSX/XLS: collapse each row into a single string line."""
+        name = (uploaded_file.name or "").lower()
+        uploaded_file.seek(0)
         if name.endswith(".csv"):
             df_raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
         else:
@@ -65,20 +85,17 @@ class SouthernGlazersParser:
         ).tolist()
         return [ln.strip() for ln in lines if ln.strip()]
 
-    # --------- main parse ---------
+    # ---------- main parse ----------
     def parse(self, uploaded_file) -> pd.DataFrame:
-        name = uploaded_file.name.lower()
-
-        # 1) Load lines from the source (PDF/TXT vs table files)
+        # 1) Decide reader: prefer PDF if detected; otherwise table
+        lines = None
         try:
-            if name.endswith(".pdf"):
+            if self._is_pdf(uploaded_file):
                 lines = self._read_lines_from_pdf(uploaded_file)
-            elif name.endswith(".txt"):
-                lines = self._read_lines_from_txt(uploaded_file)
             else:
                 lines = self._read_lines_from_table(uploaded_file)
         except Exception:
-            # as a last resort, return empty normalized df
+            # last resort: return empty normalized df (prevents hard crash)
             cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
             return pd.DataFrame(columns=cols)
 
@@ -87,13 +104,13 @@ class SouthernGlazersParser:
         current = {}  # holds fields for the current product block
 
         for ln in lines:
-            # new block starts when we see ITEM#
+            # new block when we see ITEM#
             if "ITEM#" in ln.upper():
                 if current.get("UPC"):
                     items.append(current)
                 current = {"Size": "", "Brand": "", "Description": ""}
 
-                # crude first-pass description right after ITEM#
+                # crude description right after ITEM#
                 mdesc = re.search(r"ITEM#\s*\S+\s+(.+)", ln)
                 if mdesc and not current.get("Description"):
                     current["Description"] = mdesc.group(1).strip()
@@ -111,8 +128,7 @@ class SouthernGlazersParser:
 
             if m_size:
                 sz = m_size.group(1).strip()
-                # light normalization: " z"→" oz", "Z"→"oz"
-                sz = sz.replace(" z", " oz").replace("Z", "oz")
+                sz = sz.replace(" z", " oz").replace("Z", "oz")  # light normalization
                 current["Size"] = sz
 
             if m_unit:
@@ -127,7 +143,6 @@ class SouthernGlazersParser:
             if m_date and "invoice_date" not in current:
                 current["invoice_date"] = m_date.group(1).strip()
 
-            # If description still empty, try a looser pass
             if not current.get("Description"):
                 mdesc2 = re.search(r"ITEM#.*?\s([A-Za-z0-9].+)", ln)
                 if mdesc2:
@@ -140,15 +155,13 @@ class SouthernGlazersParser:
         # 3) Build normalized DataFrame
         out = pd.DataFrame(items)
 
-        # +Cost := top Unit Net Amount (same as Cost above for SG)
+        # +Cost := Unit Net Amount (same as Cost above for SG)
         if "Cost" in out.columns:
             out["+Cost"] = out["Cost"]
         else:
             out["+Cost"] = pd.NA
 
-        # parse/normalize fields
         out["invoice_date"] = pd.to_datetime(out.get("invoice_date"), errors="coerce").dt.date
-        # Pack defaults to 1 if missing/invalid (avoids divide-by-zero downstream)
         out["Pack"] = pd.to_numeric(out.get("Pack"), errors="coerce")
         out.loc[out["Pack"].isna() | (out["Pack"] <= 0), "Pack"] = 1
         out["Case Qty"] = pd.Series([pd.NA] * len(out), dtype="Int64")  # unknown for SG here
