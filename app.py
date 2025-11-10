@@ -7,7 +7,6 @@ from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
-# Expect: parsers/__init__.py exposes SouthernGlazersParser, NevadaBeverageParser
 from parsers import SouthernGlazersParser, NevadaBeverageParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
@@ -654,13 +653,13 @@ with tabs[1]:
     else:
         st.info("Upload SG invoice(s) and Master, then click **Process SG**. Downloads will persist afterward.")
 
-# Nevada Beverage tab (NOW PDF or CSV)
+# Nevada Beverage tab (PDF-only)
 with tabs[2]:
     st.title("Nevada Beverage Processor")
-    st.caption("Prefer the original PDF if their CSV UPCs look wrong — this tab accepts either.")
+    st.caption("Upload the original Nevada Beverage PDF invoice(s).")
     inv_files_nv = st.file_uploader(
-        "Upload NV invoice PDF(s) or CSV file(s) (semicolon ';' or comma)",
-        type=["pdf","csv"],
+        "Upload NV invoice PDF(s)",
+        type=["pdf"],
         accept_multiple_files=True,
         key="nv_inv"
     )
@@ -669,7 +668,7 @@ with tabs[2]:
 
     if st.button("Process NV", type="primary"):
         if not inv_files_nv or not master_xlsx_nv:
-            st.error("Please upload at least one NV PDF/CSV and the Master workbook.")
+            st.error("Please upload at least one NV PDF and the Master workbook.")
         else:
             nv_parser = NevadaBeverageParser()
             parts_nv = []
@@ -682,7 +681,7 @@ with tabs[2]:
             invoice_items_nv = _ensure_invoice_cols(invoice_items_nv)
 
             if invoice_items_nv.empty:
-                st.error("Could not parse any NV items (no UPC/Item Name/Cost/Cases). If you uploaded CSV, try the PDF.")
+                st.error("Could not parse any NV items (no UPC/Item Name/Cost/Cases).")
             else:
                 updated_master_nv, cost_changes_nv, not_in_master_nv, pack_missing_nv, invoice_unique_nv = _update_master_from_invoice(master_xlsx_nv, invoice_items_nv)
                 pos_update_nv = None
@@ -784,4 +783,4 @@ with tabs[2]:
                 key="nv_dl_pb_missing"
             )
     else:
-        st.info("Upload NV PDF/CSV and Master, then click **Process NV**. Downloads will persist afterward.")
+        st.info("Upload NV PDF and Master, then click **Process NV**. Downloads will persist afterward.")
