@@ -1,16 +1,14 @@
 # parsers/nevada_beverage.py
-# Nevada Beverage PDF-only parser with:
-#  • Robust UPC extraction (prevents glued digits)
-#  • Unit price (D.PRICE) selection over EXT and DEP=0.00
-#  • Out-of-Stock detection (OOS/O.S./OOS/NO SHIP/BACK ORDER) → Cases=0 (excluded)
-#  • Regex-stage qty = small int (≤200) closest to the UPC on the LEFT; if that is 0, drop line
+# Nevada Beverage PDF-only parser (strict ITEM#/QTY rule)
+#  • Every item line starts with 5-digit ITEM# (e.g., "53218 5 BUD LT 18PK CAN 018200532184 15.00 0.00 75.00")
+#  • Quantity = the integer immediately following the 5-digit ITEM#
+#  • If quantity == 0 → treat as OOS and skip
+#  • UPC = first 12–13 digit token (normalized to 12 digits)
+#  • Cost = first non-zero price AFTER the UPC (this is D.PRICE, not DEP=0.00 or EXT)
+#  • Order preserved
 #
-# Pipeline (in order; stops at first non-empty result):
-#   1) Tables via pdfplumber.extract_tables()
-#   2) Word-grid reconstruction (header-detected column bucketing)
-#   3) Text/regex sweep per line (with unit-price logic + OOS detection + robust qty)
-#
-# Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
+# Fallbacks:
+#  • If strict line parse yields nothing, try table and word-grid strategies.
 
 from typing import List, Optional, Tuple
 import re
@@ -18,15 +16,14 @@ import numpy as np
 import pandas as pd
 
 try:
-    import pdfplumber  # make sure pdfplumber is in requirements.txt
+    import pdfplumber
 except Exception:
     pdfplumber = None
 
 
 class NevadaBeverageParser:
     WANT_COLS = ["UPC", "Item Name", "Cost", "Cases"]
-    _MIN_PRICE = 0.01  # ignore DEP=0.00 and other zeros
-    _MAX_QTY = 200     # generous upper bound for case counts
+    _MIN_PRICE = 0.01
 
     # ----------------- helpers -----------------
     @staticmethod
@@ -36,12 +33,11 @@ class NevadaBeverageParser:
     @classmethod
     def _extract_upc_token(cls, s: str) -> str:
         """
-        Find a 12–13 digit token *bounded by non-digits* (prevents gluing qty/price).
-        Rules:
-          - If 13 digits and starts with '0' (EAN-13 wrapper), return last 12 (UPC-A).
-          - Else if 13 digits and doesn't start with '0', return first 12.
-          - If 12 digits, return as-is.
-          - Otherwise return first 12 of any longer blob.
+        Find a 12–13 digit token bounded by non-digits.
+        - 13 digits starting with '0' => last 12 (UPC-A)
+        - 13 digits not starting '0' => first 12
+        - 12 digits => use as-is
+        - Longer => first 12
         """
         if not s:
             return ""
@@ -59,9 +55,7 @@ class NevadaBeverageParser:
         if len(run) == 12:
             return run
         if len(run) == 13:
-            if run.startswith("0"):
-                return run[1:]
-            return run[:12]
+            return run[1:] if run.startswith("0") else run[:12]
         return run[:12]
 
     @staticmethod
@@ -84,65 +78,93 @@ class NevadaBeverageParser:
         except Exception:
             return 0
 
-    @staticmethod
-    def _canon(s: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
+    # ----------------- strict line parser -----------------
+    def _parse_text_regex_strict(self, page) -> pd.DataFrame:
+        """
+        Strict NV rule per user:
+          line = ITEM#(5 digits) <space> QTY(int) <space> DESCRIPTION ... UPC ... D.PRICE ... DEP(0.00) ... EXT
+          - QTY = the integer immediately after the first 5-digit token
+          - If QTY == 0 -> skip
+          - UPC = first 12–13 digit token
+          - COST = first non-zero price AFTER the UPC
+          - DESCRIPTION = text between end-of-QTY and start-of-UPC
+        """
+        txt = page.extract_text() or ""
+        if not txt.strip():
+            return pd.DataFrame(columns=self.WANT_COLS)
 
-    # ----------------- OOS detection -----------------
-    @staticmethod
-    def _is_oos(text: str) -> bool:
-        """
-        Detect out-of-stock markers commonly seen on NV PDFs.
-        Examples matched (case-insensitive, flexible spacing/punct):
-          - OUT OF STOCK, OUT-OF-STOCK, OUTOFSTOCK
-          - O/S, O. S., O S
-          - OOS
-          - NO SHIP, NO-SHIP, NOSHIP
-          - BACK ORDER, BACKORDER, BACK-ORDER, BACK ORDERED
-        """
-        if not text:
-            return False
-        t = text.lower()
-        patterns = [
-            r"out\s*[- ]?\s*of\s*[- ]?\s*stock",
-            r"\bo\s*/\s*s\b",          # O/S or O / S
-            r"\boos\b",                # OOS
-            r"\bno\s*[- ]?\s*ship\b",  # NO SHIP
-            r"back\s*[- ]?\s*order",   # BACK ORDER / BACK-ORDER / BACKORDER / BACK ORDERED
-            r"back\s*[- ]?\s*ordered",
-        ]
-        return any(re.search(p, t) for p in patterns)
+        rows = []
+        for li, raw in enumerate(txt.splitlines()):
+            line = raw.strip()
+            if len(line) < 8:
+                continue
 
-    # ----------------- price selection -----------------
-    def _select_unit_price(self, prices: List[float], qty: int) -> Optional[float]:
-        """
-        Given all price-like tokens on a line and the parsed qty:
-          - Drop zeros/near-zeros (< _MIN_PRICE).
-          - If multiple remain, prefer the smallest (likely unit D.PRICE).
-          - If we have both small and large and large ≈ small * qty, pick small.
-        """
-        vals = [p for p in prices if (not np.isnan(p)) and (p >= self._MIN_PRICE)]
-        if not vals:
-            return None
-        vals_sorted = sorted(vals)
-        unit = vals_sorted[0]
-        if qty and len(vals_sorted) >= 2:
-            big = vals_sorted[-1]
-            if abs(big - unit * qty) <= 0.02 * max(1.0, big):  # within ~2%
-                return unit
-        return unit
+            # 1) Find first 5-digit ITEM#
+            m_item = re.search(r"\b(\d{5})\b", line)
+            if not m_item:
+                continue
 
-    # ----------------- header matching -----------------
+            # 2) Quantity = next integer after ITEM#
+            after_item = line[m_item.end():]
+            m_qty = re.search(r"\b(\d{1,3})\b", after_item)
+            if not m_qty:
+                continue
+            qty = self._to_int(m_qty.group(1))
+            if qty <= 0:
+                # Explicitly skip zero-arrival (OOS)
+                continue
+
+            qty_end_abs = m_item.end() + m_qty.end()  # absolute index in full line
+
+            # 3) UPC token (first 12–13 digit token) anywhere AFTER qty
+            after_qty = line[qty_end_abs:]
+            m_upc = re.search(r"(?<!\d)(\d{12,13})(?!\d)", after_qty)
+            if not m_upc:
+                # allow longer number blobs as last resort
+                m_upc = re.search(r"(\d{10,})", after_qty)
+                if not m_upc:
+                    continue
+            upc_span_abs = (qty_end_abs + m_upc.start(), qty_end_abs + m_upc.end())
+            upc = self._extract_upc_token(m_upc.group(1))
+            if not upc:
+                continue
+
+            # 4) Cost (D.PRICE) = first non-zero price AFTER UPC
+            after_upc = line[upc_span_abs[1]:]
+            prices_after = [self._to_float(mm.group(1)) for mm in re.finditer(r"(\d+\.\d{2})", after_upc)]
+            cost = None
+            for p in prices_after:
+                if p is not None and not np.isnan(p) and p >= self._MIN_PRICE:
+                    cost = float(p)
+                    break
+            if cost is None:
+                continue
+
+            # 5) Description = between end-of-QTY and start-of-UPC
+            desc = line[qty_end_abs:upc_span_abs[0]].strip()
+            desc = re.sub(r"\s{2,}", " ", desc).strip(" -–—|;,")
+
+            rows.append({"UPC": upc, "Item Name": desc, "Cost": cost, "Cases": int(qty), "_order": li})
+
+        if not rows:
+            return pd.DataFrame(columns=self.WANT_COLS)
+
+        out = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        return out[self.WANT_COLS]
+
+    # ----------------- table/word-grid fallbacks (unchanged) -----------------
     def _match_header(self, columns: List[str]) -> Optional[dict]:
-        cmap = {self._canon(c): c for c in columns}
+        def canon(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
+        cmap = {canon(c): c for c in columns}
 
         def pick(*aliases):
             for a in aliases:
-                ca = self._canon(a)
+                ca = canon(a)
                 if ca in cmap:
                     return cmap[ca]
             for a in aliases:
-                ca = self._canon(a)
+                ca = canon(a)
                 for k, orig in cmap.items():
                     if ca in k:
                         return orig
@@ -151,27 +173,17 @@ class NevadaBeverageParser:
         col_qty   = pick("QTY", "Qty", "Quantity")
         col_desc  = pick("DESCRIPTION", "Description", "Item Description", "Desc")
         col_upc   = pick("U.P.C.", "UPC", "U P C", "U.P.C")
-        # D.PRICE = unit price; aliases included
         col_price = pick("D.PRICE", "D PRICE", "DPRICE", "UNITPRICE", "UNIT PRICE", "PRICE")
-
         if all([col_qty, col_desc, col_upc, col_price]):
-            return {
-                "QTY": col_qty,
-                "DESCRIPTION": col_desc,
-                "U.P.C.": col_upc,
-                "D.PRICE": col_price,
-            }
+            return {"QTY": col_qty, "DESCRIPTION": col_desc, "U.P.C.": col_upc, "D.PRICE": col_price}
         return None
 
-    # ----------------- Stage 1: tables -----------------
     def _parse_pdf_tables(self, pdf: "pdfplumber.PDF") -> pd.DataFrame:
         rows = []
-
         table_settings_list = [
             {"vertical_strategy": "lines", "horizontal_strategy": "lines", "intersection_tolerance": 5, "snap_tolerance": 3, "join_tolerance": 3, "edge_min_length": 3},
             {"vertical_strategy": "text", "horizontal_strategy": "text"},
         ]
-
         for page in pdf.pages:
             for settings in table_settings_list:
                 try:
@@ -181,8 +193,6 @@ class NevadaBeverageParser:
                 for tbl in tables or []:
                     if not tbl or len(tbl) < 2:
                         continue
-
-                    # plausible header
                     header = None
                     header_idx = 0
                     for i, row in enumerate(tbl[:6]):
@@ -192,48 +202,37 @@ class NevadaBeverageParser:
                             break
                     if header is None:
                         continue
-
                     colmap = self._match_header(header)
                     if not colmap:
                         continue
-
                     body = tbl[header_idx + 1 :]
                     if not body:
                         continue
-
                     df = pd.DataFrame(body, columns=header)
-
                     for _, r in df.iterrows():
                         upc_raw = r.get(colmap["U.P.C."], "")
                         name    = r.get(colmap["DESCRIPTION"], "")
                         price   = r.get(colmap["D.PRICE"], "")
                         qty     = r.get(colmap["QTY"], "")
-                        # gather row text for OOS check
-                        row_text = " ".join(str(x) for x in [qty, name, upc_raw, price] if pd.notna(x))
-
                         upc   = self._extract_upc_token(upc_raw)
                         cost  = self._to_float(price)
                         cases = self._to_int(qty)
                         name  = str(name).strip()
-
-                        # Out-of-stock override: zero cases if OOS marker appears anywhere in row
-                        if self._is_oos(row_text):
-                            cases = 0
-
-                        if upc and not np.isnan(cost) and cost >= self._MIN_PRICE and cases > 0:
+                        if upc and cost is not None and not np.isnan(cost) and cost >= self._MIN_PRICE and cases > 0:
                             rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
-
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
         out = pd.DataFrame(rows, columns=self.WANT_COLS)
         out.reset_index(drop=True, inplace=True)
         return out
 
-    # ----------------- Stage 2: word-grid -----------------
     def _find_header_spans(self, page) -> Optional[Tuple[float, dict]]:
         words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
         if not words:
             return None
+
+        def canon(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
 
         lines = {}
         for w in words:
@@ -244,7 +243,7 @@ class NevadaBeverageParser:
         best_score = 0
         for key, ws in lines.items():
             txt = " ".join([w["text"] for w in sorted(ws, key=lambda x: x["x0"])])
-            ctxt = self._canon(txt)
+            ctxt = canon(txt)
             score = sum(a in ctxt for a in ["qty", "description", "desc", "upc", "dprice", "price", "unitprice"])
             if score >= 3 and score >= best_score:
                 best_score = score
@@ -257,9 +256,9 @@ class NevadaBeverageParser:
 
         def nearest_xcenter(*aliases):
             for target in aliases:
-                tgt = self._canon(target)
+                tgt = canon(target)
                 for w in header_words:
-                    if tgt in self._canon(w["text"]):
+                    if tgt in canon(w["text"]):
                         return (w["x0"] + w["x1"]) / 2.0
             if header_words:
                 return float(np.median([(w["x0"] + w["x1"]) / 2.0 for w in header_words]))
@@ -268,7 +267,7 @@ class NevadaBeverageParser:
         x_qty   = nearest_xcenter("QTY", "Qty", "Quantity")
         x_desc  = nearest_xcenter("DESCRIPTION", "Description", "Desc")
         x_upc   = nearest_xcenter("U.P.C.", "UPC")
-        x_price = nearest_xcenter("D.PRICE", "D PRICE", "UNIT PRICE", "PRICE")  # target unit price center
+        x_price = nearest_xcenter("D.PRICE", "D PRICE", "UNIT PRICE", "PRICE")
 
         colmap = {"qty": x_qty, "desc": x_desc, "upc": x_upc, "price": x_price}
         header_y = float(np.mean([w["top"] for w in header_words]))
@@ -320,14 +319,11 @@ class NevadaBeverageParser:
             upc_txt   = buck.get("upc", "")
             price_txt = buck.get("price", "")
 
-            # Build full-line text for OOS detection
-            full_line_text = " ".join([w["text"] for w in sorted(line_words, key=lambda x: x["x0"])])
-
-            # If price bucket mixes values (e.g., "0.00 15.00 75.00"), choose unit (non-zero, smallest)
             prices_in_bucket = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", price_txt or "")]
             qty_val = self._to_int(qty_txt)
+            if qty_val <= 0:
+                continue
 
-            # Rescue UPC if shoved into desc
             if not upc_txt and re.search(r"\d", desc_txt or ""):
                 m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", desc_txt)
                 if m:
@@ -339,105 +335,20 @@ class NevadaBeverageParser:
 
             upc = self._extract_upc_token(upc_txt)
 
-            # If bucket had no good price, try all prices on the line
-            unit_price = self._select_unit_price(prices_in_bucket, qty_val)
-            if unit_price is None:
-                all_prices = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", full_line_text)]
-                unit_price = self._select_unit_price(all_prices, qty_val)
+            unit_price = None
+            if prices_in_bucket:
+                vals = [p for p in prices_in_bucket if p is not None and not np.isnan(p) and p >= self._MIN_PRICE]
+                if vals:
+                    unit_price = min(vals)
 
-            cases = qty_val
-            name  = desc_txt.strip()
+            if not upc or unit_price is None:
+                continue
 
-            # Out-of-stock override
-            if self._is_oos(full_line_text):
-                cases = 0
-
-            if upc and (unit_price is not None) and unit_price >= self._MIN_PRICE and cases > 0:
-                rows.append({"UPC": upc, "Item Name": name, "Cost": float(unit_price), "Cases": int(cases)})
+            rows.append({"UPC": upc, "Item Name": desc_txt.strip(), "Cost": float(unit_price), "Cases": int(qty_val)})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
         return pd.DataFrame(rows, columns=self.WANT_COLS)
-
-    # ----------------- Regex helpers -----------------
-    def _qty_closest_left_of_upc(self, line: str, upc_span: Tuple[int, int]) -> Optional[int]:
-        """
-        Pick the small integer (≤ _MAX_QTY) **closest to the UPC on the LEFT**.
-        If that integer is 0 → explicit zero-arrival.
-        """
-        left = line[:upc_span[0]]
-        candidates = [(m.start(), int(m.group(1))) for m in re.finditer(r"\b(\d{1,4})\b", left)]
-        # keep plausible case counts
-        candidates = [(pos, v) for (pos, v) in candidates if v <= self._MAX_QTY]
-        if not candidates:
-            return None
-        # closest to UPC is the one with the greatest start position
-        pos, val = max(candidates, key=lambda t: t[0])
-        return val
-
-    # ----------------- Stage 3: text/regex sweep -----------------
-    def _parse_text_regex(self, page) -> pd.DataFrame:
-        txt = page.extract_text() or ""
-        if not txt.strip():
-            return pd.DataFrame(columns=self.WANT_COLS)
-
-        rows = []
-        for li, raw in enumerate(txt.splitlines()):
-            line = raw.strip()
-            if len(line) < 6:
-                continue
-
-            # UPC token (with span for left-of-upc qty detection)
-            m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", line)
-            if not m:
-                m2 = re.search(r"(\d{10,})", line)
-                if not m2:
-                    continue
-                upc = self._extract_upc_token(m2.group(1))
-                upc_span = (m2.start(), m2.end())
-            else:
-                upc = self._extract_upc_token(m.group(1))
-                upc_span = (m.start(), m.end())
-            if not upc:
-                continue
-
-            # OOS detection
-            if self._is_oos(line):
-                # explicit zero-arrival → skip
-                continue
-
-            # Qty = small int closest to the UPC on the LEFT
-            qty = self._qty_closest_left_of_upc(line, upc_span)
-            if qty is None or qty <= 0:
-                continue  # no arrival or unknown qty
-
-            # All price tokens on the line; ignore zeros
-            prices = [self._to_float(mm.group(1)) for mm in re.finditer(r"(\d+\.\d{2})", line)]
-            unit_price = self._select_unit_price(prices, qty)
-            if unit_price is None or unit_price < self._MIN_PRICE:
-                continue
-
-            # Description: slice between qty and UPC if we can find the qty occurrence
-            qmatch = None
-            for mm in re.finditer(r"\b(\d{1,4})\b", line[:upc_span[0]]):
-                try:
-                    if int(mm.group(1)) == qty:
-                        qmatch = mm
-                except Exception:
-                    pass
-            left_clip = (qmatch.end() if qmatch else 0)
-            desc = line[left_clip:upc_span[0]].strip()
-            desc = re.sub(r"\s{2,}", " ", desc).strip(" -–—|;,")
-            if not desc:
-                desc = line[:upc_span[0]].strip()
-
-            rows.append({"UPC": upc, "Item Name": desc, "Cost": float(unit_price), "Cases": int(qty), "_order": li})
-
-        if not rows:
-            return pd.DataFrame(columns=self.WANT_COLS)
-
-        out = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-        return out[self.WANT_COLS]
 
     # ----------------- public API -----------------
     def parse(self, uploaded_file) -> pd.DataFrame:
@@ -455,39 +366,38 @@ class NevadaBeverageParser:
 
         try:
             with pdfplumber.open(uploaded_file) as pdf:
-                # Stage 1: tables
-                items = self._parse_pdf_tables(pdf)
+                # Try STRICT text regex first (based on 5-digit ITEM# then QTY)
+                items = []
+                for page in pdf.pages:
+                    df = self._parse_text_regex_strict(page)
+                    if not df.empty:
+                        items.append(df)
+                items = pd.concat(items, ignore_index=True) if items else pd.DataFrame(columns=self.WANT_COLS)
 
-                # Stage 2: word-grid fallback
-                if items is None or items.empty:
+                # Fallback: tables
+                if items.empty:
+                    items = self._parse_pdf_tables(pdf)
+
+                # Fallback: word-grid
+                if items.empty:
                     rows = []
                     for page in pdf.pages:
                         pg = self._parse_word_grid(page)
                         if not pg.empty:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
-
-                # Stage 3: text/regex sweep
-                if items is None or items.empty:
-                    rows = []
-                    for page in pdf.pages:
-                        pg = self._parse_text_regex(page)
-                        if not pg.empty:
-                            rows.append(pg)
-                    items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
         except Exception:
             items = pd.DataFrame(columns=self.WANT_COLS)
 
-        if items is None or items.empty:
+        if items.empty:
             return pd.DataFrame(columns=self.WANT_COLS)
 
-        # Defensive normalization
+        # Normalize and filter
         items["UPC"] = items["UPC"].astype(str).str.replace(r"\D", "", regex=True).str[:12].str.zfill(12)
         items["Item Name"] = items["Item Name"].astype(str).str.strip()
         items["Cost"] = pd.to_numeric(items["Cost"], errors="coerce")
         items["Cases"] = pd.to_numeric(items["Cases"], errors="coerce").fillna(0).astype(int)
 
-        # Keep only arrived items (Cases > 0) and valid costs
         items = items[(items["UPC"] != "") & items["Cost"].notna() & (items["Cost"] >= self._MIN_PRICE) & (items["Cases"] > 0)].copy()
         items.reset_index(drop=True, inplace=True)
         return items[self.WANT_COLS]
