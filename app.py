@@ -116,6 +116,7 @@ def _download_xlsx(df: pd.DataFrame, filename: str, sheet="Sheet1"):
     st.download_button(f"Download {filename}", bio.getvalue(), filename)
 
 def _download_csv_with_upc_text(df: pd.DataFrame, filename: str, upc_col="UPC"):
+    # Force Excel to keep leading zeros by exporting UPC as ="001234..."
     df2 = df.copy()
     if upc_col in df2.columns:
         df2[upc_col] = df2[upc_col].astype(str).map(lambda x: f'="{x}"')
@@ -439,8 +440,17 @@ def process_unified(pos_csv_file, unified_files):
 
     return full_export_df, pos_update_df, gs1_out, unmatched
 
-# ===================== Session state for Unified downloads =====================
+# ===================== Session state =====================
+# Unified
 for k in ["full_export_df", "pos_update_df", "gs1_df", "unmatched_df", "ts"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# Southern Glazer's (persist after processing)
+for k in [
+    "sg_invoice_items_df", "sg_updated_master", "sg_cost_changes",
+    "sg_not_in_master", "sg_pack_missing", "sg_pos_update", "sg_pb_missing", "sg_ts"
+]:
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -530,7 +540,7 @@ with tabs[1]:
     master_xlsx = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="sg_master")
     pricebook_csv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="sg_pb")
 
-    if st.button("Process SG"):
+    if st.button("Process SG", type="primary"):
         if not inv_files or not master_xlsx:
             st.error("Please upload at least one SG invoice and the Master workbook.")
         else:
@@ -543,48 +553,116 @@ with tabs[1]:
                     parts.append(df)
             invoice_items_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
             invoice_items_df = _ensure_invoice_cols(invoice_items_df)
+
             if invoice_items_df.empty:
                 st.error("Could not parse any SG items (no UPC/Item Name/Cost/Cases). Please check the PDF.")
             else:
-                _download_csv_with_upc_text(invoice_items_df, "sg_invoice_items.csv", upc_col="UPC")
-
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
-                if updated_master is None:
-                    st.error("No valid items to merge into Master.")
-                else:
-                    bio_master = BytesIO()
-                    with pd.ExcelWriter(bio_master, engine="openpyxl") as w:
-                        updated_master.to_excel(w, index=False, sheet_name="Master")
-                    st.download_button("Download Updated Master (XLSX)", bio_master.getvalue(), "Master_UPDATED.xlsx")
+                pos_update = None
+                pb_missing = None
+                if pricebook_csv is not None and updated_master is not None:
+                    pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
-                    if cost_changes is not None and not cost_changes.empty:
-                        st.caption("Cost changes")
-                        st.dataframe(cost_changes, use_container_width=True)
-                        st.download_button("Download Cost Changes (CSV)", cost_changes.to_csv(index=False).encode("utf-8"), "sg_cost_changes.csv")
+                # Persist everything in session_state so downloads stay after clicking
+                st.session_state["sg_invoice_items_df"] = invoice_items_df
+                st.session_state["sg_updated_master"]   = updated_master
+                st.session_state["sg_cost_changes"]     = cost_changes
+                st.session_state["sg_not_in_master"]    = not_in_master
+                st.session_state["sg_pack_missing"]     = pack_missing
+                st.session_state["sg_pos_update"]       = pos_update
+                st.session_state["sg_pb_missing"]       = pb_missing
+                st.session_state["sg_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                    if not_in_master is not None and not not_in_master.empty:
-                        st.caption("Invoice UPCs not in Master")
-                        st.dataframe(not_in_master, use_container_width=True)
-                        st.download_button("Download Not-in-Master (CSV)", not_in_master.to_csv(index=False).encode("utf-8"), "sg_not_in_master.csv")
+                st.success("Southern Glazer's — processing complete.")
 
-                    if pack_missing is not None and not pack_missing.empty:
-                        st.caption("Added items with Pack == 0")
-                        st.dataframe(pack_missing, use_container_width=True)
-                        st.download_button("Download Added-with-Pack-0 (CSV)", pack_missing.to_csv(index=False).encode("utf-8"), "sg_added_pack_zero.csv")
+    # Render persistent downloads / previews if we have them
+    if st.session_state["sg_invoice_items_df"] is not None:
+        sg_ts = st.session_state["sg_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                    if pricebook_csv is not None:
-                        pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
-                        st.caption("POS update preview")
-                        st.dataframe(pos_update.head(100), use_container_width=True)
-                        bio_pos = BytesIO()
-                        with pd.ExcelWriter(bio_pos, engine="openpyxl") as w:
-                            pos_update.to_excel(w, index=False, sheet_name="POS_Update")
-                        st.download_button("Download POS Update (XLSX)", bio_pos.getvalue(), "POS_Update.xlsx")
+        st.subheader("Invoice Items (parsed, in-invoice order)")
+        st.dataframe(st.session_state["sg_invoice_items_df"].head(100), use_container_width=True)
 
-                        if pb_missing is not None and not pb_missing.empty:
-                            st.warning("Some invoice items were not found in the pricebook.")
-                            st.dataframe(pb_missing, use_container_width=True)
-                            st.download_button("Download Pricebook Missing (CSV)", pb_missing.to_csv(index=False).encode("utf-8"), "pricebook_missing.csv")
+        # Download: Invoice Items CSV (keep leading zeros in Excel)
+        inv_items_df = st.session_state["sg_invoice_items_df"]
+        df2 = inv_items_df.copy()
+        if "UPC" in df2.columns:
+            df2["UPC"] = df2["UPC"].astype(str).map(lambda x: f'="{x}"')
+        st.download_button(
+            "⬇️ Download Invoice Items (CSV)",
+            data=df2.to_csv(index=False).encode("utf-8"),
+            file_name=f"sg_invoice_items_{sg_ts}.csv",
+            mime="text/csv",
+            key="sg_dl_invoice_items",
+        )
+
+        if st.session_state["sg_updated_master"] is not None:
+            st.subheader("Updated Master (preview)")
+            st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
+            bio_master = BytesIO()
+            with pd.ExcelWriter(bio_master, engine="openpyxl") as w:
+                st.session_state["sg_updated_master"].to_excel(w, index=False, sheet_name="Master")
+            st.download_button(
+                "⬇️ Download Updated Master (XLSX)",
+                data=bio_master.getvalue(),
+                file_name=f"Master_UPDATED_{sg_ts}.xlsx",
+                key="sg_dl_master_xlsx"
+            )
+
+        if st.session_state["sg_cost_changes"] is not None and not st.session_state["sg_cost_changes"].empty:
+            st.caption("Cost changes")
+            st.dataframe(st.session_state["sg_cost_changes"], use_container_width=True)
+            st.download_button(
+                "⬇️ Cost Changes (CSV)",
+                data=st.session_state["sg_cost_changes"].to_csv(index=False).encode("utf-8"),
+                file_name=f"sg_cost_changes_{sg_ts}.csv",
+                key="sg_dl_cost_changes"
+            )
+
+        if st.session_state["sg_not_in_master"] is not None and not st.session_state["sg_not_in_master"].empty:
+            st.caption("Invoice UPCs not in Master")
+            st.dataframe(st.session_state["sg_not_in_master"], use_container_width=True)
+            st.download_button(
+                "⬇️ Not in Master (CSV)",
+                data=st.session_state["sg_not_in_master"].to_csv(index=False).encode("utf-8"),
+                file_name=f"sg_not_in_master_{sg_ts}.csv",
+                key="sg_dl_not_in_master"
+            )
+
+        if st.session_state["sg_pack_missing"] is not None and not st.session_state["sg_pack_missing"].empty:
+            st.caption("Added items with Pack == 0")
+            st.dataframe(st.session_state["sg_pack_missing"], use_container_width=True)
+            st.download_button(
+                "⬇️ Added with Pack 0 (CSV)",
+                data=st.session_state["sg_pack_missing"].to_csv(index=False).encode("utf-8"),
+                file_name=f"sg_added_pack_zero_{sg_ts}.csv",
+                key="sg_dl_pack_zero"
+            )
+
+        if st.session_state["sg_pos_update"] is not None:
+            st.subheader("POS Update (preview)")
+            st.dataframe(st.session_state["sg_pos_update"].head(100), use_container_width=True)
+            bio_pos = BytesIO()
+            with pd.ExcelWriter(bio_pos, engine="openpyxl") as w:
+                st.session_state["sg_pos_update"].to_excel(w, index=False, sheet_name="POS_Update")
+            st.download_button(
+                "⬇️ Download POS Update (XLSX)",
+                data=bio_pos.getvalue(),
+                file_name=f"POS_Update_{sg_ts}.xlsx",
+                key="sg_dl_pos_update"
+            )
+
+        if st.session_state["sg_pb_missing"] is not None and not st.session_state["sg_pb_missing"].empty:
+            st.warning("Some invoice items were not found in the pricebook.")
+            st.dataframe(st.session_state["sg_pb_missing"], use_container_width=True)
+            st.download_button(
+                "⬇️ Pricebook Missing (CSV)",
+                data=st.session_state["sg_pb_missing"].to_csv(index=False).encode("utf-8"),
+                file_name=f"pricebook_missing_{sg_ts}.csv",
+                key="sg_dl_pb_missing"
+            )
+
+    else:
+        st.info("Upload SG invoice(s) and Master, then click **Process SG**. Downloads will persist afterward.")
 
 # ---------- Nevada Beverage ----------
 with tabs[2]:
