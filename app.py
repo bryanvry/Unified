@@ -3,10 +3,18 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-# ===== Imports for vendor parsers (these files should already exist as you pasted earlier) =====
+# ===== Imports for vendor parsers (already added previously) =====
 from parsers import SouthernGlazersParser, NevadaBeverageParser
 
 st.set_page_config(page_title="Unified Invoice Processor", layout="wide")
+
+# ===================== Constants =====================
+# Unified ignore list (as you requested earlier)
+UNIFIED_IGNORE_UPCS = {
+    "000000000000",
+    "003760010302",
+    "023700052551",
+}
 
 # ===================== Utilities =====================
 def _to_int_safe(x):
@@ -81,7 +89,7 @@ def _download_csv_with_upc_text(df: pd.DataFrame, filename: str, upc_col="UPC"):
         df2[upc_col] = df2[upc_col].astype(str).map(lambda x: f'="{x}"')
     st.download_button(f"Download {filename}", df2.to_csv(index=False).encode("utf-8"), filename)
 
-# ===================== Master update & POS build =====================
+# ===================== Master update & POS build (for SG/NV) =====================
 def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
     """
     Apply SG/NV invoice updates to Master:
@@ -184,7 +192,7 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
       - addstock = Master.Total
       - cost_cents = Master.'Cost ¢'
     Match on UPC using RIGHTMOST 12 digits with preserved leading zeros
-    on BOTH Master['Full Barcode'] and pricebook['Upc'].
+    on BOTH Master['Full Barcode'] and pricebook['Upc'|'UPC'].
     """
     pb = pd.read_csv(pricebook_csv, dtype=str).fillna("")
 
@@ -195,7 +203,6 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
             upc_col = cand
             break
     if upc_col is None:
-        # Create it so downstream code doesn't crash; result will be empty anyway
         upc_col = "Upc"
         pb[upc_col] = ""
 
@@ -249,7 +256,6 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
     if pos_norm_set != master_norm_set:
         missing_norms = sorted(master_norm_set - pos_norm_set)
         if missing_norms:
-            # Provide original Full Barcode and (optionally) Name if present
             cols_to_show = ["__fb_norm", full_barcode_col]
             if "Name" in master.columns:
                 cols_to_show.append("Name")
@@ -260,7 +266,7 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
     return pos_update.drop(columns=["__upc_norm"]), missing
 
 # ===================== UI =====================
-st.title("Invoice Processor")
+st.title("Unified — Multi-Vendor Invoice Processor")
 
 tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage"])
 
@@ -275,15 +281,28 @@ with tabs[0]:
         if not pos_csv or not inv_files:
             st.error("Please upload at least one Unified invoice and the POS CSV.")
         else:
-            # Read POS
+            # Read POS & normalize UPC field
             pos_df = pd.read_csv(pos_csv, dtype=str).fillna("")
+            # Accept either Upc or UPC; create a canonical 'UPC' normalized for joins
+            if "UPC" not in pos_df.columns and "Upc" in pos_df.columns:
+                pos_df["UPC"] = pos_df["Upc"]
+            if "UPC" not in pos_df.columns:
+                pos_df["UPC"] = ""
+            pos_df["UPC"] = pos_df["UPC"].map(_norm_upc_12)
+
+            # $Now from cents
             if "cents" in pos_df.columns and "$Now" not in pos_df.columns:
                 pos_df["$Now"] = (pd.to_numeric(pos_df["cents"], errors="coerce").fillna(0) / 100).round(2)
+            elif "$Now" not in pos_df.columns:
+                pos_df["$Now"] = 0.0
 
+            # Collect & normalize Unified invoice rows
             inv_parts = []
             for f in inv_files:
                 x = pd.read_excel(f, dtype=str).fillna("")
                 x.columns = [c.strip() for c in x.columns]
+                # Map common headers (case-insensitive)
+                # These are typical from your prior Unified files
                 colmap = {
                     "Item UPC": "Item UPC",
                     "Brand": "Brand",
@@ -292,7 +311,7 @@ with tabs[0]:
                     "Size": "Size",
                     "Net Case Cost": "Net Case Cost",
                     "Case Qty": "Case Qty",
-                    "+Cost": "Net Case Cost",
+                    "+Cost": "Net Case Cost",  # allow +Cost alias to fill Net Case Cost
                     "Invoice Date": "Invoice Date",
                     "Date": "Invoice Date",
                 }
@@ -304,10 +323,16 @@ with tabs[0]:
                         else:
                             if v not in x.columns:
                                 x[v] = ""
+
+                # Numeric cleanup
                 x["Case Qty"] = pd.to_numeric(x["Case Qty"], errors="coerce").fillna(0).astype(float)
                 x["Net Case Cost"] = pd.to_numeric(x["Net Case Cost"], errors="coerce")
+                x["Invoice Date"] = pd.to_datetime(x["Invoice Date"], errors="coerce")
+
+                # Ignore items that did NOT arrive
                 x = x[x["Case Qty"] > 0]
 
+                # Normalize UPC per Unified quirks
                 def norm_un(u):
                     s = str(u or "").replace("-", "").replace(" ", "")
                     s = "".join(ch for ch in s if ch.isdigit())
@@ -316,47 +341,59 @@ with tabs[0]:
                     if len(s) < 12:
                         s = s.zfill(12)
                     return s
+
                 x["Item UPC"] = x["Item UPC"].map(norm_un)
+
+                # Drop ignored UPCs
+                x = x[~x["Item UPC"].isin(UNIFIED_IGNORE_UPCS)]
+
                 inv_parts.append(x)
 
             if not inv_parts:
                 st.error("No usable Unified rows found in the uploaded files.")
             else:
                 inv_all = pd.concat(inv_parts, ignore_index=True)
-                inv_all["Invoice Date"] = pd.to_datetime(inv_all["Invoice Date"], errors="coerce")
-                inv_all = inv_all.sort_values(["Item UPC", "Invoice Date"], ascending=[True, True])
-                inv_latest = inv_all.groupby("Item UPC", as_index=False).tail(1)
 
-                # Goal Sheet 1
+                # Keep the latest-arrived record per UPC (based on Invoice Date; if missing, keep last occurrence)
+                inv_all["__order"] = inv_all.groupby("Item UPC").cumcount()
+                inv_all = inv_all.sort_values(["Item UPC", "Invoice Date", "__order"], ascending=[True, True, True])
+                inv_latest = inv_all.groupby("Item UPC", as_index=False).tail(1).drop(columns=["__order"])
+
+                # ==== Goal Sheet 1 ====
+                # Columns: UPC, Brand, Description, Pack, Size, Cost, +Cost (Net Case Cost),
+                # Unit = +Cost / Pack, D40% = Unit / 0.6, 40% = (Cost / Pack) / 0.6, $Now (from pricebook cents)
                 gs1 = inv_latest[["Item UPC","Brand","Description","Pack","Size","Net Case Cost"]].copy()
                 gs1.rename(columns={"Item UPC":"UPC","Net Case Cost":"+Cost"}, inplace=True)
                 gs1["Pack"] = pd.to_numeric(gs1["Pack"], errors="coerce").fillna(0)
                 gs1["+Cost"] = pd.to_numeric(gs1["+Cost"], errors="coerce").fillna(0.0)
+                gs1["Cost"] = gs1["+Cost"]
                 gs1["Unit"] = (gs1["+Cost"] / gs1["Pack"]).replace([float("inf")], 0).fillna(0.0)
                 gs1["D40%"] = (gs1["Unit"] / 0.6).round(2)
-                gs1["Cost"] = gs1["+Cost"]
                 gs1["40%"] = ((gs1["Cost"] / gs1["Pack"]) / 0.6).replace([float("inf")], 0).fillna(0.0).round(2)
 
-                if "UPC" in pos_df.columns:
-                    pos_now = pos_df[["UPC","cents"]].copy()
-                    pos_now["$Now"] = (pd.to_numeric(pos_now["cents"], errors="coerce").fillna(0) / 100).round(2)
-                    pos_now = pos_now[["UPC","$Now"]]
-                    gs1 = gs1.merge(pos_now, on="UPC", how="left")
-                else:
-                    gs1["$Now"] = 0.0
+                # Merge $Now by normalized UPC
+                gs1["UPC"] = gs1["UPC"].map(_norm_upc_12)
+                pos_now = pos_df[["UPC","$Now"]].copy()
+                gs1 = gs1.merge(pos_now, on="UPC", how="left")
 
-                # Goal Sheet 2
+                # ==== Goal Sheet 2 ====
+                # Same as POS sheet but ONLY items found in Unified; cost_qty = Pack; cost_cents = +Cost (in cents)
+                # Join using normalized 12-digit UPC
                 if "UPC" in pos_df.columns:
                     keep_upcs = set(gs1["UPC"])
                     pos2 = pos_df[pos_df["UPC"].isin(keep_upcs)].copy()
+
+                    # Ensure fields exist
                     if "cost_qty" not in pos2.columns:
                         pos2["cost_qty"] = ""
                     if "cost_cents" not in pos2.columns:
                         pos2["cost_cents"] = ""
+
                     join = gs1[["UPC","Pack","+Cost"]].copy()
-                    join["cost_qty"] = join["Pack"].astype(int)
-                    join["cost_cents"] = (join["+Cost"].round(2) * 100).astype(int)
+                    join["cost_qty"] = join["Pack"].fillna(0).astype(float).astype(int)
+                    join["cost_cents"] = (join["+Cost"].fillna(0.0).round(2) * 100).astype(int)
                     join = join[["UPC","cost_qty","cost_cents"]]
+
                     # drop old then merge
                     pos2 = pos2.drop(columns=[c for c in ["cost_qty","cost_cents"] if c in pos2.columns]).merge(join, on="UPC", how="left")
                 else:
@@ -369,7 +406,7 @@ with tabs[0]:
                     st.dataframe(pos2.head(100), use_container_width=True)
                     _download_xlsx(pos2, "Goal_Sheet_2.xlsx", sheet="POS Update")
                 else:
-                    st.info("POS upload sheet not generated (pricebook missing a 'UPC' column or no matches).")
+                    st.info("POS upload sheet not generated (pricebook missing a usable 'Upc'/'UPC' column or no matches).")
 
 # ---------- Southern Glazer's ----------
 with tabs[1]:
