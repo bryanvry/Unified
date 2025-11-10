@@ -1,11 +1,11 @@
 # parsers/nevada_beverage.py
 # Nevada Beverage PDF-only parser with robust UPC extraction
-# and explicit preference for D.PRICE (unit price) over EXT (extended).
+# and explicit preference for D.PRICE (unit price) over EXT and DEP=0.00.
 #
 # Stages:
 #   1) Tables via pdfplumber.extract_tables()
 #   2) Word-grid reconstruction (header-detected column bucketing)
-#   3) Text/regex sweep per line (with unit-price selection)
+#   3) Text/regex sweep per line (with unit-price logic)
 #
 # Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
 
@@ -22,6 +22,7 @@ except Exception:
 
 class NevadaBeverageParser:
     WANT_COLS = ["UPC", "Item Name", "Cost", "Cases"]
+    _MIN_PRICE = 0.01  # ignore DEP=0.00 and other zeros
 
     # ----------------- helpers -----------------
     @staticmethod
@@ -36,7 +37,7 @@ class NevadaBeverageParser:
           - If 13 digits and starts with '0' (EAN-13 wrapper), return last 12 (UPC-A).
           - Else if 13 digits and doesn't start with '0', return first 12.
           - If 12 digits, return as-is.
-          - Otherwise return "" (or first 12 of any long blob as a last resort).
+          - Otherwise return first 12 of any longer blob.
         """
         if not s:
             return ""
@@ -82,6 +83,25 @@ class NevadaBeverageParser:
     @staticmethod
     def _canon(s: str) -> str:
         return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
+
+    # ----------------- price selection -----------------
+    def _select_unit_price(self, prices: List[float], qty: int) -> Optional[float]:
+        """
+        Given all price-like tokens on a line and the parsed qty:
+          - Drop zeros/near-zeros (< _MIN_PRICE).
+          - If multiple remain, prefer the smallest (likely unit D.PRICE).
+          - If both small and large and large ≈ small * qty, pick small.
+        """
+        vals = [p for p in prices if (not np.isnan(p)) and (p >= self._MIN_PRICE)]
+        if not vals:
+            return None
+        vals_sorted = sorted(vals)
+        unit = vals_sorted[0]
+        if qty and len(vals_sorted) >= 2:
+            big = vals_sorted[-1]
+            if abs(big - unit * qty) <= 0.02 * max(1.0, big):  # within ~2%
+                return unit
+        return unit
 
     # ----------------- header matching -----------------
     def _match_header(self, columns: List[str]) -> Optional[dict]:
@@ -165,7 +185,7 @@ class NevadaBeverageParser:
                         cases = self._to_int(qty)
                         name  = str(name).strip()
 
-                        if upc and not np.isnan(cost) and cases > 0:
+                        if upc and not np.isnan(cost) and cost >= self._MIN_PRICE and cases > 0:
                             rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
 
         if not rows:
@@ -213,7 +233,7 @@ class NevadaBeverageParser:
         x_qty   = nearest_xcenter("QTY", "Qty", "Quantity")
         x_desc  = nearest_xcenter("DESCRIPTION", "Description", "Desc")
         x_upc   = nearest_xcenter("U.P.C.", "UPC")
-        x_price = nearest_xcenter("D.PRICE", "D PRICE", "UNIT PRICE", "PRICE")  # price center ~ unit price
+        x_price = nearest_xcenter("D.PRICE", "D PRICE", "UNIT PRICE", "PRICE")  # target unit price center
 
         colmap = {"qty": x_qty, "desc": x_desc, "upc": x_upc, "price": x_price}
         header_y = float(np.mean([w["top"] for w in header_words]))
@@ -264,6 +284,11 @@ class NevadaBeverageParser:
             upc_txt   = buck.get("upc", "")
             price_txt = buck.get("price", "")
 
+            # If price bucket contains multiple tokens (e.g., "0.00 15.00 75.00"),
+            # choose unit (non-zero, smallest; check EXT ≈ unit*qty if both present).
+            prices_in_bucket = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", price_txt or "")]
+            qty_val = self._to_int(qty_txt)
+
             # Rescue UPC if shoved into desc
             if not upc_txt and re.search(r"\d", desc_txt or ""):
                 m = re.search(r"(?<!\d)(\d{12,13})(?!\d)", desc_txt)
@@ -274,37 +299,25 @@ class NevadaBeverageParser:
                     if m2:
                         upc_txt = m2.group(1)
 
-            upc   = self._extract_upc_token(upc_txt)
-            cases = self._to_int(qty_txt)
-            cost  = self._to_float(price_txt)
+            upc = self._extract_upc_token(upc_txt)
+
+            # If bucket had no good price, try all prices on the line
+            unit_price = self._select_unit_price(prices_in_bucket, qty_val)
+            if unit_price is None:
+                all_prices = [self._to_float(m) for m in re.findall(r"\d+\.\d{2}", " ".join(buck.values()))]
+                unit_price = self._select_unit_price(all_prices, qty_val)
+
+            cases = qty_val
             name  = desc_txt.strip()
 
-            if upc and not np.isnan(cost) and cases > 0:
-                rows.append({"UPC": upc, "Item Name": name, "Cost": float(cost), "Cases": int(cases)})
+            if upc and (unit_price is not None) and unit_price >= self._MIN_PRICE and cases > 0:
+                rows.append({"UPC": upc, "Item Name": name, "Cost": float(unit_price), "Cases": int(cases)})
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
         return pd.DataFrame(rows, columns=self.WANT_COLS)
 
     # ----------------- Stage 3: text/regex sweep -----------------
-    def _select_unit_price(self, prices: List[float], qty: int) -> Optional[float]:
-        """
-        Given all price-like tokens on a line and the parsed qty:
-          - If multiple prices, prefer the smallest (likely D.PRICE).
-          - If we have both small and large and large ≈ small * qty, pick small.
-          - Else return the smallest non-NaN.
-        """
-        vals = [p for p in prices if not np.isnan(p)]
-        if not vals:
-            return None
-        vals_sorted = sorted(vals)
-        unit = vals_sorted[0]
-        if qty and len(vals_sorted) >= 2:
-            big = vals_sorted[-1]
-            if abs(big - unit * qty) <= 0.02 * max(1.0, big):  # within ~2%
-                return unit
-        return unit
-
     def _parse_text_regex(self, page) -> pd.DataFrame:
         txt = page.extract_text() or ""
         if not txt.strip():
@@ -328,14 +341,12 @@ class NevadaBeverageParser:
             if not upc:
                 continue
 
-            # All price tokens on the line
+            # All price tokens on the line; ignore zeros
             price_matches = list(re.finditer(r"(\d+\.\d{2})", line))
-            prices = [self._to_float(m.group(1)) for m in price_matches]
-            if not prices:
-                continue
+            prices = [self._to_float(mm.group(1)) for mm in price_matches]
+            qty = None
 
             # Qty (use first small integer; refine using pos relative to UPC if needed)
-            qty = None
             ints = list(re.finditer(r"\b(\d{1,4})\b", line))
             if ints:
                 try:
@@ -353,9 +364,8 @@ class NevadaBeverageParser:
             if qty is None or qty <= 0:
                 continue
 
-            # Choose unit price over EXT
             unit_price = self._select_unit_price(prices, qty)
-            if unit_price is None:
+            if unit_price is None or unit_price < self._MIN_PRICE:
                 continue
 
             # Description between qty and UPC if possible
@@ -403,7 +413,7 @@ class NevadaBeverageParser:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
 
-                # Stage 3: text/regex sweep (with unit-price logic)
+                # Stage 3: text/regex sweep (with unit-price logic and zero filtering)
                 if items is None or items.empty:
                     rows = []
                     for page in pdf.pages:
@@ -423,6 +433,6 @@ class NevadaBeverageParser:
         items["Cost"] = pd.to_numeric(items["Cost"], errors="coerce")
         items["Cases"] = pd.to_numeric(items["Cases"], errors="coerce").fillna(0).astype(int)
 
-        items = items[(items["UPC"] != "") & items["Cost"].notna() & (items["Cases"] > 0)].copy()
+        items = items[(items["UPC"] != "") & items["Cost"].notna() & (items["Cost"] >= self._MIN_PRICE) & (items["Cases"] > 0)].copy()
         items.reset_index(drop=True, inplace=True)
         return items[self.WANT_COLS]
