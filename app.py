@@ -43,7 +43,7 @@ with st.sidebar:
     st.write("- Ignore list: 000000000000, 003760010302, 023700052551")
 
 pos_file = st.file_uploader("Upload POS pricebook CSV", type=["csv"], accept_multiple_files=False, key="pos")
-inv_files = st.file_uploader("Upload invoice file(s) (XLSX/XLS/CSV)", type=["xlsx","xls","csv"], accept_multiple_files=True, key="inv")
+inv_files = st.file_uploader("Upload invoice file(s) (XLSX/XLS/CSV)", type=["xlsx","xls","csv","pdf"], accept_multiple_files=True, key="inv")
 
 def autodetect_parser(file, content_head: str):
     best = None
@@ -55,14 +55,26 @@ def autodetect_parser(file, content_head: str):
     return best
 
 def read_head_text(file, nrows=50):
+    name = file.name.lower()
     try:
-        if file.name.lower().endswith(".csv"):
+        if name.endswith(".csv"):
             df = pd.read_csv(file, header=None, dtype=str, nrows=nrows)
-        else:
+            return "\n".join(" ".join(map(str, df.iloc[i].tolist())) for i in range(len(df)))
+        elif name.endswith((".xlsx",".xls")):
             df = pd.read_excel(file, header=None, dtype=str, nrows=nrows)
-        return "\n".join(" ".join([str(x) for x in df.iloc[i].tolist()]) for i in range(len(df)))
+            return "\n".join(" ".join(map(str, df.iloc[i].tolist())) for i in range(len(df)))
+        elif name.endswith(".pdf"):
+            import pdfplumber
+            text_chunks = []
+            with pdfplumber.open(file) as pdf:
+                for page in pdf.pages[:2]:  # first 2 pages for detection
+                    text = page.extract_text() or ""
+                    text_chunks.append(text)
+            return "\n".join(text_chunks)
     except Exception:
-        return ""
+        pass
+    return ""
+
 
 def process(pos_csv_file, invoice_files, vendor_choice: str):
     pos_df = pd.read_csv(pos_csv_file, dtype=str, keep_default_na=False, na_values=[])
