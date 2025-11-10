@@ -12,7 +12,7 @@ class SouthernGlazersParser:
     """
     Southern Glazer's invoice parser.
 
-    - Accepts PDF, XLSX/XLS, CSV  (TXT is optional; not required)
+    - Accepts PDF, XLSX/XLS, CSV
     - Uses Unit Net Amount as +Cost
     - Pack from 'CS ORD/DLV' (first integer)
     - Returns normalized columns:
@@ -25,7 +25,6 @@ class SouthernGlazersParser:
     def _is_pdf(self, uploaded_file) -> bool:
         """Detect by magic header or mimetype; always seek(0) afterward."""
         try:
-            # some streamlit UploadFile objects expose .type
             mt = getattr(uploaded_file, "type", "") or ""
             if "pdf" in mt.lower():
                 return True
@@ -88,14 +87,12 @@ class SouthernGlazersParser:
     # ---------- main parse ----------
     def parse(self, uploaded_file) -> pd.DataFrame:
         # 1) Decide reader: prefer PDF if detected; otherwise table
-        lines = None
         try:
             if self._is_pdf(uploaded_file):
                 lines = self._read_lines_from_pdf(uploaded_file)
             else:
                 lines = self._read_lines_from_table(uploaded_file)
         except Exception:
-            # last resort: return empty normalized df (prevents hard crash)
             cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
             return pd.DataFrame(columns=cols)
 
@@ -152,27 +149,28 @@ class SouthernGlazersParser:
         if current.get("UPC"):
             items.append(current)
 
-        # 3) Build normalized DataFrame
+        # 3) Build normalized DataFrame (robust to empty/missing cols)
         out = pd.DataFrame(items)
 
-        # +Cost := Unit Net Amount (same as Cost above for SG)
-        if "Cost" in out.columns:
-            out["+Cost"] = out["Cost"]
-        else:
-            out["+Cost"] = pd.NA
+        if out.empty:
+            cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
+            return pd.DataFrame(columns=cols)
 
-        out["invoice_date"] = pd.to_datetime(out.get("invoice_date"), errors="coerce").dt.date
-        out["Pack"] = pd.to_numeric(out.get("Pack"), errors="coerce")
+        # Ensure required columns exist before conversions
+        for col in ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]:
+            if col not in out.columns:
+                out[col] = "" if col in ["Brand","Description","Size"] else pd.NA
+
+        # +Cost := Unit Net Amount (same as Cost above for SG)
+        if out["+Cost"].isna().all():
+            out["+Cost"] = out["Cost"]
+
+        # Safe conversions
+        out["invoice_date"] = pd.to_datetime(out["invoice_date"], errors="coerce").dt.date
+        out["Pack"] = pd.to_numeric(out["Pack"], errors="coerce")
         out.loc[out["Pack"].isna() | (out["Pack"] <= 0), "Pack"] = 1
-        out["Case Qty"] = pd.Series([pd.NA] * len(out), dtype="Int64")  # unknown for SG here
-        out["Brand"] = out.get("Brand", "")
-        out["Description"] = out.get("Description", "")
-        out["Size"] = out.get("Size", "")
+        out["Case Qty"] = pd.Series([pd.NA] * len(out), dtype="Int64")
 
         cols = ["invoice_date","UPC","Brand","Description","Pack","Size","Cost","+Cost","Case Qty"]
-        for c in cols:
-            if c not in out.columns:
-                out[c] = "" if c in ["Brand","Description","Size"] else pd.NA
-
         out = out[cols]
         return sanitize_columns(out)
