@@ -1,6 +1,10 @@
 # parsers/nevada_beverage.py
-# Nevada Beverage PDF-only parser with robust fallback.
-# Output columns: ["UPC", "Item Name", "Cost", "Cases"] in invoice order.
+# Nevada Beverage PDF-only parser with 3-stage extraction:
+# 1) Table extraction via pdfplumber.extract_tables()
+# 2) Word-grid reconstruction (header-detected column bucketing)
+# 3) Text/regex line sweep (no table required)
+#
+# Output columns (invoice order preserved): ["UPC", "Item Name", "Cost", "Cases"]
 
 from typing import List, Optional, Tuple
 import re
@@ -16,7 +20,7 @@ except Exception:
 class NevadaBeverageParser:
     WANT_COLS = ["UPC", "Item Name", "Cost", "Cases"]
 
-    # ----------------- basic helpers -----------------
+    # ----------------- helpers -----------------
     @staticmethod
     def _digits_only(s: str) -> str:
         return re.sub(r"\D", "", str(s)) if s is not None else ""
@@ -34,8 +38,8 @@ class NevadaBeverageParser:
             return np.nan
         if isinstance(x, (int, float, np.number)):
             return float(x)
-        s = str(x).replace("$", "").replace(",", "").strip()
-        # handle stray unicode or trailing dots
+        s = str(x)
+        s = s.replace("$", "").replace(",", "").strip()
         s = re.sub(r"[^\d.\-]", "", s)
         try:
             return float(s)
@@ -51,23 +55,17 @@ class NevadaBeverageParser:
 
     @staticmethod
     def _canon(s: str) -> str:
-        # normalize to alnum lowercase for matching ("U.P.C." -> "upc")
         return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
 
     # ----------------- header matching -----------------
     def _match_header(self, columns: List[str]) -> Optional[dict]:
-        """
-        Given a list of header cell texts, return a mapping to the original header labels.
-        """
         cmap = {self._canon(c): c for c in columns}
 
         def pick(*aliases):
-            # exact canonical first
             for a in aliases:
                 ca = self._canon(a)
                 if ca in cmap:
                     return cmap[ca]
-            # contains fallback
             for a in aliases:
                 ca = self._canon(a)
                 for k, orig in cmap.items():
@@ -78,7 +76,8 @@ class NevadaBeverageParser:
         col_qty   = pick("QTY", "Qty", "Quantity")
         col_desc  = pick("DESCRIPTION", "Description", "Item Description", "Desc")
         col_upc   = pick("U.P.C.", "UPC", "U P C", "U.P.C")
-        col_price = pick("D.PRICE", "DPRICE", "Unit Price", "Price")
+        # Price header varies a LOT on NV: D.PRICE, D PRICE, PRICE, UNIT PRICE, D-PRICE, DPRC
+        col_price = pick("D.PRICE", "DPRICE", "D PRICE", "PRICE", "UNITPRICE", "UNIT PRICE", "D-PRICE", "DPRC", "PRC")
 
         if all([col_qty, col_desc, col_upc, col_price]):
             return {
@@ -89,84 +88,78 @@ class NevadaBeverageParser:
             }
         return None
 
-    # ----------------- table-first parse -----------------
+    # ----------------- Stage 1: tables -----------------
     def _parse_pdf_tables(self, pdf: "pdfplumber.PDF") -> pd.DataFrame:
         rows = []
 
+        table_settings = {
+            "vertical_strategy": "lines",    # try lines first
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "edge_min_length": 3,
+        }
+
         for page in pdf.pages:
-            try:
-                tables = page.extract_tables()
-            except Exception:
-                tables = []
-
-            for tbl in tables or []:
-                if not tbl or len(tbl) < 2:
-                    continue
-
-                # find a plausible header row
-                header = None
-                header_idx = 0
-                for i, row in enumerate(tbl[:6]):
-                    if any(str(x or "").strip() for x in row):
-                        header = [str(x or "").strip() for x in row]
-                        header_idx = i
-                        break
-                if header is None:
-                    continue
-
-                colmap = self._match_header(header)
-                if not colmap:
-                    continue
-
-                body = tbl[header_idx + 1 :]
-                if not body:
-                    continue
-
-                df = pd.DataFrame(body, columns=header)
-
-                for _, r in df.iterrows():
-                    upc_raw = r.get(colmap["U.P.C."], "")
-                    name    = r.get(colmap["DESCRIPTION"], "")
-                    price   = r.get(colmap["D.PRICE"], "")
-                    qty     = r.get(colmap["QTY"], "")
-
-                    upc   = self._norm_upc_12(upc_raw)
-                    cost  = self._to_float(price)
-                    cases = self._to_int(qty)
-                    name  = str(name).strip()
-
-                    if upc and not np.isnan(cost) and cases > 0:
-                        rows.append({
-                            "UPC": upc,
-                            "Item Name": name,
-                            "Cost": float(cost),
-                            "Cases": int(cases),
-                        })
+            # fallback with 'text' strategies if line-based fails
+            for settings in (table_settings, {"vertical_strategy": "text", "horizontal_strategy": "text"}):
+                try:
+                    tables = page.extract_tables(table_settings=settings)
+                except Exception:
+                    tables = []
+                for tbl in tables or []:
+                    if not tbl or len(tbl) < 2:
+                        continue
+                    # find plausible header
+                    header = None
+                    header_idx = 0
+                    for i, row in enumerate(tbl[:6]):
+                        if any(str(x or "").strip() for x in row):
+                            header = [str(x or "").strip() for x in row]
+                            header_idx = i
+                            break
+                    if header is None:
+                        continue
+                    colmap = self._match_header(header)
+                    if not colmap:
+                        continue
+                    body = tbl[header_idx + 1 :]
+                    if not body:
+                        continue
+                    df = pd.DataFrame(body, columns=header)
+                    for _, r in df.iterrows():
+                        upc_raw = r.get(colmap["U.P.C."], "")
+                        name    = r.get(colmap["DESCRIPTION"], "")
+                        price   = r.get(colmap["D.PRICE"], "")
+                        qty     = r.get(colmap["QTY"], "")
+                        upc   = self._norm_upc_12(upc_raw)
+                        cost  = self._to_float(price)
+                        cases = self._to_int(qty)
+                        name  = str(name).strip()
+                        if upc and not np.isnan(cost) and cases > 0:
+                            rows.append({
+                                "UPC": upc,
+                                "Item Name": name,
+                                "Cost": float(cost),
+                                "Cases": int(cases),
+                            })
 
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
-
         out = pd.DataFrame(rows, columns=self.WANT_COLS)
-        out.reset_index(drop=True, inplace=True)  # preserve discovery order
+        out.reset_index(drop=True, inplace=True)
         return out
 
-    # ----------------- word-grid fallback -----------------
+    # ----------------- Stage 2: word-grid -----------------
     def _find_header_spans(self, page) -> Optional[Tuple[float, dict]]:
-        """
-        Use page.extract_words() to find the header row and approximate column x centers.
-        Returns (header_y, col_xcenters) where col_xcenters = {"qty": x, "desc": x, "upc": x, "price": x}
-        """
         words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
         if not words:
             return None
 
-        # group words by (approx) y to find a header-like line
-        # allow small y tolerance to cluster
         lines = {}
         for w in words:
-            y = float(w["top"])
-            # quantize y to 2px buckets
-            key = round(y / 2.0, 0)
+            key = round(float(w["top"]) / 2.0, 0)
             lines.setdefault(key, []).append(w)
 
         header_key = None
@@ -174,7 +167,7 @@ class NevadaBeverageParser:
         for key, ws in lines.items():
             txt = " ".join([w["text"] for w in sorted(ws, key=lambda x: x["x0"])])
             ctxt = self._canon(txt)
-            score = sum(a in ctxt for a in ["qty", "description", "desc", "upc", "dprice", "price"])
+            score = sum(a in ctxt for a in ["qty", "description", "desc", "upc", "dprice", "price", "unitprice"])
             if score >= 3 and score >= best_score:
                 best_score = score
                 header_key = key
@@ -183,49 +176,31 @@ class NevadaBeverageParser:
             return None
 
         header_words = sorted(lines[header_key], key=lambda x: x["x0"])
-        header_txts = [w["text"] for w in header_words]
-        # map each needed label to nearest word x-center
+
         def nearest_xcenter(*aliases):
+            # exact/contains search
             for target in aliases:
                 tgt = self._canon(target)
-                best = None
-                best_dx = 1e9
                 for w in header_words:
                     if tgt in self._canon(w["text"]):
-                        xc = (w["x0"] + w["x1"]) / 2.0
-                        dx = 0  # exact hit
-                        if dx < best_dx:
-                            best = xc
-                            best_dx = dx
-                # fallback: look for a word that is close in string distance
-            # looser fallback: search any word containing a chunk
-            for target in aliases:
-                tgt = self._canon(target)
-                for w in header_words:
-                    if tgt[:3] in self._canon(w["text"]):
                         return (w["x0"] + w["x1"]) / 2.0
+            # fallback: median
+            if header_words:
+                return float(np.median([(w["x0"] + w["x1"]) / 2.0 for w in header_words]))
             return None
 
         x_qty   = nearest_xcenter("QTY", "Qty", "Quantity")
         x_desc  = nearest_xcenter("DESCRIPTION", "Description", "Desc")
         x_upc   = nearest_xcenter("U.P.C.", "UPC")
-        x_price = nearest_xcenter("D.PRICE", "Price")
-
-        # if description not found, approximate to middle
-        if x_desc is None:
-            x_desc = np.median([w["x0"] for w in header_words]) if header_words else 200.0
+        x_price = nearest_xcenter("D.PRICE", "D PRICE", "Price", "UNIT PRICE")
 
         colmap = {"qty": x_qty, "desc": x_desc, "upc": x_upc, "price": x_price}
-        header_y = np.mean([w["top"] for w in header_words])
-        # ensure at least three columns found (qty/desc/upc/price)
+        header_y = float(np.mean([w["top"] for w in header_words]))
         if sum(v is not None for v in colmap.values()) < 3:
             return None
         return header_y, colmap
 
     def _bucket_line(self, words_line, col_x):
-        """
-        Assign words to nearest of qty/desc/upc/price by x-center; join text per column.
-        """
         buckets = {"qty": [], "desc": [], "upc": [], "price": []}
         for w in sorted(words_line, key=lambda x: x["x0"]):
             xc = (w["x0"] + w["x1"]) / 2.0
@@ -239,7 +214,6 @@ class NevadaBeverageParser:
                     best = key
                     best_dx = dx
             if best is None:
-                # default to desc if no column centers available
                 best = "desc"
             buckets[best].append(w["text"])
         return {k: " ".join(v).strip() for k, v in buckets.items()}
@@ -252,13 +226,11 @@ class NevadaBeverageParser:
         found = self._find_header_spans(page)
         if not found:
             return pd.DataFrame(columns=self.WANT_COLS)
-
         header_y, col_x = found
 
-        # group words into lines below header
         lines = {}
         for w in words:
-            if w["top"] <= header_y + 1:  # allow just below header baseline
+            if w["top"] <= header_y + 1:
                 continue
             key = round(w["top"] / 2.0, 0)
             lines.setdefault(key, []).append(w)
@@ -271,9 +243,7 @@ class NevadaBeverageParser:
             upc_txt   = buck.get("upc", "")
             price_txt = buck.get("price", "")
 
-            # Some PDFs push UPC into desc column; try to rescue
             if not upc_txt and re.search(r"\d", desc_txt or ""):
-                # grab a 10-14 digit chunk from desc end
                 m = re.search(r"(\d[\d\-\s]{8,})$", desc_txt)
                 if m:
                     upc_txt = m.group(1)
@@ -283,7 +253,6 @@ class NevadaBeverageParser:
             cost  = self._to_float(price_txt)
             name  = desc_txt.strip()
 
-            # sanity: require UPC + cost; cases > 0
             if upc and not np.isnan(cost) and cases > 0:
                 rows.append({
                     "UPC": upc,
@@ -295,6 +264,99 @@ class NevadaBeverageParser:
         if not rows:
             return pd.DataFrame(columns=self.WANT_COLS)
         return pd.DataFrame(rows, columns=self.WANT_COLS)
+
+    # ----------------- Stage 3: text/regex sweep -----------------
+    def _parse_text_regex(self, page) -> pd.DataFrame:
+        """
+        Last-resort: use extract_text() and heuristics per line.
+        Strategy:
+          - Find a 10–14 digit UPC chunk on the line.
+          - Find a price-like token (last decimal with 2 digits).
+          - Find an integer QTY near the start or just before/after price.
+          - Description is what's between qty and UPC (or start .. UPC).
+        """
+        txt = page.extract_text() or ""
+        if not txt.strip():
+            return pd.DataFrame(columns=self.WANT_COLS)
+
+        rows = []
+        for li, line in enumerate(txt.splitlines()):
+            raw = line.strip()
+            if len(raw) < 6:
+                continue
+
+            # find UPC candidate
+            upc_match = re.search(r"(\d[\d\-\s]{10,})", raw)
+            if not upc_match:
+                continue
+            upc_raw = upc_match.group(1)
+            upc = self._norm_upc_12(upc_raw)
+            if not upc:
+                continue
+
+            # find a price (prefer the last price token)
+            price_matches = list(re.finditer(r"(\d+\.\d{2})", raw))
+            if not price_matches:
+                continue
+            price = self._to_float(price_matches[-1].group(1))
+            if np.isnan(price):
+                continue
+
+            # find qty: first integer token, or nearest integer to price/UPC
+            int_tokens = list(re.finditer(r"\b(\d{1,4})\b", raw))
+            qty = None
+            if int_tokens:
+                try:
+                    qty = int(int_tokens[0].group(1))
+                except Exception:
+                    qty = None
+
+            # refine qty: prefer integer appearing before description/UPC if plausible
+            if qty is None or qty == 0:
+                # try token before UPC
+                prev = raw[:upc_match.start()]
+                m2 = list(re.finditer(r"\b(\d{1,4})\b", prev))
+                if m2:
+                    try:
+                        qty = int(m2[-1].group(1))
+                    except Exception:
+                        qty = None
+
+            if qty is None or qty <= 0:
+                continue
+
+            # description: between first qty occurrence and UPC
+            desc = raw
+            # clip left at qty end
+            left_clip = 0
+            qm = re.search(r"\b" + re.escape(str(qty)) + r"\b", raw)
+            if qm:
+                left_clip = qm.end()
+            # description window
+            desc = raw[left_clip:upc_match.start()].strip()
+            # clean redundant spaces and trailing separators
+            desc = re.sub(r"\s{2,}", " ", desc)
+            desc = desc.strip(" -–—|;,")
+
+            # sometimes price sits before qty; if desc ended up empty, try between UPC and price
+            if not desc:
+                desc = raw[:upc_match.start()].strip()
+
+            if desc and upc and not np.isnan(price) and qty > 0:
+                rows.append({
+                    "UPC": upc,
+                    "Item Name": desc,
+                    "Cost": float(price),
+                    "Cases": int(qty),
+                    "_order": (li)  # keep original line order
+                })
+
+        if not rows:
+            return pd.DataFrame(columns=self.WANT_COLS)
+
+        out = pd.DataFrame(rows)
+        out = out.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        return out[self.WANT_COLS]
 
     # ----------------- public API -----------------
     def parse(self, uploaded_file) -> pd.DataFrame:
@@ -316,13 +378,22 @@ class NevadaBeverageParser:
 
         try:
             with pdfplumber.open(uploaded_file) as pdf:
-                # 1) table-based
+                # Stage 1: table extraction
                 items = self._parse_pdf_tables(pdf)
                 if items is None or items.empty:
-                    # 2) word-grid fallback, page by page until we get rows
+                    # Stage 2: word-grid per page
                     rows = []
                     for page in pdf.pages:
                         pg = self._parse_word_grid(page)
+                        if not pg.empty:
+                            rows.append(pg)
+                    items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
+
+                if items is None or items.empty:
+                    # Stage 3: text/regex line sweep
+                    rows = []
+                    for page in pdf.pages:
+                        pg = self._parse_text_regex(page)
                         if not pg.empty:
                             rows.append(pg)
                     items = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=self.WANT_COLS)
