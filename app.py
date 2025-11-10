@@ -260,7 +260,7 @@ def _build_pricebook_update(pricebook_csv, updated_master_df):
     return pos_update.drop(columns=["__upc_norm"]), missing
 
 # ===================== UI =====================
-st.title("Unified — Multi-Vendor Invoice Processor")
+st.title("Invoice Processor")
 
 tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage"])
 
