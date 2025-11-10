@@ -1,178 +1,112 @@
 # parsers/nevada_beverage.py
-import re
+import io
 import pandas as pd
-
-def _normalize_upc_keep_zeros(u: str) -> str:
-    digits = re.sub(r"\D", "", str(u))
-    if len(digits) == 13 and digits.startswith("0"):
-        digits = digits[1:]
-    if len(digits) > 12:
-        digits = digits[-12:]
-    if len(digits) < 12:
-        digits = digits.zfill(12)
-    return digits
+import numpy as np
+import re
 
 class NevadaBeverageParser:
     """
-    Parse Nevada Beverage invoices (PDF/CSV/XLSX) into:
-      [UPC, Item Name, Cost, Cases]
-    Rules:
-      - Find header line that includes 'ITEM#' and 'QTY' and 'U.P.C.' (case-insensitive).
-      - Extract rows until a totals/summary line appears.
-      - Cases = QTY (int).
-      - Cost = last numeric on the item line (unit/case net commonly sits at end).
-      - Preserve invoice order and UPC leading zeros.
-      - Size column intentionally ignored per prior instruction.
+    Parse Nevada Beverage CSV (semicolon ';' delimited).
+
+    Input columns (case-insensitive):
+      - unitUpc   -> UPC (normalize to 12 digits)
+      - itemName  -> Item Name
+      - total     -> Cost  (float)
+      - quantity  -> Cases (int)
+
+    Output dataframe columns (in invoice order):
+      ["UPC", "Item Name", "Cost", "Cases"]
     """
 
-    name = "Nevada Beverage"
+    WANT_COLS = ["UPC", "Item Name", "Cost", "Cases"]
 
-    def _is_pdf(self, f) -> bool:
+    @staticmethod
+    def _digits_only(s: str) -> str:
+        return re.sub(r"\D", "", str(s)) if s is not None else ""
+
+    @staticmethod
+    def _norm_upc_12(s: str) -> str:
+        d = NevadaBeverageParser._digits_only(s)
+        if len(d) > 12:
+            d = d[-12:]
+        return d.zfill(12)
+
+    @staticmethod
+    def _to_float(x):
+        if x is None:
+            return np.nan
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        s = str(x).replace("$", "").replace(",", "").strip()
         try:
-            mt = (getattr(f, "type", "") or "").lower()
-            if "pdf" in mt:
-                return True
-        except Exception:
-            pass
-        pos = None
+            return float(s)
+        except:
+            return np.nan
+
+    @staticmethod
+    def _to_int(x):
         try:
-            pos = f.tell()
-            f.seek(0)
-            head = f.read(5)
-            return isinstance(head, (bytes, bytearray)) and head.startswith(b"%PDF")
-        except Exception:
-            return False
-        finally:
-            try:
-                f.seek(0 if pos is None else pos)
-            except Exception:
-                pass
-
-    def _read_lines_pdf(self, f):
-        import pdfplumber
-        f.seek(0)
-        lines = []
-        with pdfplumber.open(f) as pdf:
-            for page in pdf.pages:
-                txt = page.extract_text() or ""
-                for ln in txt.splitlines():
-                    ln = ln.strip()
-                    if ln:
-                        lines.append(ln)
-        return lines
-
-    def _read_lines_table(self, f):
-        name = (getattr(f, "name", "") or "").lower()
-        f.seek(0)
-        if name.endswith(".csv"):
-            df = pd.read_csv(f, header=None, dtype=str, keep_default_na=False)
-        else:
-            df = pd.read_excel(f, header=None, dtype=str)
-        df = df.fillna("")
-        lines = df.apply(lambda r: " ".join([c for c in r if str(c).strip() != ""]).strip(), axis=1)
-        return [x for x in lines.tolist() if x]
+            return int(float(str(x).strip()))
+        except:
+            return 0
 
     def parse(self, uploaded_file) -> pd.DataFrame:
-        # Read
+        # Read semicolon-separated CSV, preserving order
+        # (Streamlit gives a BytesIO-like object; ensure we start at 0)
         try:
-            if self._is_pdf(uploaded_file):
-                lines = self._read_lines_pdf(uploaded_file)
-            else:
-                lines = self._read_lines_table(uploaded_file)
+            uploaded_file.seek(0)
         except Exception:
-            return pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
+            pass
 
-        # find header row index
-        hdr_idx = -1
-        for idx, ln in enumerate(lines):
-            l = ln.lower()
-            if ("item#" in l or "item #" in l) and "qty" in l and ("u.p.c" in l or "upc" in l):
-                hdr_idx = idx
-                break
-        if hdr_idx == -1:
-            # fallback: parse all lines as potential items (best-effort)
-            start_idx = 0
+        # Try decoding to text; fall back to binary stream with sep=';'
+        if hasattr(uploaded_file, "read"):
+            raw = uploaded_file.read()
+            # put stream back for any caller who reuses it
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            # Decode safely; CSV is typically UTF-8
+            text = raw.decode("utf-8", errors="ignore")
+            df = pd.read_csv(io.StringIO(text), sep=";", dtype=str, keep_default_na=False)
         else:
-            start_idx = hdr_idx + 1
+            # If somehow a filepath ends up here
+            df = pd.read_csv(uploaded_file, sep=";", dtype=str, keep_default_na=False)
 
-        out = []
-        order_idx = 0
-        stop_terms = ("subtotal", "total", "payment", "summary", "tax", "thank you")
+        if df is None or df.empty:
+            return pd.DataFrame(columns=self.WANT_COLS)
 
-        for ln in lines[start_idx:]:
-            low = ln.lower()
-            if any(t in low for t in stop_terms):
-                break
+        # Normalize headers to lowercase for robust lookup
+        lower_map = {c.lower().strip(): c for c in df.columns}
+        def pick(*names):
+            for n in names:
+                if n.lower() in lower_map:
+                    return lower_map[n.lower()]
+            # fuzzy contains
+            for n in names:
+                for lc, orig in lower_map.items():
+                    if n.lower() in lc:
+                        return orig
+            return None
 
-            # Extract UPC: prefer an explicit 12-13 digit chunk or something after 'upc:'
-            upc = None
-            if "upc:" in low:
-                try:
-                    upc_raw = ln.split("UPC:", 1)[1]
-                except Exception:
-                    try:
-                        upc_raw = ln.split("upc:", 1)[1]
-                    except Exception:
-                        upc_raw = ""
-                upc = _normalize_upc_keep_zeros(upc_raw)
-            else:
-                # look for a long digit run (>= 11) as candidate UPC
-                cand = re.findall(r"\d{11,14}", ln)
-                if cand:
-                    upc = _normalize_upc_keep_zeros(cand[-1])
+        col_upc   = pick("unitUpc", "unit_upc", "upc", "unit upc")
+        col_name  = pick("itemName", "item_name", "name", "item name")
+        col_total = pick("total", "extended", "amount", "price")
+        col_qty   = pick("quantity", "qty", "cases")
 
-            if not upc:
-                continue
+        out = pd.DataFrame(columns=self.WANT_COLS)
+        if not all([col_upc, col_name, col_total, col_qty]):
+            return out
 
-            # Extract QTY (cases)
-            qty = 0
-            # try "... ITEM# <id>  QTY <num>  DESCRIPTION ..." or any ' qty ' pattern
-            m_qty = re.search(r"\bqty\b\s*[:\-]?\s*(\d+)", low)
-            if m_qty:
-                qty = int(m_qty.group(1))
-            else:
-                # heuristic: look for an isolated small int near start
-                ints = [int(x) for x in re.findall(r"\b\d+\b", ln)]
-                if ints:
-                    qty = ints[0]
+        res = pd.DataFrame()
+        res["UPC"]       = df[col_upc].map(self._norm_upc_12)
+        res["Item Name"] = df[col_name].astype(str)
+        res["Cost"]      = df[col_total].map(self._to_float)
+        res["Cases"]     = df[col_qty].map(self._to_int)
 
-            # Extract name (description): remove obvious tokens
-            name = ln
-            name = re.sub(r"\b(item#|item #)\b.*?\bqty\b", "", name, flags=re.I)
-            name = re.sub(r"\bqty\b\s*[:\-]?\s*\d+", "", name, flags=re.I)
-            name = re.sub(r"UPC:\s*[\d\-\s]+", "", name, flags=re.I)
-            # strip trailing numeric cluster (prices)
-            tail_nums = re.findall(r"[0-9]+(?:\.[0-9]+)?", name)
-            if tail_nums:
-                last_num = tail_nums[-1]
-            else:
-                last_num = None
-            # Cost: take last numeric token on line (typical NV formatting)
-            cost = None
-            nums_all = re.findall(r"[0-9]+(?:\.[0-9]+)?", ln)
-            if nums_all:
-                try:
-                    cost = float(nums_all[-1].replace(",", ""))
-                except Exception:
-                    cost = None
+        # Keep only rows with valid UPC and non-null cost
+        res = res[(res["UPC"] != "") & res["Cost"].notna()].copy()
 
-            # refine name: drop all trailing numbers
-            name = re.sub(r"\s*[0-9\.,]+\s*$", "", name).strip()
-
-            if upc and cost is not None and qty >= 0:
-                out.append({
-                    "_order": order_idx,
-                    "UPC": upc,
-                    "Item Name": name,
-                    "Cost": float(cost),
-                    "Cases": int(qty)
-                })
-                order_idx += 1
-
-        if not out:
-            return pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
-
-        df = pd.DataFrame(out)
-        df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-        df["UPC"] = df["UPC"].astype(str)
-        return df
+        # Preserve original invoice order (no sorting)
+        res = res[self.WANT_COLS].reset_index(drop=True)
+        return res
