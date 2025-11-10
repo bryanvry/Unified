@@ -462,12 +462,6 @@ with tabs[0]:
     st.title("🧾 Unified → POS Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
 
-    with st.sidebar:
-        st.markdown("### Rules (Unified)")
-        st.write("- UPC: rightmost 11 digits + computed check digit (UPC-A).")
-        st.write("- Ignore Case Qty = 0; keep latest invoice per UPC.")
-        st.write("- Ignore list: 000000000000, 003760010302, 023700052551")
-
     pos_file = st.file_uploader("Upload POS pricebook CSV", type=["csv"], accept_multiple_files=False, key="un_pos")
     inv_files = st.file_uploader("Upload Unified invoice file(s) (XLSX/XLS/CSV)", type=["xlsx","xls","csv"], accept_multiple_files=True, key="un_inv")
 
