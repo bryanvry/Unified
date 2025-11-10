@@ -1,30 +1,26 @@
 # parsers/nevada_beverage.py
 import io
 import re
-import csv
 import pandas as pd
 import numpy as np
 
 class NevadaBeverageParser:
     """
-    Robust parser for Nevada Beverage CSV invoices.
+    Parser for Nevada Beverage CSV invoices.
 
-    Accepts:
-      - CSV with ; , or \t delimiter (auto-detected)
-      - Header row may not be the first line (we scan for it)
-      - Column aliases:
-          unitUpc / unit_upc / upc / unit upc        -> UPC
-          itemName / item_name / name / description  -> Item Name
-          total / totalAmount / extprice / amount    -> Cost
-          quantity / qty / cases / caseqty           -> Cases
+    Expected header (case-insensitive, semicolon ';' delimiter):
+      - unitUpc   -> UPC (normalize to 12 digits, keep rightmost 12, pad with zeros)
+      - itemName  -> Item Name
+      - total     -> Cost (float)
+      - quantity  -> Cases (int)
 
-    Output (invoice order preserved):
-      columns: ["UPC", "Item Name", "Cost", "Cases"]
+    Output columns (invoice order preserved):
+      ["UPC", "Item Name", "Cost", "Cases"]
     """
 
     WANT_COLS = ["UPC", "Item Name", "Cost", "Cases"]
 
-    # -------- helpers --------
+    # ---- helpers ----
     @staticmethod
     def _digits_only(s: str) -> str:
         return re.sub(r"\D", "", str(s)) if s is not None else ""
@@ -39,7 +35,7 @@ class NevadaBeverageParser:
 
     @staticmethod
     def _to_float(x):
-        if x is None:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
             return np.nan
         if isinstance(x, (int, float, np.number)):
             return float(x)
@@ -58,76 +54,15 @@ class NevadaBeverageParser:
 
     @staticmethod
     def _canon(s: str) -> str:
-        # normalize header tokens: lowercase, remove non-alphanum
         return re.sub(r"[^a-z0-9]", "", s.lower()) if s is not None else ""
 
-    @staticmethod
-    def _detect_delimiter(header_line: str) -> str:
-        # choose the delimiter that appears most in the header line
-        cands = [";", ",", "\t"]
-        counts = {d: header_line.count(d) for d in cands}
-        # fallback to ';' if tie/zero
-        best = max(counts, key=counts.get) if any(counts.values()) else ";"
-        return best
-
-    def _find_header_index_and_delim(self, text: str):
-        """
-        Scan lines to find the first header line that contains any of our
-        canonical header tokens, and detect its delimiter.
-        """
-        lines = text.splitlines()
-        # sets of canonical aliases we accept
-        upc_keys   = {"unitupc", "upc", "unitupc"}  # duplicate ok
-        name_keys  = {"itemname", "item", "name", "description", "desc"}
-        cost_keys  = {"total", "totalamount", "extprice", "amount", "extended", "extendedamount", "nettotal"}
-        qty_keys   = {"quantity", "qty", "cases", "caseqty", "qtyordered", "qtydelivered", "qtyshipped"}
-
-        for i, line in enumerate(lines[:200]):  # only scan first 200 lines
-            if not line.strip():
-                continue
-            delim = self._detect_delimiter(line)
-            parts = [self._canon(p) for p in line.split(delim)]
-            partset = set(parts)
-
-            # if the line contains at least one from each category, likely a header
-            has_upc  = any(k in partset for k in upc_keys)
-            has_name = any(k in partset for k in name_keys)
-            has_cost = any(k in partset for k in cost_keys)
-            has_qty  = any(k in partset for k in qty_keys)
-
-            if (has_upc and has_name and has_cost and has_qty) or \
-               (has_upc and has_name and (has_cost or has_qty)):
-                return i, delim
-
-        # fallback: assume first non-empty line is header; default ';'
-        for i, line in enumerate(lines):
-            if line.strip():
-                return i, self._detect_delimiter(line)
-        return 0, ";"  # ultimate fallback
-
-    def _read_csv_with_known_header(self, text: str, header_idx: int, delim: str) -> pd.DataFrame:
-        # Keep invoice order, read starting from header
-        lines = text.splitlines()
-        sliced = "\n".join(lines[header_idx:])
-        return pd.read_csv(
-            io.StringIO(sliced),
-            sep=delim,
-            dtype=str,
-            keep_default_na=False,
-            engine="python"  # enables sep inference behaviors if needed
-        )
-
     def _pick_col(self, columns, *aliases):
-        """
-        Pick first matching column by canonical alias, with contains fallback.
-        """
+        # exact canonical match first, then "contains"
         cmap = {self._canon(c): c for c in columns}
-        # exact canonical match
         for alias in aliases:
             ca = self._canon(alias)
             if ca in cmap:
                 return cmap[ca]
-        # contains fallback
         for alias in aliases:
             ca = self._canon(alias)
             for k, orig in cmap.items():
@@ -135,51 +70,59 @@ class NevadaBeverageParser:
                     return orig
         return None
 
-    # -------- main entry --------
+    # ---- main ----
     def parse(self, uploaded_file) -> pd.DataFrame:
-        # load full text (keep a copy for other reads)
+        # Ensure we can read the uploaded stream multiple times
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
 
-        if hasattr(uploaded_file, "read"):
+        # Read as ';'-delimited first (that’s what your file uses)
+        # Use utf-8-sig to strip BOM if present
+        try:
             raw = uploaded_file.read()
             try:
                 uploaded_file.seek(0)
             except Exception:
                 pass
-            # decode with BOM tolerance
             text = raw.decode("utf-8-sig", errors="ignore")
-        else:
-            # path-like
-            with open(uploaded_file, "rb") as f:
-                text = f.read().decode("utf-8-sig", errors="ignore")
-
-        header_idx, delim = self._find_header_index_and_delim(text)
-        df = self._read_csv_with_known_header(text, header_idx, delim)
+            df = pd.read_csv(io.StringIO(text), sep=";", dtype=str, keep_default_na=False)
+        except Exception:
+            # Fallback: try comma in case a future export changes delimiter
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            raw = uploaded_file.read()
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            text = raw.decode("utf-8-sig", errors="ignore")
+            df = pd.read_csv(io.StringIO(text), sep=",", dtype=str, keep_default_na=False)
 
         if df is None or df.empty:
             return pd.DataFrame(columns=self.WANT_COLS)
 
-        # map columns
+        # Map columns (case-insensitive)
         col_upc = self._pick_col(df.columns, "unitUpc", "unit_upc", "unit upc", "upc")
-        col_nm  = self._pick_col(df.columns, "itemName", "item_name", "item name", "name", "description", "desc")
-        col_tot = self._pick_col(df.columns, "total", "totalAmount", "extprice", "amount", "extended", "extendedAmount", "nettotal")
-        col_qty = self._pick_col(df.columns, "quantity", "qty", "cases", "caseqty", "qtyordered", "qtydelivered", "qtyshipped")
+        col_nm  = self._pick_col(df.columns, "itemName", "item_name", "item name", "name", "description")
+        col_tot = self._pick_col(df.columns, "total", "totalAmount", "extprice", "amount")
+        col_qty = self._pick_col(df.columns, "quantity", "qty", "cases", "caseqty")
 
-        out = pd.DataFrame(columns=self.WANT_COLS)
+        # If any are missing, return empty so app shows the “could not parse” message
         if not all([col_upc, col_nm, col_tot, col_qty]):
-            return out  # let caller show “Could not parse…” message
+            return pd.DataFrame(columns=self.WANT_COLS)
 
-        res = pd.DataFrame()
-        res["UPC"]       = df[col_upc].map(self._norm_upc_12)
-        res["Item Name"] = df[col_nm].astype(str)
-        res["Cost"]      = df[col_tot].map(self._to_float)
-        res["Cases"]     = df[col_qty].map(self._to_int)
+        out = pd.DataFrame()
+        out["UPC"]       = df[col_upc].map(self._norm_upc_12)
+        out["Item Name"] = df[col_nm].astype(str)
+        out["Cost"]      = df[col_tot].map(self._to_float)
+        out["Cases"]     = df[col_qty].map(self._to_int)
 
-        # filter unusable rows
-        res = res[(res["UPC"] != "") & res["Cost"].notna()].copy()
+        # Keep usable rows only; preserve invoice order (no sorting)
+        out = out[(out["UPC"] != "") & out["Cost"].notna()].reset_index(drop=True)
 
-        # preserve invoice order (no sorting)
-        return res[self.WANT_COLS].reset_index(drop=True)
+        # Return with the exact column set/order expected by the app
+        return out[self.WANT_COLS]
