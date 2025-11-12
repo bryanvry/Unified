@@ -1,7 +1,6 @@
 streamlit==1.39.0
 pandas==2.2.2
-numpy==1.26.4
-pdfplumber==0.11.4
-Pillow==10.4.0
-xlsxwriter==3.2.0
 openpyxl==3.1.5
+numpy==1.26.4
+pyarrow==16.1.0
+pdfplumber==0.11.4
