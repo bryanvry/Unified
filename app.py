@@ -6,7 +6,7 @@ from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
-from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser  # <-- added Breakthru
+from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 
@@ -109,11 +109,10 @@ def _resolve_col(df: pd.DataFrame, candidates, default_name):
 def _download_csv_with_upc_text(df: pd.DataFrame, filename: str, upc_col="UPC"):
     df2 = df.copy()
     if upc_col in df2.columns:
-        # Force spreadsheet apps to treat UPC as text and keep leading zeros
         df2[upc_col] = df2[upc_col].astype(str).map(lambda x: f'="{x}"')
     st.download_button(f"⬇️ Download {filename}", df2.to_csv(index=False).encode("utf-8"), filename)
 
-# -------- SG/NV shared helpers --------
+# -------- SG/NV/Breakthru shared helpers --------
 def _ensure_invoice_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases"])
@@ -158,7 +157,6 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
     master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
     master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
 
-    # Group invoice rows by UPC (sum cases, keep last cost/name)
     invoice_unique = (
         invoice_df
         .groupby("UPC", as_index=False)
@@ -453,18 +451,17 @@ for k in [
     if k not in st.session_state:
         st.session_state[k] = None
 
-# Breakthru session state (same pattern)
 for k in [
-    "bt_invoice_items_df", "bt_updated_master", "bt_cost_changes",
+    "bt_invoice_items_df", "bt_invoice_items_dl_df", "bt_updated_master", "bt_cost_changes",
     "bt_not_in_master", "bt_pack_missing", "bt_pos_update", "bt_pb_missing", "bt_ts"
 ]:
     if k not in st.session_state:
         st.session_state[k] = None
 
 # ---------------- UI ----------------
-tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage", "Breakthru"])  # <-- added Breakthru
+tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage", "Breakthru"])
 
-# Unified tab
+# Unified tab (unchanged)
 with tabs[0]:
     st.title("🧾 Unified → POS Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
@@ -534,7 +531,7 @@ with tabs[0]:
     else:
         st.info("Upload a POS CSV and at least one Unified invoice file, then click **Process Unified**.")
 
-# Southern Glazer's tab
+# Southern Glazer's tab (unchanged)
 with tabs[1]:
     st.title("Southern Glazer's Processor")
     inv_files = st.file_uploader("Upload SG invoice PDF(s) or CSV/XLSX", type=["pdf","csv","xlsx","xls"], accept_multiple_files=True, key="sg_inv")
@@ -660,7 +657,7 @@ with tabs[1]:
     else:
         st.info("Upload SG invoice(s) and Master, then click **Process SG**. Downloads will persist afterward.")
 
-# Nevada Beverage tab (PDF-only)
+# Nevada Beverage tab (unchanged)
 with tabs[2]:
     st.title("Nevada Beverage Processor")
     st.caption("Upload the original Nevada Beverage PDF invoice(s).")
@@ -792,7 +789,7 @@ with tabs[2]:
     else:
         st.info("Upload NV PDF and Master, then click **Process NV**. Downloads will persist afterward.")
 
-# Breakthru tab (CSV-only)
+# Breakthru tab — adds UPC fallback to Item Number in the *download* only
 with tabs[3]:
     st.title("Breakthru Processor")
     st.caption("Upload Breakthru CSV invoice(s).")
@@ -813,29 +810,63 @@ with tabs[3]:
             parts_bt = []
             for f in inv_files_bt:
                 f.seek(0)
-                df = bt_parser.parse(f)
+                df = bt_parser.parse(f)  # returns columns incl. "Item Number"
                 if df is not None and not df.empty:
                     parts_bt.append(df)
-            invoice_items_bt = pd.concat(parts_bt, ignore_index=True) if parts_bt else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
-            invoice_items_bt = _ensure_invoice_cols(invoice_items_bt)
+            invoice_items_bt_raw = pd.concat(parts_bt, ignore_index=True) if parts_bt else pd.DataFrame(
+                columns=["UPC","Item Name","Cost","Cases","Item Number"]
+            )
+
+            # Prepare the processing copy (strict 4 columns)
+            invoice_items_bt = _ensure_invoice_cols(invoice_items_bt_raw)
 
             if invoice_items_bt.empty:
                 st.error("Could not parse any Breakthru items (no UPC/Item Name/Cost/Cases).")
             else:
+                # Build download copy with UPC fallback to Item Number when UPC is blank.
+                # Also check Master for 'Invoice UPC' (normed); if UPC is blank, there's no match anyway,
+                # so the practical rule is: UPC blank -> set to Item Number (if present).
+                try:
+                    master_df_bt = pd.read_excel(master_xlsx_bt, dtype=str).fillna("")
+                except Exception:
+                    master_df_bt = pd.DataFrame(columns=["Invoice UPC"])
+                inv_upc_col_bt = _resolve_col(master_df_bt, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
+                master_upc_norms = set(master_df_bt[inv_upc_col_bt].astype(str).map(_norm_upc_12))
+
+                inv_dl = invoice_items_bt_raw.copy()
+                if "UPC" not in inv_dl.columns:
+                    inv_dl["UPC"] = ""
+                if "Item Number" not in inv_dl.columns:
+                    inv_dl["Item Number"] = ""
+
+                def _fallback_upc(row):
+                    upc = (row.get("UPC") or "").strip()
+                    if upc:  # keep real UPC
+                        return upc
+                    # No UPC → use Item Number for visibility in the download
+                    item_no = (row.get("Item Number") or "").strip()
+                    return item_no or ""  # allow blank if neither exists
+
+                inv_dl["UPC"] = inv_dl.apply(_fallback_upc, axis=1)
+                # Download shows only the 4 standard columns (with the UPC fallback applied)
+                invoice_items_bt_for_download = inv_dl[["UPC","Item Name","Cost","Cases"]].copy()
+
+                # Downstream updates use the strict 4-col dataframe (no Item Number fallback)
                 updated_master_bt, cost_changes_bt, not_in_master_bt, pack_missing_bt, invoice_unique_bt = _update_master_from_invoice(master_xlsx_bt, invoice_items_bt)
                 pos_update_bt = None
                 pb_missing_bt = None
                 if pricebook_csv_bt is not None and updated_master_bt is not None:
                     pos_update_bt, pb_missing_bt = _build_pricebook_update(pricebook_csv_bt, updated_master_bt)
 
-                st.session_state["bt_invoice_items_df"] = invoice_items_bt
-                st.session_state["bt_updated_master"]   = updated_master_bt
-                st.session_state["bt_cost_changes"]     = cost_changes_bt
-                st.session_state["bt_not_in_master"]    = not_in_master_bt
-                st.session_state["bt_pack_missing"]     = pack_missing_bt
-                st.session_state["bt_pos_update"]       = pos_update_bt
-                st.session_state["bt_pb_missing"]       = pb_missing_bt
-                st.session_state["bt_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.session_state["bt_invoice_items_df"]   = invoice_items_bt  # processing version
+                st.session_state["bt_invoice_items_dl_df"] = invoice_items_bt_for_download  # download version with UPC fallback
+                st.session_state["bt_updated_master"]     = updated_master_bt
+                st.session_state["bt_cost_changes"]       = cost_changes_bt
+                st.session_state["bt_not_in_master"]      = not_in_master_bt
+                st.session_state["bt_pack_missing"]       = pack_missing_bt
+                st.session_state["bt_pos_update"]         = pos_update_bt
+                st.session_state["bt_pb_missing"]         = pb_missing_bt
+                st.session_state["bt_ts"]                 = datetime.now().strftime("%Y%m%d_%H%M%S")
 
                 st.success("Breakthru — processing complete.")
 
@@ -843,9 +874,11 @@ with tabs[3]:
         bt_ts = st.session_state["bt_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
-        st.dataframe(st.session_state["bt_invoice_items_df"].head(100), use_container_width=True)
+        # Show the *download* version that includes the UPC fallback to Item Number
+        preview_df = st.session_state["bt_invoice_items_dl_df"] or st.session_state["bt_invoice_items_df"]
+        st.dataframe(preview_df.head(100), use_container_width=True)
 
-        inv_items_df = st.session_state["bt_invoice_items_df"].copy()
+        inv_items_df = (st.session_state["bt_invoice_items_dl_df"] or st.session_state["bt_invoice_items_df"]).copy()
         if "UPC" in inv_items_df.columns:
             inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
         st.download_button(
