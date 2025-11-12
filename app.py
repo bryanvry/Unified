@@ -875,10 +875,16 @@ with tabs[3]:
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
         # Show the *download* version that includes the UPC fallback to Item Number
-        preview_df = st.session_state["bt_invoice_items_dl_df"] or st.session_state["bt_invoice_items_df"]
+        preview_df = st.session_state.get("bt_invoice_items_dl_df")
+if not isinstance(preview_df, pd.DataFrame) or preview_df.empty:
+    preview_df = st.session_state.get("bt_invoice_items_df")
         st.dataframe(preview_df.head(100), use_container_width=True)
 
-        inv_items_df = (st.session_state["bt_invoice_items_dl_df"] or st.session_state["bt_invoice_items_df"]).copy()
+        _dl = st.session_state.get("bt_invoice_items_dl_df")
+if isinstance(_dl, pd.DataFrame) and not _dl.empty:
+    inv_items_df = _dl.copy()
+else:
+    inv_items_df = st.session_state.get("bt_invoice_items_df", pd.DataFrame()).copy()
         if "UPC" in inv_items_df.columns:
             inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
         st.download_button(
