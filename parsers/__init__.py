@@ -1,6 +1,5 @@
-
-from .unified_parser import UnifiedParser
+# parsers/__init__.py
 from .southern_glazers import SouthernGlazersParser
 from .nevada_beverage import NevadaBeverageParser
 
-ALL_PARSERS = [UnifiedParser(), SouthernGlazersParser(), NevadaBeverageParser()]
+__all__ = ["SouthernGlazersParser", "NevadaBeverageParser"]
