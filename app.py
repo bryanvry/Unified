@@ -12,6 +12,85 @@ st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page
 
 # ---------------- shared helpers ----------------
 UNIFIED_IGNORE_UPCS = set(["000000000000", "003760010302", "023700052551"])
+def _build_pricebook_update(pricebook_csv_file, updated_master_df):
+    """
+    Build POS update sheet from updated Master.
+    - Join on Master['Full Barcode'] ↔ Pricebook['Upc'] (both normalized to 12 digits).
+    - Only include items with Total > 0 in Master.
+    - Update only addstock and cost_cents in the pricebook rows that match.
+    - Return (pos_update_df, pricebook_missing_df).
+    """
+    if updated_master_df is None or len(updated_master_df) == 0:
+        return (pd.DataFrame(), pd.DataFrame())
+
+    # Read pricebook
+    pb = pd.read_csv(pricebook_csv_file, dtype=str, keep_default_na=False, na_values=[])
+    if pb.empty:
+        return (pd.DataFrame(), pd.DataFrame())
+
+    # Resolve key columns
+    upc_col = "Upc" if "Upc" in pb.columns else ("UPC" if "UPC" in pb.columns else pb.columns[0])
+
+    # Normalize UPCs in pricebook and master
+    pb = pb.copy()
+    pb["__pb_upc_norm"] = pb[upc_col].astype(str).map(normalize_pos_upc)
+
+    mast = updated_master_df.copy()
+    fb_col = _resolve_col(mast, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
+    total_col = _resolve_col(mast, ["Total","TOTAL","total"], "Total")
+    cents_col = _resolve_col(mast, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
+
+    # Numeric Total; keep only >0
+    mast["__Total_num"] = mast[total_col].apply(_to_float_safe)
+    mast["__Cost_cents"] = mast[cents_col].apply(_to_int_safe)
+    mast["__fb_norm"] = mast[fb_col].astype(str).map(normalize_pos_upc)
+
+    mast_used = mast[mast["__Total_num"] > 0].copy()
+
+    # Which master rows aren’t present in the pricebook
+    pb_upcs = set(pb["__pb_upc_norm"])
+    missing_mask = ~mast_used["__fb_norm"].isin(pb_upcs)
+    pricebook_missing = (
+        mast_used.loc[missing_mask, [fb_col, total_col, cents_col]]
+        .rename(columns={fb_col: "Full Barcode", total_col: "Total", cents_col: "Cost ¢"})
+        .reset_index(drop=True)
+    )
+
+    # Keep only rows we can actually update (present in pricebook)
+    mast_used = mast_used[~missing_mask].copy()
+    if mast_used.empty:
+        return (pd.DataFrame(), pricebook_missing)
+
+    # Build mapping Full Barcode → (Total, Cost ¢)
+    map_total = dict(zip(mast_used["__fb_norm"], mast_used["__Total_num"]))
+    map_cents = dict(zip(mast_used["__fb_norm"], mast_used["__Cost_cents"]))
+
+    # Apply updates to a copy of the pricebook
+    out = pb.copy()
+    out["_new_addstock"] = out["__pb_upc_norm"].map(map_total).fillna(0)
+    out["_new_cost_cents"] = out["__pb_upc_norm"].map(map_cents).fillna(0).astype(int)
+
+    # Only keep rows that were actually in the invoice (Total>0 mapping exists)
+    updated_rows = out[out["_new_addstock"] > 0].copy()
+    if updated_rows.empty:
+        return (pd.DataFrame(), pricebook_missing)
+
+    # Write into the canonical columns (create if missing)
+    if "addstock" not in updated_rows.columns:
+        updated_rows["addstock"] = 0
+    if "cost_cents" not in updated_rows.columns:
+        updated_rows["cost_cents"] = 0
+
+    updated_rows["addstock"] = updated_rows["_new_addstock"]
+    updated_rows["cost_cents"] = updated_rows["_new_cost_cents"]
+
+    # Drop helper cols
+    updated_rows = updated_rows.drop(columns=["_new_addstock","_new_cost_cents"], errors="ignore")
+
+    # Return just the updated subset (POS upload file) + the missing list
+    # Keep original order of columns
+    updated_rows = updated_rows[pb.columns] if set(pb.columns).issubset(set(updated_rows.columns)) else updated_rows
+    return (updated_rows.reset_index(drop=True), pricebook_missing.reset_index(drop=True))
 
 def digits_only(s):
     return re.sub(r"\D", "", str(s)) if pd.notna(s) else ""
