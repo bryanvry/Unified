@@ -1,7 +1,7 @@
 # parsers/nevada_beverage.py
 # Nevada Beverage PDF-only parser (strict ITEM#/QTY rule)
-#  • Every item line starts with 5-digit ITEM# (e.g., "53218 5 BUD LT 18PK CAN 018200532184 15.00 0.00 75.00")
-#  • Quantity = the integer immediately following the 5-digit ITEM#
+#  • Every item line starts with 5–6 digit ITEM# (e.g., "53218 5 BUD LT 18PK CAN 018200532184 15.00 0.00 75.00")
+#  • Quantity = the integer immediately following the 5–6 digit ITEM#
 #  • If quantity == 0 → treat as OOS and skip
 #  • UPC = first 12–13 digit token (normalized to 12 digits)
 #  • Cost = first non-zero price AFTER the UPC (this is D.PRICE, not DEP=0.00 or EXT)
@@ -82,8 +82,8 @@ class NevadaBeverageParser:
     def _parse_text_regex_strict(self, page) -> pd.DataFrame:
         """
         Strict NV rule per user:
-          line = ITEM#(5 digits) <space> QTY(int) <space> DESCRIPTION ... UPC ... D.PRICE ... DEP(0.00) ... EXT
-          - QTY = the integer immediately after the first 5-digit token
+          line = ITEM#(5–6 digits) <space> QTY(int) <space> DESCRIPTION ... UPC ... D.PRICE ... DEP(0.00) ... EXT
+          - QTY = the integer immediately after the ITEM#
           - If QTY == 0 -> skip
           - UPC = first 12–13 digit token
           - COST = first non-zero price AFTER the UPC
@@ -99,8 +99,8 @@ class NevadaBeverageParser:
             if len(line) < 8:
                 continue
 
-            # 1) Find first 5-digit ITEM#
-            m_item = re.search(r"\b(\d{5})\b", line)
+            # 1) Find first 5–6 digit ITEM#
+            m_item = re.search(r"\b(\d{5,6})\b", line)
             if not m_item:
                 continue
 
@@ -366,7 +366,7 @@ class NevadaBeverageParser:
 
         try:
             with pdfplumber.open(uploaded_file) as pdf:
-                # Try STRICT text regex first (based on 5-digit ITEM# then QTY)
+                # Try STRICT text regex first (based on 5–6 digit ITEM# then QTY)
                 items = []
                 for page in pdf.pages:
                     df = self._parse_text_regex_strict(page)
