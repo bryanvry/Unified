@@ -634,7 +634,7 @@ VENDOR_OPTIONS = [
     "Southern Glazer's", 
     "Nevada Beverage", 
     "Breakthru", 
-    "JC Sales (Coming Soon)"
+    "JC Sales"
 ]
 
 selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
