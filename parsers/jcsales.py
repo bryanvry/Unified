@@ -1,13 +1,8 @@
 # parsers/jcsales.py
-# Robust JC Sales PDF parser that returns a pandas.DataFrame
-# Columns returned: ITEM, DESCRIPTION, PACK, UNIT, COST (app computes UPC/NOW/DELTA/RETAIL)
-# Returns: (df, invoice_no)
-
 from __future__ import annotations
-
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
 import re
-from typing import List, Tuple, Dict, Any
-
 import pandas as pd
 
 try:
@@ -16,130 +11,226 @@ except Exception:
     pdfplumber = None
 
 
+@dataclass
+class JCLine:
+    line_no: int
+    item: str
+    desc: str
+    r_qty: int
+    s_qty: int
+    um: str
+    pack: int
+    unit_p: float   # UNIT_P (unit price printed on invoice)
+    um_p: float     # UM_P (case price)  -> this is COST
+    ext_p: float    # EXT_P
+
+
 class JCSalesParser:
-    """
-    Extracts JC Sales invoice line items from PDF text.
+    WANT_COLS = ["UPC", "DESCRIPTION", "PACK", "COST", "UNIT", "RETAIL", "NOW", "DELTA"]
 
-    Expected header somewhere on the page:
-      LINE # ITEM DESCRIPTION Crv R-QTY S-QTY UM #/UM UNIT_P UM_P EXT_P
+    def __init__(self):
+        pass
 
-    Typical item row (examples from user):
-      1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 2.39 28.68 28.68 12
-      100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 0.85 20.40 20.40 24
+    # ---------------- core text parsing ----------------
+    def _iter_text_lines(self, pdf: "pdfplumber.PDF") -> List[str]:
+        lines: List[str] = []
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            # Keep original order, drop obvious header/footer noise lines
+            for raw in t.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                # Skip section headers
+                if line.startswith("LINE # ITEM") or "Customer Copy" in line:
+                    continue
+                if "Printed." in line and "Page" in line:
+                    continue
+                lines.append(line)
+        return lines
 
-    Notes:
-      - Optional single-letter flag (T, C, etc.) may appear after the line number.
-      - PACK is taken from #/UM immediately after UM.
-      - COST = UM_P (case price); UNIT is recomputed as COST / PACK (fallback to UNIT_P if PACK is zero).
-    """
+    def _parse_line(self, line: str) -> Optional[JCLine]:
+        """
+        Expect the tail of a valid item line to look like:
+           ... <R-QTY> <S-QTY> <UM> <UNIT_P> <UM_P> <EXT_P> <PACK>
+        Example:
+           '1 14158 AXION ... 1 1 PK 2.39 28.68 28.68 12'
+        We'll:
+          - parse the 7 trailing fields first (right-anchored)
+          - then peel off the left part to read LINE#, [optional T/C], ITEM, DESCRIPTION
+        """
+        # Right-anchored capture of the 7 final tokens
+        tail_regex = re.compile(
+            r"""
+            \s
+            (?P<rqty>\d+)
+            \s+(?P<sqty>\d+)
+            \s+(?P<um>[A-Z]{1,3})
+            \s+(?P<unit_p>\d+\.\d{2})
+            \s+(?P<um_p>\d+\.\d{2})
+            \s+(?P<ext_p>\d+\.\d{2})
+            \s+(?P<pack>\d+)
+            \s*$""",
+            re.VERBOSE,
+        )
+        mt = tail_regex.search(line)
+        if not mt:
+            return None
 
-    # Regex capturing the row with optional flag and optional trailing fields.
-    # Groups:
-    #  1: line number
-    #  2: optional flag (T/C/…)
-    #  3: ITEM (digits)
-    #  4: DESCRIPTION (greedy, trimmed)
-    #  5: R-QTY (int)
-    #  6: S-QTY (int)
-    #  7: UM (e.g., PK)
-    #  8: #/UM (PACK)
-    #  9: UNIT_P
-    # 10: UM_P (COST)
-    # 11: EXT_P (optional)
-    # 12: trailing PACK echo (optional)
-    _ROW_RE = re.compile(
-        r"""
-        ^\s*
-        (\d+)\s+                        # line number
-        (?:(?:([A-Z]))\s+)?             # optional flag (e.g., 'T', 'C')
-        (\d{3,})\s+                     # ITEM number (3+ digits)
-        (.+?)\s+                        # DESCRIPTION
-        (\d+)\s+                        # R-QTY
-        (\d+)\s+                        # S-QTY
-        ([A-Z]{1,3})\s+                 # UM (PK, etc.)
-        (\d+)\s+                        # #/UM (PACK)
-        (\d+\.\d{2})\s+                 # UNIT_P
-        (\d+\.\d{2})                    # UM_P (COST)
-        (?:\s+(\d+\.\d{2}))?            # EXT_P optional
-        (?:\s+(\d+))?                   # trailing pack echo optional
-        \s*$
-        """,
-        re.VERBOSE,
-    )
+        # Split head vs tail
+        head = line[: mt.start()].strip()
+        # Head looks like:  '<LINE#> [T|C]? <ITEM> <DESCRIPTION...>'
+        # Be tolerant about the optional flag and multi-space blobs.
+        head_regex = re.compile(
+            r"""
+            ^\s*
+            (?P<lineno>\d+)
+            (?:\s+[TC])?            # optional T/C flag
+            \s+(?P<item>\d+)
+            \s+(?P<desc>.+?)\s*$    # greedy description
+            """,
+            re.VERBOSE,
+        )
+        mh = head_regex.match(head)
+        if not mh:
+            return None
 
-    _INV_RE = re.compile(r"OSI\d+", re.IGNORECASE)
+        try:
+            return JCLine(
+                line_no=int(mh.group("lineno")),
+                item=mh.group("item"),
+                desc=mh.group("desc").strip(),
+                r_qty=int(mt.group("rqty")),
+                s_qty=int(mt.group("sqty")),
+                um=mt.group("um"),
+                pack=int(mt.group("pack")),
+                unit_p=float(mt.group("unit_p")),
+                um_p=float(mt.group("um_p")),
+                ext_p=float(mt.group("ext_p")),
+            )
+        except Exception:
+            return None
 
-    def _extract_invoice_no(self, page_texts: List[str]) -> str:
-        for txt in page_texts:
-            m = self._INV_RE.search(txt)
-            if m:
-                return m.group(0).upper()
-        return "UNKNOWN"
-
-    def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, str]:
-        """Parse a JC Sales PDF, returning (DataFrame, invoice_no)."""
+    def _parse_pdf(self, uploaded_pdf) -> Tuple[pd.DataFrame, str]:
+        """
+        Return (rows_df, invoice_no)
+        rows_df has columns: ITEM, DESCRIPTION, PACK, COST(=UM_P), UNIT, RETAIL
+        """
         if pdfplumber is None:
-            return pd.DataFrame(columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"]), "UNKNOWN"
+            return pd.DataFrame(), ""
 
         try:
             uploaded_pdf.seek(0)
         except Exception:
             pass
 
-        page_texts: List[str] = []
-        rows: List[Dict[str, Any]] = []
-
         with pdfplumber.open(uploaded_pdf) as pdf:
-            for page in pdf.pages:
-                txt = page.extract_text() or ""
-                if not txt.strip():
-                    continue
-                page_texts.append(txt)
+            lines = self._iter_text_lines(pdf)
 
-                for raw in txt.splitlines():
-                    line = raw.strip()
-                    if not line or len(line) < 8:
-                        continue
-                    m = self._ROW_RE.match(line)
-                    if not m:
-                        continue
+        # Try to extract invoice number from the buffer (e.g., '*OSI014135*' or 'JCSALES OSI014135 ...')
+        raw_text = "\n".join(lines)
+        m_inv = re.search(r"\bOSI0?\d{5}\b", raw_text)
+        invoice_no = m_inv.group(0) if m_inv else "UNKNOWN"
 
-                    item = m.group(3)
-                    desc = m.group(4).strip()
-                    pack_str = m.group(8)
-                    unit_p_str = m.group(9)
-                    um_p_str = m.group(10)
+        parsed: List[JCLine] = []
+        for li, raw in enumerate(lines):
+            rec = self._parse_line(raw)
+            if rec:
+                parsed.append(rec)
 
-                    # Parse numerics safely
-                    try:
-                        pack = int(pack_str)
-                    except Exception:
-                        pack = 0
-                    try:
-                        unit_p = float(unit_p_str)
-                    except Exception:
-                        unit_p = 0.0
-                    try:
-                        cost = float(um_p_str)  # COST = UM_P (case price)
-                    except Exception:
-                        cost = 0.0
+        if not parsed:
+            return pd.DataFrame(), invoice_no
 
-                    unit = (cost / pack) if pack else unit_p
+        # Build DataFrame (keep original order by line_no)
+        parsed.sort(key=lambda r: r.line_no)
+        df = pd.DataFrame(
+            {
+                "LINE": [r.line_no for r in parsed],
+                "ITEM": [r.item for r in parsed],
+                "DESCRIPTION": [r.desc for r in parsed],
+                "PACK": [r.pack for r in parsed],
+                # COST uses UM_P per spec
+                "COST": [r.um_p for r in parsed],
+                # sanity extras (not returned to app, but could be helpful)
+                "_UNIT_P": [r.unit_p for r in parsed],
+                "_EXT_P": [r.ext_p for r in parsed],
+            }
+        )
 
-                    rows.append(
-                        {
-                            "ITEM": item,
-                            "DESCRIPTION": re.sub(r"\s{2,}", " ", desc).strip(),
-                            "PACK": pack,
-                            "UNIT": round(unit, 2),
-                            "COST": round(cost, 2),
-                        }
-                    )
+        # Derive UNIT & RETAIL
+        df["UNIT"] = (pd.to_numeric(df["COST"], errors="coerce") / df["PACK"].replace(0, pd.NA)).round(2)
+        df["RETAIL"] = (df["UNIT"] * 2).round(2)
 
-        inv_no = self._extract_invoice_no(page_texts)
+        # Keep only expected output columns for the next stage (UPC, NOW, DELTA added in app using pricebook)
+        return df[["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT", "RETAIL"]], invoice_no
 
-        if not rows:
-            return pd.DataFrame(columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"]), inv_no
+    # ---------------- public API ----------------
+    def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, str]:
+        """
+        Returns a DF with columns: ITEM, DESCRIPTION, PACK, COST, UNIT, RETAIL
+        and the invoice number string.
+        """
+        if not uploaded_pdf or (getattr(uploaded_pdf, "name", "") or "").lower().endswith(".pdf") is False:
+            return pd.DataFrame(), ""
 
-        df = pd.DataFrame(rows, columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"])
-        return df, inv_no
+        try:
+            rows, inv_no = self._parse_pdf(uploaded_pdf)
+        except Exception:
+            return pd.DataFrame(), ""
+
+        return rows, inv_no
+
+
+# --------------- helpers used by app.py ---------------
+
+def normalize_upc_str(s: str) -> str:
+    """Strip non-digits and drop leading zeros for matching purposes."""
+    digits = re.sub(r"\D", "", str(s or ""))
+    return digits.lstrip("0") or ("0" if digits else "")
+
+
+def resolve_upc_from_master(pricebook_df: pd.DataFrame, master_df: pd.DataFrame, item_series: pd.Series) -> pd.Series:
+    """
+    Use ITEM to lookup (UPC1/UPC2) in master, then check which one exists in pricebook['Upc'] after zero-strip normalization.
+    If neither match, return "No Match <ITEM>".
+    """
+    # Minimal columns
+    m = master_df.copy()
+    m_cols = {c.lower(): c for c in m.columns}
+    item_col = m_cols.get("item", "ITEM")
+    upc1_col = m_cols.get("upc1", "UPC1")
+    upc2_col = m_cols.get("upc2", "UPC2")
+
+    # Build ITEM→(UPC1, UPC2)
+    m_small = m[[item_col, upc1_col, upc2_col]].copy()
+    m_small.columns = ["ITEM", "UPC1", "UPC2"]
+    m_small["ITEM"] = m_small["ITEM"].astype(str).str.strip()
+
+    # Pricebook UPC map (normalized)
+    pb = pricebook_df.copy()
+    pb_cols = {c.lower(): c for c in pb.columns}
+    pb_upc = pb_cols.get("upc", "Upc")
+    pb["__upc_norm"] = pb[pb_upc].astype(str).map(normalize_upc_str)
+
+    pb_set = set(pb["__upc_norm"])
+
+    # Map items
+    out = []
+    item_series = item_series.astype(str).str.strip()
+    master_map = {str(r.ITEM): (r.UPC1, r.UPC2) for r in m_small.itertuples(index=False)}
+
+    for itm in item_series.tolist():
+        upc1, upc2 = master_map.get(itm, (None, None))
+        u1 = normalize_upc_str(upc1)
+        u2 = normalize_upc_str(upc2)
+        if u1 and u1 in pb_set:
+            # return as proper 12–14 digit with leading zeros from PB (first match)
+            row = pb.loc[pb["__upc_norm"] == u1].iloc[0]
+            out.append(str(row[pb_upc]))
+        elif u2 and u2 in pb_set:
+            row = pb.loc[pb["__upc_norm"] == u2].iloc[0]
+            out.append(str(row[pb_upc]))
+        else:
+            out.append(f"No Match {itm}")
+
+    return pd.Series(out, index=item_series.index)
