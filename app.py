@@ -634,7 +634,7 @@ VENDOR_OPTIONS = [
     "Southern Glazer's", 
     "Nevada Beverage", 
     "Breakthru", 
-    "JC Sales (Coming Soon)"
+    "JC Sales"
 ]
 
 selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
@@ -1012,7 +1012,93 @@ if selected_vendor == "Breakthru":
             )
 
 
-# ===== JC Sales (Future) =====
-if selected_vendor == "JC Sales (Coming Soon)":
-    st.title("🛒 JC Sales Invoice Processor")
-    st.info("🚧 The JC Sales parser is currently under construction. Check back soon!")
+# ==========================================
+# 5. JC SALES
+# ==========================================
+if selected_vendor == "JC Sales":
+    st.title("🛒 JC Sales Parser")
+    st.caption("Process JC Sales PDF Invoice against Master & Pricebook.")
+
+    jc_col1, jc_col2, jc_col3 = st.columns(3)
+    with jc_col1:
+        jc_invoice = st.file_uploader("JC Sales Invoice (PDF)", type=["pdf"], key="jc_inv")
+    with jc_col2:
+        jc_master = st.file_uploader("JC Sales Master (XLSX/CSV)", type=["xlsx", "xls", "csv"], key="jc_mst")
+    with jc_col3:
+        jc_pb = st.file_uploader("POS Pricebook (CSV)", type=["csv"], key="jc_pb")
+
+    if st.button("Process JC Sales", type="primary"):
+        if not jc_invoice or not jc_master or not jc_pb:
+            st.warning("Please upload Invoice, Master File, and Pricebook.")
+        else:
+            with st.spinner("Parsing JC Sales..."):
+                try:
+                    # Import here to avoid errors if file is missing initially
+                    from jcsales import JCSalesParser
+                    parser = JCSalesParser()
+                    
+                    # Reset file pointers to ensure clean read
+                    jc_invoice.seek(0)
+                    jc_master.seek(0)
+                    jc_pb.seek(0)
+
+                    # Run the parsing logic
+                    parsed_df, pos_update_df = parser.parse(jc_invoice, jc_master, jc_pb)
+                    
+                    # Save results to session state
+                    st.session_state["jc_parsed"] = parsed_df
+                    st.session_state["jc_pos_update"] = pos_update_df
+                    
+                    # Logic: Extract Invoice Number from filename (e.g. "LAF080-OSI014135.pdf")
+                    # We look for the pattern "OSI" followed by digits
+                    inv_name = jc_invoice.name
+                    match = re.search(r"(OSI\d+)", inv_name, re.IGNORECASE)
+                    if match:
+                        inv_num = match.group(1)
+                    else:
+                        # Fallback if filename format is different
+                        inv_num = "Parsed_Invoice"
+                    
+                    st.session_state["jc_inv_num"] = inv_num
+                    st.success(f"Processing Complete! Invoice #{inv_num}")
+
+                except Exception as e:
+                    st.error(f"An error occurred: {e}")
+
+    # Display Results if available
+    if "jc_parsed" in st.session_state and st.session_state["jc_parsed"] is not None:
+        inv_num = st.session_state.get("jc_inv_num", "Invoice")
+        
+        st.divider()
+        
+        c1, c2 = st.columns(2)
+        
+        # Column 1: The "Goal Sheet" (Parsed Invoice)
+        with c1:
+            st.subheader("Parsed Invoice (Goal Sheet)")
+            st.dataframe(st.session_state["jc_parsed"], use_container_width=True)
+            
+            # Create Excel file in memory
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+                st.session_state["jc_parsed"].to_excel(writer, index=False, sheet_name="Parsed")
+            
+            st.download_button(
+                label=f"⬇️ Download parsed_{inv_num}.xlsx",
+                data=excel_buffer.getvalue(),
+                file_name=f"parsed_{inv_num}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        # Column 2: The POS Update
+        with c2:
+            st.subheader("POS Update File")
+            st.dataframe(st.session_state["jc_pos_update"], use_container_width=True)
+            
+            csv_data = st.session_state["jc_pos_update"].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="⬇️ Download POS_update.csv",
+                data=csv_data,
+                file_name="POS_update.csv",
+                mime="text/csv"
+            )
