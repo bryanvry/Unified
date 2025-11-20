@@ -1012,7 +1012,169 @@ if selected_vendor == "Breakthru":
             )
 
 
-# ===== JC Sales (Future) =====
-if selected_vendor == "JC Sales (Coming Soon)":
-    st.title("🛒 JC Sales Invoice Processor")
-    st.info("🚧 The JC Sales parser is currently under construction. Check back soon!")
+# ==== JC SALES ===============================================================
+if selected_vendor == "JC Sales":
+    st.title("JC Sales Processor")
+
+    inv_pdf = st.file_uploader("Upload JC Sales invoice (PDF)", type=["pdf"], key="jc_pdf")
+    pricebook_csv = st.file_uploader("Upload POS pricebook (CSV)", type=["csv"], key="jc_pb")
+    master_xlsx = st.file_uploader("Upload JC Sales Master (XLSX)", type=["xlsx"], key="jc_master")
+
+    if st.button("Process JC Sales", type="primary", key="jc_go"):
+        if not inv_pdf or not pricebook_csv or not master_xlsx:
+            st.error("Please upload the invoice PDF, pricebook CSV, and JC Sales Master XLSX.")
+        else:
+            from parsers import JCSalesParser
+            parser = JCSalesParser()
+
+            # 1) Parse PDF → ITEM/DESCRIPTION/PACK/COST/UNIT + invoice number
+            rows, inv_no = parser.parse(inv_pdf)
+            if rows is None or rows.empty:
+                st.error("Could not parse any JC Sales lines.")
+            else:
+                # 2) Load Master & Pricebook
+                try:
+                    master = pd.read_excel(master_xlsx, dtype=str).fillna("")
+                except Exception as e:
+                    st.error(f"Master read error: {e}")
+                    master = pd.DataFrame()
+
+                try:
+                    pb = pd.read_csv(pricebook_csv, dtype=str, keep_default_na=False, na_values=[])
+                except Exception as e:
+                    st.error(f"Pricebook read error: {e}")
+                    pb = pd.DataFrame()
+
+                if master.empty or pb.empty:
+                    st.error("Master or Pricebook is empty/unreadable.")
+                else:
+                    # column picks + normalization
+                    def pick(df, names, default):
+                        for n in names:
+                            if n in df.columns:
+                                return n
+                        if default not in df.columns:
+                            df[default] = ""
+                        return default
+
+                    m_item = pick(master, ["ITEM","Item","item"], "ITEM")
+                    m_upc1 = pick(master, ["UPC1","Upc1","upc1"], "UPC1")
+                    m_upc2 = pick(master, ["UPC2","Upc2","upc2"], "UPC2")
+
+                    pb_upc        = "Upc" if "Upc" in pb.columns else ("UPC" if "UPC" in pb.columns else pb.columns[0])
+                    pb_cents      = "cents" if "cents" in pb.columns else next((c for c in pb.columns if c.lower()=="cents"), None)
+                    pb_cost_qty   = "cost_qty" if "cost_qty" in pb.columns else next((c for c in pb.columns if c.lower()=="cost_qty"), None)
+                    pb_cost_cents = "cost_cents" if "cost_cents" in pb.columns else next((c for c in pb.columns if c.lower()=="cost_cents"), None)
+
+                    pb = pb.copy()
+                    pb["__pb_upc_norm"] = pb[pb_upc].astype(str).map(_norm_upc_12)
+
+                    # Build ITEM → (UPC1_norm, UPC2_norm)
+                    m = master.copy()
+                    m["__UPC1_norm"] = m[m_upc1].astype(str).map(_norm_upc_12)
+                    m["__UPC2_norm"] = m[m_upc2].astype(str).map(_norm_upc_12)
+                    item_to_upcs = dict(zip(m[m_item].astype(str), zip(m["__UPC1_norm"], m["__UPC2_norm"])))
+                    pb_set = set(pb["__pb_upc_norm"])
+
+                    # Compute UPC by trying UPC1 then UPC2 against PB (after zero-drop normalize)
+                    parsed = rows.copy()
+                    parsed["ITEM"] = parsed["ITEM"].astype(str)
+                    parsed["PACK"] = pd.to_numeric(parsed["PACK"], errors="coerce").fillna(0).astype(int)
+                    parsed["COST"] = pd.to_numeric(parsed["COST"], errors="coerce")
+                    parsed["UNIT"] = pd.to_numeric(parsed["UNIT"], errors="coerce")
+
+                    def resolve_upc(item):
+                        u1, u2 = item_to_upcs.get(str(item), ("",""))
+                        if u1 and u1 in pb_set:
+                            return u1
+                        if u2 and u2 in pb_set:
+                            return u2
+                        return "No Match"
+
+                    parsed["UPC"] = parsed["ITEM"].map(resolve_upc)
+
+                    # RETAIL = UNIT * 2
+                    parsed["RETAIL"] = parsed["UNIT"] * 2
+
+                    # NOW = pricebook.cents / 100 (join by UPC)
+                    pb_now_map = dict(zip(pb["__pb_upc_norm"], pd.to_numeric(pb.get(pb_cents, 0), errors="coerce").fillna(0) / 100.0))
+                    parsed["NOW"] = parsed["UPC"].map(pb_now_map)
+                    parsed.loc[parsed["UPC"]=="No Match", "NOW"] = np.nan
+
+                    # DELTA = UNIT - ((cost_cents/100) / cost_qty)
+                    pb_cc = pd.to_numeric(pb.get(pb_cost_cents, 0), errors="coerce").fillna(0.0)
+                    pb_cq = pd.to_numeric(pb.get(pb_cost_qty, 0), errors="coerce").fillna(0.0)
+                    pb_unit_map = {}
+                    for u, cc, cq in zip(pb["__pb_upc_norm"], pb_cc, pb_cq):
+                        pb_unit_map[u] = (cc/100.0)/cq if cq and cq>0 else np.nan
+                    parsed["DELTA"] = parsed["UNIT"] - parsed["UPC"].map(pb_unit_map)
+
+                    # Order & select final columns
+                    parsed_out = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA"]].copy()
+
+                    # Example sanity (your two samples)
+                    # 118815 → PACK 24, COST 20.40, UNIT 0.85, RETAIL 1.70
+                    # AXION line 1 → PACK 12, COST 28.68, UNIT 2.39, RETAIL 4.78
+                    # (Values come straight from columns UNIT_P and UM_P in your PDF.)  # ref: OSI014135
+
+                    # Build POS_update: keep pricebook cols, only invoice items with UPC != "No Match"
+                    matched = parsed_out[parsed_out["UPC"]!="No Match"].copy()
+                    if not matched.empty:
+                        matched = matched.rename(columns={"UPC": "__norm"})
+                        pb2 = pb.copy()
+                        pb2 = pb2.rename(columns={"__pb_upc_norm": "__norm"})
+                        join = pb2.merge(matched[["__norm","PACK","COST"]], on="__norm", how="inner")
+                        # update cost fields
+                        join["cost_qty"] = pd.to_numeric(join["PACK"], errors="coerce").fillna(0).astype(int)
+                        join["cost_cents"] = (pd.to_numeric(join["COST"], errors="coerce").fillna(0.0) * 100).round().astype(int)
+                        out_cols = list(pb.columns)
+                        if "cost_qty" not in out_cols: out_cols.append("cost_qty")
+                        if "cost_cents" not in out_cols: out_cols.append("cost_cents")
+                        pos_update = join.reindex(columns=out_cols)
+                    else:
+                        pos_update = pd.DataFrame()
+
+                    # Name: parsed_<Invoice>.xlsx
+                    label = inv_no or "parsed"
+                    parsed_xlsx_name = f"parsed_{label}.xlsx"
+
+                    # Save to session
+                    st.session_state["jc_parsed_df"] = parsed_out
+                    st.session_state["jc_pos_update_df"] = pos_update
+                    st.session_state["jc_parsed_name"] = parsed_xlsx_name
+
+                    st.success(f"JC Sales parsed: {len(parsed_out)} rows | POS updates: {len(pos_update)}")
+
+    # downloads + previews
+    if st.session_state.get("jc_parsed_df") is not None:
+        parsed_out = st.session_state["jc_parsed_df"]
+        pos_update = st.session_state.get("jc_pos_update_df")
+        parsed_name = st.session_state.get("jc_parsed_name") or "parsed.xlsx"
+
+        parsed_bytes = dfs_to_xlsx_bytes({"parsed": parsed_out})
+        st.download_button(
+            "⬇️ Download parsed workbook (XLSX)",
+            data=parsed_bytes,
+            file_name=parsed_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="jc_dl_parsed_xlsx",
+        )
+
+        if pos_update is not None and not pos_update.empty:
+            st.download_button(
+                "⬇️ Download POS_update (CSV)",
+                data=df_to_csv_bytes(pos_update),
+                file_name="POS_update_JCSales.csv",
+                mime="text/csv",
+                key="jc_dl_pos_csv",
+            )
+        else:
+            st.info("No POS updates generated (no matches).")
+
+        st.subheader("Preview — parsed (first 100)")
+        st.dataframe(parsed_out.head(100), use_container_width=True)
+
+        if pos_update is not None and not pos_update.empty:
+            st.subheader("Preview — POS_update (first 100)")
+            st.dataframe(pos_update.head(100), use_container_width=True)
+# ==== /JC SALES ==============================================================
