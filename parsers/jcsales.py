@@ -182,131 +182,128 @@ class JCSalesParser:
 
     def _extract_pdf_data(self, pdf_file):
         """
-        Extracts line items preserving strict order from PDF.
-        Logic: 
-        1. Read text line-by-line (pdfplumber handles basic layout).
-        2. Look for rows starting with ITEM # (digits).
-        3. Use Regex to cleanly separate Description, Pack, and Pricing.
+        Extracts line items preserving strict order from PDF using PDFPlumber text lines.
         """
         items = []
         
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                # Extract text preserving physical layout
-                text = page.extract_text(layout=True)
+                # Get all words/lines with their positions
+                # We use 'text' mode but we process line by line carefully
+                text = page.extract_text()
                 if not text: continue
                 
                 lines = text.split('\n')
+                
                 for line in lines:
-                    line = line.strip()
-                    if not line: continue
-
-                    # Regex Strategy:
-                    # 1. ITEM (Start of line, digits)
-                    # 2. DESCRIPTION (Text block)
-                    # 3. OPTIONAL: "T" flag (Tax?)
-                    # 4. OPTIONAL: "1" (Crv or Quantity?)
-                    # 5. UNIT/MEASURE (PK/CS/EA) -- Key Anchor!
-                    # 6. PACK (Integer)
-                    # 7. Prices...
-                    
-                    # Invoice layout example:
-                    # 118815 TOY DOCTOR PLAY SET ASST COLOR T 1 PK 24 1 0.85 20.40 20.40
-                    # Item: 118815
-                    # Desc: TOY DOCTOR PLAY SET ASST COLOR
-                    # Pack: 24
-                    # Cost: 20.40 (UM_P)
-                    
-                    # We split by whitespace
+                    # CLEANUP: Remove likely header/footer noise
+                    if "PAGE" in line.upper() or "INVOICE" in line.upper() or "SUBTOTAL" in line.upper():
+                        continue
+                        
                     parts = line.split()
+                    if len(parts) < 5: continue
                     
-                    # Must start with Item# (3-6 digits)
-                    if len(parts) < 6 or not (parts[0].isdigit() and 3 <= len(parts[0]) <= 6):
+                    # START ANCHOR: Must start with Item # (3-6 digits)
+                    # Example: "14158 AXION DISH..."
+                    if not (parts[0].isdigit() and 3 <= len(parts[0]) <= 6):
                         continue
                         
                     item_num = parts[0]
                     
-                    # SCAN FROM THE RIGHT (End of line) to find the numeric columns
-                    # Expected End: ... [PACK] [Multiplier?] [UNIT_PRICE] [CASE_COST] [EXT_COST]
-                    # Example: ... 24 1 0.85 20.40 20.40
+                    # END ANCHOR: Look for the pricing block at the end of the line
+                    # Pattern: [PACK] [1?] [UNIT_P] [CASE_COST] [EXT_COST]
+                    # Example: ... PK 12 1 2.39 28.68 28.68
                     
-                    try:
-                        # Identify the pricing floats at the end
-                        # We look for the last 3 numbers that look like prices
-                        float_indices = []
-                        for i in range(len(parts)-1, -1, -1):
-                            s = parts[i].replace(',', '')
-                            if re.match(r'^\d+\.\d+$', s): # Strict float match (X.XX)
-                                float_indices.append(i)
+                    # Scan from right to find floats
+                    float_indices = []
+                    for i in range(len(parts)-1, -1, -1):
+                        clean_s = parts[i].replace(',', '')
+                        # Regex for price-like number (1.99, 20.40, 0.85)
+                        if re.match(r'^\d+\.\d+$', clean_s):
+                            float_indices.append(i)
+                    
+                    # We need typically 3 prices at end: Ext, UM_P (Cost), Unit_P
+                    # Sometimes Ext is missing or broken, but Cost and Unit are usually there.
+                    # Let's assume at least 2 floats found.
+                    if len(float_indices) >= 2:
+                        # Indices are reversed: [Last, 2nd Last, ...]
+                        # UM_P (Cost) is usually the 2nd numeric value from right if 3 exist, or 1st if 2?
+                        # Standard Layout: Unit_P   UM_P    Ext_P
+                        #                  2.39     28.68   28.68
                         
-                        # We need at least 2 price columns (UnitP, UM_P) or 3 (UnitP, UM_P, ExtP)
-                        if len(float_indices) < 2:
-                            continue
-                            
-                        # UM_P (Case Cost) is usually the 2nd to last price
-                        # Ext_P is last price.
-                        # Unit_P is 3rd to last.
-                        
-                        # If we have 3 prices [Ext, Case, Unit] (indices reversed)
+                        # If 3 floats found:
                         if len(float_indices) >= 3:
-                            um_p_idx = float_indices[1]
-                            unit_p_idx = float_indices[2]
-                            cost = float(parts[um_p_idx].replace(',', ''))
+                            um_p_idx = float_indices[1] # 28.68
+                            unit_p_idx = float_indices[2] # 2.39
+                        else:
+                            # Fallback logic? Maybe only 2 prices printed?
+                            continue
+
+                        cost = float(parts[um_p_idx].replace(',', ''))
+                        
+                        # FIND PACK
+                        # Look to the left of Unit Price
+                        # There might be a '1' (multiplier?) and 'T' (tax)
+                        search_idx = unit_p_idx - 1
+                        pack = 1
+                        desc_end_idx = unit_p_idx # Default end of desc
+                        
+                        # Walk backwards
+                        while search_idx > 0:
+                            tok = parts[search_idx]
                             
-                            # PACK is usually the integer before the Unit Price
-                            # But sometimes there is a multiplier "1" in between
+                            # If we hit "PK", "CS", "EA", stop.
+                            if tok in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
+                                # The number we just passed (to the right) was likely the pack?
+                                # Wait, format is usually "PK 12". 
+                                # If we are at PK, check to right? No, we scanned left.
+                                # In "PK 12 1 2.39":
+                                # 2.39 is unit_p.
+                                # 1 is at unit_p - 1.
+                                # 12 is at unit_p - 2.
+                                # PK is at unit_p - 3.
+                                break
                             
-                            # Look immediately left of Unit Price
-                            search_idx = unit_p_idx - 1
-                            pack = 1
-                            
-                            # Consume any "1"s or "T"s between Pack and Unit Price
-                            while search_idx > 1:
-                                tok = parts[search_idx]
-                                if tok.isdigit() and int(tok) > 1:
-                                    # Found the pack!
-                                    pack = int(tok)
-                                    # Everything before this pack (and after Item#) is description
-                                    desc_end = search_idx
-                                    
-                                    # BUT: We need to handle the "UM" text (PK, CS) which comes BEFORE pack
-                                    # Check left one more time for "PK"
-                                    if parts[search_idx-1] in ['PK', 'CS', 'EA', 'DZ']:
-                                        desc_end = search_idx - 1
-                                    
+                            if tok.isdigit():
+                                val = int(tok)
+                                # Heuristic: 1 is likely a multiplier if we find another number.
+                                # If we find > 1, it's definitely pack.
+                                if val > 1:
+                                    pack = val
+                                    # Check if token to left is PK/CS
+                                    if parts[search_idx-1] in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
+                                        desc_end_idx = search_idx - 1
+                                    else:
+                                        desc_end_idx = search_idx
                                     break
-                                elif tok in ['PK', 'CS', 'EA', 'DZ']:
-                                    # Found the Unit Measure, Pack must be to the right? 
-                                    # Wait, usually it is: PK 24
-                                    # If we hit 'PK', the number to the RIGHT is pack. 
-                                    # But we are scanning left.
-                                    # If we hit PK at search_idx, then Pack was search_idx+1 (which we just passed)
-                                    if parts[search_idx+1].isdigit():
-                                         pack = int(parts[search_idx+1])
-                                         desc_end = search_idx
-                                         break
-                                search_idx -= 1
+                                elif val == 1:
+                                    # Keep looking left for the real pack
+                                    pass
                             
-                            # Clean Description
-                            # Everything from parts[1] to desc_end
-                            raw_desc_parts = parts[1:desc_end]
-                            
-                            # Filter out specific artifacts like standalone "T" (Tax flag) or "1"
-                            clean_desc_parts = []
-                            for p in raw_desc_parts:
-                                if p not in ['T', '1', 'N']: # Common noise flags
-                                    clean_desc_parts.append(p)
-                                    
-                            description = " ".join(clean_desc_parts)
+                            search_idx -= 1
+                        
+                        # If we exited loop without setting desc_end_idx firmly, use search_idx
+                        if desc_end_idx == unit_p_idx: 
+                             desc_end_idx = search_idx
 
-                            items.append({
-                                'ITEM': item_num,
-                                'DESCRIPTION': description,
-                                'PACK': pack,
-                                'COST': cost
-                            })
-
-                    except Exception:
-                        continue
+                        # Extract Description
+                        # parts[0] is Item Num
+                        # parts[1] to desc_end_idx is description + noise
+                        raw_desc_parts = parts[1:desc_end_idx]
+                        
+                        # CLEANUP: Remove "T", "N", "1" artifacts from description
+                        clean_desc = []
+                        for p in raw_desc_parts:
+                            if p not in ['T', 'N', '1']:
+                                clean_desc.append(p)
+                        
+                        description = " ".join(clean_desc)
+                        
+                        items.append({
+                            'ITEM': item_num,
+                            'DESCRIPTION': description,
+                            'PACK': pack,
+                            'COST': cost
+                        })
 
         return items
