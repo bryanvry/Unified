@@ -1,10 +1,7 @@
 # parsers/jcsales.py
-# Robust JC Sales PDF parser
-# - Parses every item line under the "LINE # ITEM DESCRIPTION ..." table across all pages.
-# - Accepts optional leading flags (T, C, etc.) after the line number.
-# - Uses the #/UM that appears immediately after UM as authoritative PACK.
-# - COST = UM_P (case pack price); UNIT = COST / PACK; RETAIL = UNIT * 2 (app can recompute if needed).
-# - Returns (rows, invoice_no) where rows is a list of dicts with the minimal columns the app expects.
+# Robust JC Sales PDF parser that returns a pandas.DataFrame
+# Columns returned: ITEM, DESCRIPTION, PACK, UNIT, COST (app computes UPC/NOW/DELTA/RETAIL)
+# Returns: (df, invoice_no)
 
 from __future__ import annotations
 
@@ -31,40 +28,40 @@ class JCSalesParser:
       100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 0.85 20.40 20.40 24
 
     Notes:
-      - There may be a single letter flag (T, C, etc.) after the line number.
-      - We treat UM_P as COST; UNIT is recomputed as COST / PACK to avoid rounding drift.
-      - The final pack echo (the very last integer) isn't guaranteed; PACK is taken from #/UM after UM.
+      - Optional single-letter flag (T, C, etc.) may appear after the line number.
+      - PACK is taken from #/UM immediately after UM.
+      - COST = UM_P (case price); UNIT is recomputed as COST / PACK (fallback to UNIT_P if PACK is zero).
     """
 
-    # compile a permissive regex for lines
-    # groups:
+    # Regex capturing the row with optional flag and optional trailing fields.
+    # Groups:
     #  1: line number
-    #  2: (optional) flag like 'T' or 'C'
-    #  3: ITEM (digits, can include leading zeros)
+    #  2: optional flag (T/C/…)
+    #  3: ITEM (digits)
     #  4: DESCRIPTION (greedy, trimmed)
     #  5: R-QTY (int)
     #  6: S-QTY (int)
     #  7: UM (e.g., PK)
-    #  8: #/UM (PACK, int)
-    #  9: UNIT_P (float like 2.39)
-    # 10: UM_P (float like 28.68)  <-- this is COST
-    # 11: EXT_P (optional float)
-    # 12: trailing PACK echo (optional int)
+    #  8: #/UM (PACK)
+    #  9: UNIT_P
+    # 10: UM_P (COST)
+    # 11: EXT_P (optional)
+    # 12: trailing PACK echo (optional)
     _ROW_RE = re.compile(
         r"""
         ^\s*
         (\d+)\s+                        # line number
         (?:(?:([A-Z]))\s+)?             # optional flag (e.g., 'T', 'C')
         (\d{3,})\s+                     # ITEM number (3+ digits)
-        (.+?)\s+                        # DESCRIPTION (lazy until the qtys)
+        (.+?)\s+                        # DESCRIPTION
         (\d+)\s+                        # R-QTY
         (\d+)\s+                        # S-QTY
         ([A-Z]{1,3})\s+                 # UM (PK, etc.)
-        (\d+)\s+                        # #/UM (PACK authoritative)
+        (\d+)\s+                        # #/UM (PACK)
         (\d+\.\d{2})\s+                 # UNIT_P
-        (\d+\.\d{2})                    # UM_P  (COST)
+        (\d+\.\d{2})                    # UM_P (COST)
         (?:\s+(\d+\.\d{2}))?            # EXT_P optional
-        (?:\s+(\d+))?                   # optional trailing pack echo
+        (?:\s+(\d+))?                   # trailing pack echo optional
         \s*$
         """,
         re.VERBOSE,
@@ -79,20 +76,16 @@ class JCSalesParser:
                 return m.group(0).upper()
         return "UNKNOWN"
 
-    def parse(self, uploaded_pdf) -> Tuple[List[Dict[str, Any]], str]:
-        """Parse a JC Sales PDF, returning (rows, invoice_no).
-        Each row dict contains: ITEM, DESCRIPTION, PACK, UNIT, COST.
-        App will add UPC/NOW/DELTA/RETAIL and do master/pricebook joins.
-        """
+    def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, str]:
+        """Parse a JC Sales PDF, returning (DataFrame, invoice_no)."""
         if pdfplumber is None:
-            return [], "UNKNOWN"
+            return pd.DataFrame(columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"]), "UNKNOWN"
 
         try:
             uploaded_pdf.seek(0)
         except Exception:
             pass
 
-        # collect page texts, then parse lines
         page_texts: List[str] = []
         rows: List[Dict[str, Any]] = []
 
@@ -107,46 +100,31 @@ class JCSalesParser:
                     line = raw.strip()
                     if not line or len(line) < 8:
                         continue
-
                     m = self._ROW_RE.match(line)
                     if not m:
                         continue
 
-                    # unpack captures
-                    # line_no = m.group(1)  # not used
-                    # flag    = m.group(2)  # not used
                     item = m.group(3)
                     desc = m.group(4).strip()
-                    # r_qty  = m.group(5)  # not used
-                    # s_qty  = m.group(6)  # not used
-                    # um     = m.group(7)  # not used, typically 'PK'
                     pack_str = m.group(8)
                     unit_p_str = m.group(9)
                     um_p_str = m.group(10)
-                    # ext_p_str = m.group(11)   # not needed
-                    # pack_echo = m.group(12)   # optional echo
 
+                    # Parse numerics safely
                     try:
                         pack = int(pack_str)
                     except Exception:
-                        # if somehow missing, fallback to optional echo
-                        try:
-                            pack = int(m.group(12)) if m.group(12) else 0
-                        except Exception:
-                            pack = 0
-
+                        pack = 0
                     try:
                         unit_p = float(unit_p_str)
                     except Exception:
                         unit_p = 0.0
-
                     try:
-                        cost = float(um_p_str)  # COST = UM_P
+                        cost = float(um_p_str)  # COST = UM_P (case price)
                     except Exception:
                         cost = 0.0
 
-                    # authoritative UNIT from COST / PACK (avoid display rounding)
-                    unit = cost / pack if pack else unit_p
+                    unit = (cost / pack) if pack else unit_p
 
                     rows.append(
                         {
@@ -159,4 +137,9 @@ class JCSalesParser:
                     )
 
         inv_no = self._extract_invoice_no(page_texts)
-        return rows, inv_no
+
+        if not rows:
+            return pd.DataFrame(columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"]), inv_no
+
+        df = pd.DataFrame(rows, columns=["ITEM", "DESCRIPTION", "PACK", "UNIT", "COST"])
+        return df, inv_no
