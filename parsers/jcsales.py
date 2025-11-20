@@ -24,6 +24,7 @@ def normalize_output_upc(val):
         return ""
     s = str(val).strip()
     s = re.sub(r"\D", "", s)
+    # If it's valid data, pad it to 12 digits
     if len(s) > 0:
         return s.zfill(12)[-12:]
     return ""
@@ -32,13 +33,15 @@ class JCSalesParser:
     name = "JC Sales"
 
     def parse(self, invoice_pdf, master_file, pricebook_file):
-        # 1. Parse PDF - returns list of dicts with '_order' key
+        # 1. Parse PDF with strict layout preservation
         invoice_items = self._extract_pdf_data(invoice_pdf)
-        invoice_df = pd.DataFrame(invoice_items)
         
-        if invoice_df.empty:
+        if not invoice_items:
             return pd.DataFrame(), pd.DataFrame()
 
+        # Create DataFrame and ensure we preserve the extraction order
+        invoice_df = pd.DataFrame(invoice_items)
+        
         # 2. Load Master
         if master_file.name.endswith('.csv'):
             master_df = pd.read_csv(master_file, dtype=str)
@@ -47,7 +50,9 @@ class JCSalesParser:
         
         # Normalize Master Item for lookup
         master_df['match_item'] = master_df['ITEM'].apply(normalize_for_match)
-        # Drop duplicates, keeping first occurrence
+        
+        # Create efficient lookup map: match_item -> row dict
+        # Drop duplicates to avoid explosion (keep first found)
         master_unique = master_df.drop_duplicates(subset=['match_item'])
         master_map = master_unique.set_index('match_item').to_dict('index')
 
@@ -56,26 +61,25 @@ class JCSalesParser:
         pb_df['match_upc'] = pb_df['Upc'].apply(normalize_for_match)
         
         # Lookup dictionaries
+        # Map normalized UPC -> Index in PB dataframe
         pb_map_idx = dict(zip(pb_df['match_upc'], pb_df.index))
-        # Drop duplicates for data lookup
+        
+        # Map normalized UPC -> Data row
         pb_unique = pb_df.drop_duplicates(subset=['match_upc'])
         pb_data_map = pb_unique.set_index('match_upc').to_dict('index')
 
-        # 4. Logic Loop
+        # 4. Logic Loop (Iterate Invoice Rows in Order)
         parsed_rows = []
         pos_update_indices = [] 
 
-        # Iterate through invoice items in the order they were extracted
-        # We assume invoice_df is already in order 0..N from _extract_pdf_data
-        for idx, inv_row in invoice_df.iterrows():
-            item_id_raw = str(inv_row['ITEM'])
-            item_id = normalize_for_match(item_id_raw)
+        for _, inv_row in invoice_df.iterrows():
+            item_id = normalize_for_match(inv_row['ITEM'])
             
             final_upc_raw = None
             final_upc_display = "No Match"
             pb_entry = None
 
-            # Master Lookup
+            # Lookup in Master Map
             if item_id in master_map:
                 m_row = master_map[item_id]
                 upc1_raw = str(m_row.get('UPC1', ''))
@@ -84,7 +88,7 @@ class JCSalesParser:
                 u1 = normalize_for_match(upc1_raw)
                 u2 = normalize_for_match(upc2_raw)
 
-                # Check Pricebook
+                # Priority Check: UPC1 then UPC2
                 if u1 and u1 in pb_data_map:
                     final_upc_raw = u1
                     final_upc_display = upc1_raw 
@@ -94,7 +98,7 @@ class JCSalesParser:
                     final_upc_display = upc2_raw
                     pb_entry = pb_data_map[u2]
             
-            # Format Output UPC
+            # If matched, format for output
             if final_upc_raw:
                  final_upc_display = normalize_output_upc(final_upc_raw)
 
@@ -122,11 +126,11 @@ class JCSalesParser:
                 except ValueError:
                     pass
 
+                # Collect index for POS Update file
                 if final_upc_raw in pb_map_idx:
                      pos_update_indices.append(pb_map_idx[final_upc_raw])
 
             parsed_rows.append({
-                "_order": inv_row['_order'], # Keep original order
                 "UPC": final_upc_display,
                 "DESCRIPTION": inv_row['DESCRIPTION'],
                 "PACK": int(pack),
@@ -137,17 +141,15 @@ class JCSalesParser:
                 "DELTA": round(delta, 2)
             })
 
-        # Build Final DF and Sort by Original Order
+        # Build Final DataFrames
         parsed_df = pd.DataFrame(parsed_rows)
-        if not parsed_df.empty:
-            parsed_df = parsed_df.sort_values('_order').drop(columns=['_order'])
         
-        # Build POS Update
+        # Build POS Update DF
         if pos_update_indices:
             unique_indices = list(set(pos_update_indices))
             pos_update_df = pb_df.loc[unique_indices].copy()
             
-            # Update Logic
+            # Map Invoice Data to Updates
             updates = {}
             for _, row in parsed_df.iterrows():
                 u = normalize_for_match(row['UPC'])
@@ -180,96 +182,131 @@ class JCSalesParser:
 
     def _extract_pdf_data(self, pdf_file):
         """
-        Extracts items preserving exact invoice order.
-        Refined to handle 'T ' artifact in description.
+        Extracts line items preserving strict order from PDF.
+        Logic: 
+        1. Read text line-by-line (pdfplumber handles basic layout).
+        2. Look for rows starting with ITEM # (digits).
+        3. Use Regex to cleanly separate Description, Pack, and Pricing.
         """
         items = []
-        order_counter = 0
         
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                text = page.extract_text()
+                # Extract text preserving physical layout
+                text = page.extract_text(layout=True)
                 if not text: continue
                 
                 lines = text.split('\n')
                 for line in lines:
-                    parts = line.split()
-                    if len(parts) < 5: continue
+                    line = line.strip()
+                    if not line: continue
+
+                    # Regex Strategy:
+                    # 1. ITEM (Start of line, digits)
+                    # 2. DESCRIPTION (Text block)
+                    # 3. OPTIONAL: "T" flag (Tax?)
+                    # 4. OPTIONAL: "1" (Crv or Quantity?)
+                    # 5. UNIT/MEASURE (PK/CS/EA) -- Key Anchor!
+                    # 6. PACK (Integer)
+                    # 7. Prices...
                     
-                    # Check if line starts with Item Number (digits)
-                    # Must be 3-6 digits.
-                    if parts[0].isdigit() and 3 <= len(parts[0]) <= 6:
-                        item_num = parts[0]
+                    # Invoice layout example:
+                    # 118815 TOY DOCTOR PLAY SET ASST COLOR T 1 PK 24 1 0.85 20.40 20.40
+                    # Item: 118815
+                    # Desc: TOY DOCTOR PLAY SET ASST COLOR
+                    # Pack: 24
+                    # Cost: 20.40 (UM_P)
+                    
+                    # We split by whitespace
+                    parts = line.split()
+                    
+                    # Must start with Item# (3-6 digits)
+                    if len(parts) < 6 or not (parts[0].isdigit() and 3 <= len(parts[0]) <= 6):
+                        continue
                         
-                        # Parse from RIGHT to LEFT to find prices
-                        # Expected tail: ... [PACK] [?] [UNIT_P] [UM_P] [EXT_P]
-                        # Example: ... PK 12 1 2.39 28.68 28.68
+                    item_num = parts[0]
+                    
+                    # SCAN FROM THE RIGHT (End of line) to find the numeric columns
+                    # Expected End: ... [PACK] [Multiplier?] [UNIT_PRICE] [CASE_COST] [EXT_COST]
+                    # Example: ... 24 1 0.85 20.40 20.40
+                    
+                    try:
+                        # Identify the pricing floats at the end
+                        # We look for the last 3 numbers that look like prices
+                        float_indices = []
+                        for i in range(len(parts)-1, -1, -1):
+                            s = parts[i].replace(',', '')
+                            if re.match(r'^\d+\.\d+$', s): # Strict float match (X.XX)
+                                float_indices.append(i)
                         
-                        try:
-                            # Find indices of the last 3 numbers (UnitP, CaseCost, ExtCost)
-                            float_indices = []
-                            for i in range(len(parts)-1, -1, -1):
-                                clean_s = parts[i].replace(',', '')
-                                # Regex for price-like number (1.99, 20.40, 0.85)
-                                if re.match(r'^\d+(\.\d+)?$', clean_s):
-                                    float_indices.append(i)
-                                    if len(float_indices) == 3:
-                                        break
-                            
-                            if len(float_indices) == 3:
-                                # Indices are reversed: [Ext_P_idx, UM_P_idx, Unit_P_idx]
-                                um_p_idx = float_indices[1]
-                                cost = float(parts[um_p_idx].replace(',', ''))
-                                
-                                unit_p_idx = float_indices[2]
-                                
-                                # Find PACK to the left of Unit Price
-                                # Scan backwards from unit_p_idx
-                                pack = 1
-                                desc_end_idx = unit_p_idx
-                                
-                                found_pack = False
-                                for k in range(unit_p_idx - 1, 0, -1):
-                                    tok = parts[k]
-                                    if tok.isdigit():
-                                        val = int(tok)
-                                        # If it's '1', it might be a multiplier. Check one more left.
-                                        if val == 1 and k > 1 and parts[k-1].isdigit():
-                                             pack = int(parts[k-1])
-                                             desc_end_idx = k - 1
-                                             found_pack = True
-                                             break
-                                        elif val > 1:
-                                             pack = val
-                                             desc_end_idx = k
-                                             found_pack = True
-                                             break
-                                    # Stop if we hit unit measure text
-                                    elif tok in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
-                                        desc_end_idx = k
-                                        break
-                                
-                                # EXTRACT DESCRIPTION
-                                # parts[0] is Item Num.
-                                # parts[1] might be "T" or part of desc.
-                                # Description is parts[1:desc_end_idx]
-                                raw_desc = parts[1:desc_end_idx]
-                                
-                                # Clean artifacts: Remove leading "T" if present as standalone token
-                                if raw_desc and raw_desc[0] == "T":
-                                    raw_desc = raw_desc[1:]
-                                
-                                description = " ".join(raw_desc)
-                                
-                                items.append({
-                                    '_order': order_counter,
-                                    'ITEM': item_num,
-                                    'DESCRIPTION': description,
-                                    'PACK': pack,
-                                    'COST': cost
-                                })
-                                order_counter += 1
-                        except Exception:
+                        # We need at least 2 price columns (UnitP, UM_P) or 3 (UnitP, UM_P, ExtP)
+                        if len(float_indices) < 2:
                             continue
                             
+                        # UM_P (Case Cost) is usually the 2nd to last price
+                        # Ext_P is last price.
+                        # Unit_P is 3rd to last.
+                        
+                        # If we have 3 prices [Ext, Case, Unit] (indices reversed)
+                        if len(float_indices) >= 3:
+                            um_p_idx = float_indices[1]
+                            unit_p_idx = float_indices[2]
+                            cost = float(parts[um_p_idx].replace(',', ''))
+                            
+                            # PACK is usually the integer before the Unit Price
+                            # But sometimes there is a multiplier "1" in between
+                            
+                            # Look immediately left of Unit Price
+                            search_idx = unit_p_idx - 1
+                            pack = 1
+                            
+                            # Consume any "1"s or "T"s between Pack and Unit Price
+                            while search_idx > 1:
+                                tok = parts[search_idx]
+                                if tok.isdigit() and int(tok) > 1:
+                                    # Found the pack!
+                                    pack = int(tok)
+                                    # Everything before this pack (and after Item#) is description
+                                    desc_end = search_idx
+                                    
+                                    # BUT: We need to handle the "UM" text (PK, CS) which comes BEFORE pack
+                                    # Check left one more time for "PK"
+                                    if parts[search_idx-1] in ['PK', 'CS', 'EA', 'DZ']:
+                                        desc_end = search_idx - 1
+                                    
+                                    break
+                                elif tok in ['PK', 'CS', 'EA', 'DZ']:
+                                    # Found the Unit Measure, Pack must be to the right? 
+                                    # Wait, usually it is: PK 24
+                                    # If we hit 'PK', the number to the RIGHT is pack. 
+                                    # But we are scanning left.
+                                    # If we hit PK at search_idx, then Pack was search_idx+1 (which we just passed)
+                                    if parts[search_idx+1].isdigit():
+                                         pack = int(parts[search_idx+1])
+                                         desc_end = search_idx
+                                         break
+                                search_idx -= 1
+                            
+                            # Clean Description
+                            # Everything from parts[1] to desc_end
+                            raw_desc_parts = parts[1:desc_end]
+                            
+                            # Filter out specific artifacts like standalone "T" (Tax flag) or "1"
+                            clean_desc_parts = []
+                            for p in raw_desc_parts:
+                                if p not in ['T', '1', 'N']: # Common noise flags
+                                    clean_desc_parts.append(p)
+                                    
+                            description = " ".join(clean_desc_parts)
+
+                            items.append({
+                                'ITEM': item_num,
+                                'DESCRIPTION': description,
+                                'PACK': pack,
+                                'COST': cost
+                            })
+
+                    except Exception:
+                        continue
+
         return items
