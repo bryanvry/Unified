@@ -34,11 +34,14 @@ class JCSalesParser:
 
     def parse(self, invoice_pdf, master_file, pricebook_file):
         # 1. Parse the PDF Invoice to get ITEM, DESCRIPTION, PACK, COST
+        # This function ensures items are returned in the order they appear in the PDF
         invoice_items = self._extract_pdf_data(invoice_pdf)
+        
+        # Convert to DataFrame just for easier handling, but we will iterate row-by-row
+        # to preserve the extraction order.
         invoice_df = pd.DataFrame(invoice_items)
         
         if invoice_df.empty:
-            # Return empty if nothing extracted
             return pd.DataFrame(), pd.DataFrame()
 
         # 2. Load JC Sales Master (ITEM -> UPC1, UPC2)
@@ -48,91 +51,75 @@ class JCSalesParser:
             master_df = pd.read_excel(master_file, dtype=str)
         
         # Normalize ITEM column for joining
-        invoice_df['match_item'] = invoice_df['ITEM'].apply(normalize_for_match)
+        # We create a map for faster O(1) lookup instead of repeated DF filtering
         master_df['match_item'] = master_df['ITEM'].apply(normalize_for_match)
         
+        # Create a dictionary mapping ITEM -> {UPC1, UPC2}
+        # We drop duplicates to avoid explosion, taking the first occurrence found in Master
+        master_unique = master_df.drop_duplicates(subset=['match_item'])
+        master_map = master_unique.set_index('match_item').to_dict('index')
+
         # 3. Load Pricebook
         pb_df = pd.read_csv(pricebook_file, dtype=str)
-        # Create a normalized UPC column for matching
         pb_df['match_upc'] = pb_df['Upc'].apply(normalize_for_match)
         
-        # --- FIX: Handle Duplicate UPCs in Pricebook ---
-        # Map normalized UPC -> Index in PB dataframe
-        # We use a dictionary comprehension which is safe for duplicates (last one wins)
+        # Create lookup dictionaries
         pb_map_idx = dict(zip(pb_df['match_upc'], pb_df.index))
-        
-        # Create lookup dictionary for pricing data
-        # We MUST drop duplicates in 'match_upc' before setting it as index
-        # to avoid "DataFrame index must be unique" error.
-        # We keep the first occurrence of each UPC.
         pb_unique = pb_df.drop_duplicates(subset=['match_upc'])
         pb_data_map = pb_unique.set_index('match_upc').to_dict('index')
-        # ------------------------------------------------
 
-        # 4. Merge Logic
+        # 4. Logic Loop (Iterate through Invoice Items in Order)
         parsed_rows = []
-        pos_update_indices = [] # Store indices of PB rows to keep
+        pos_update_indices = [] 
 
         for _, inv_row in invoice_df.iterrows():
-            item_id = inv_row['match_item']
-            
-            # Lookup in Master
-            master_record = master_df[master_df['match_item'] == item_id]
+            # Normalize the extracted item number for lookup
+            item_id_raw = str(inv_row['ITEM'])
+            item_id = normalize_for_match(item_id_raw)
             
             final_upc_raw = None
             final_upc_display = "No Match"
             pb_entry = None
 
-            if not master_record.empty:
-                m_row = master_record.iloc[0]
+            # Lookup Item in Master Map
+            if item_id in master_map:
+                m_row = master_map[item_id]
                 upc1_raw = str(m_row.get('UPC1', ''))
                 upc2_raw = str(m_row.get('UPC2', ''))
                 
                 u1 = normalize_for_match(upc1_raw)
                 u2 = normalize_for_match(upc2_raw)
 
-                # Check UPC1
+                # Priority 1: Check UPC1 in Pricebook
                 if u1 and u1 in pb_data_map:
                     final_upc_raw = u1
-                    final_upc_display = upc1_raw # Use original from master
+                    final_upc_display = upc1_raw 
                     pb_entry = pb_data_map[u1]
-                # Check UPC2
+                # Priority 2: Check UPC2 in Pricebook
                 elif u2 and u2 in pb_data_map:
                     final_upc_raw = u2
                     final_upc_display = upc2_raw
                     pb_entry = pb_data_map[u2]
             
-            # Format the UPC for the Goal Sheet if match found
+            # Format output UPC if matched
             if final_upc_raw:
-                 # User requested using the matched UPC. We'll standard formatting if needed, 
-                 # but here we stick to the raw match or normalized version.
-                 # Usually POS needs 12 digits.
                  final_upc_display = normalize_output_upc(final_upc_raw)
 
             # --- Calculations ---
-            # PACK (#/UM from PDF), COST (UM_P from PDF)
             pack = float(inv_row['PACK'])
             cost = float(inv_row['COST'])
             
-            # UNIT = COST / PACK
             unit = cost / pack if pack else 0
-            
-            # RETAIL = UNIT * 2
             retail = unit * 2
             
-            # NOW = cents / .01
-            # DELTA = UNIT - (cost_cents / cost_qty / .01)
             now_price = 0.0
             delta = 0.0
             
             if pb_entry:
                 try:
-                    # NOW
                     cents = float(pb_entry.get('cents', 0))
                     now_price = cents / 100.0
                     
-                    # DELTA
-                    # Watch out for strings or NaNs in pricebook numbers
                     pb_cost_cents = float(pb_entry.get('cost_cents', 0))
                     pb_cost_qty = float(pb_entry.get('cost_qty', 1))
                     if pb_cost_qty == 0: pb_cost_qty = 1
@@ -142,9 +129,6 @@ class JCSalesParser:
                 except ValueError:
                     pass
 
-                # Add to POS update list
-                # We assume one match per normalized UPC in pricebook for simplicity,
-                # or grab the specific index we mapped earlier
                 if final_upc_raw in pb_map_idx:
                      pos_update_indices.append(pb_map_idx[final_upc_raw])
 
@@ -159,22 +143,16 @@ class JCSalesParser:
                 "DELTA": round(delta, 2)
             })
 
-        # --- Build Goal Sheet DataFrame ---
+        # --- Build Goal Sheet DataFrame (Preserving Order) ---
         parsed_df = pd.DataFrame(parsed_rows)
         
         # --- Build POS Update DataFrame ---
         if pos_update_indices:
-            # Select only the matching rows from original pricebook
-            # Use set() to remove duplicates if multiple items map to same UPC
             unique_indices = list(set(pos_update_indices))
             pos_update_df = pb_df.loc[unique_indices].copy()
             
-            # Update cost_qty and cost_cents
-            # Create a map from normalized UPC -> {pack, cost}
             updates = {}
             for _, row in parsed_df.iterrows():
-                # Re-normalize output UPC to match key
-                # The output UPC might be formatted (12 digits), so we normalize it back
                 u = normalize_for_match(row['UPC'])
                 if u and u != "":
                     updates[u] = {
@@ -182,7 +160,6 @@ class JCSalesParser:
                         'cost': row['COST']
                     }
             
-            # Apply updates
             def apply_qty(row):
                 u = row['match_upc']
                 if u in updates:
@@ -198,11 +175,8 @@ class JCSalesParser:
             pos_update_df['cost_qty'] = pos_update_df.apply(apply_qty, axis=1)
             pos_update_df['cost_cents'] = pos_update_df.apply(apply_cents, axis=1)
             
-            # Drop helper column
             pos_update_df = pos_update_df.drop(columns=['match_upc'])
-            
         else:
-            # Return empty DF with correct columns if no matches
             pos_update_df = pd.DataFrame(columns=pb_df.columns).drop(columns=['match_upc'])
 
         return parsed_df, pos_update_df
@@ -221,21 +195,17 @@ class JCSalesParser:
                 
                 lines = text.split('\n')
                 for line in lines:
-                    # Tokenize line
                     parts = line.split()
                     if len(parts) < 5: continue
                     
                     # Candidate for Item #: First token must be digits (e.g., "14158")
-                    # And typically 3+ digits long
                     if parts[0].isdigit() and len(parts[0]) >= 3:
                         item_num = parts[0]
                         
                         try:
-                            # Identify the three floating point numbers at the end
-                            # We walk backwards from the end of the line
+                            # Find floats at the end
                             float_indices = []
                             for i in range(len(parts)-1, -1, -1):
-                                # Clean commas from numbers
                                 clean_s = parts[i].replace(',', '')
                                 if re.match(r'^\d+(\.\d+)?$', clean_s):
                                     float_indices.append(i)
@@ -243,20 +213,13 @@ class JCSalesParser:
                                         break
                             
                             if len(float_indices) == 3:
-                                # Indices are reversed: [Ext_P_idx, UM_P_idx, Unit_P_idx]
                                 um_p_idx = float_indices[1]
                                 cost = float(parts[um_p_idx].replace(',', ''))
-                                
-                                # The PACK (#/UM) is usually the integer immediately preceding the UNIT_P
-                                # UNIT_P is at float_indices[2]
                                 unit_p_idx = float_indices[2]
                                 
-                                # Look at the token before Unit Price. 
-                                # Sometimes there is a "1" or multiplier there.
                                 pack = 1
                                 desc_end_idx = unit_p_idx
                                 
-                                # Scan backwards from Unit Price to find Pack
                                 found_pack = False
                                 for k in range(unit_p_idx - 1, 0, -1):
                                     tok = parts[k]
@@ -264,7 +227,6 @@ class JCSalesParser:
                                         if not found_pack:
                                             val = int(tok)
                                             if val == 1:
-                                                # Check one more to left for actual pack
                                                 prev = parts[k-1] if k>0 else ""
                                                 if prev.isdigit():
                                                     pack = int(prev)
@@ -280,11 +242,9 @@ class JCSalesParser:
                                                 found_pack = True
                                                 break
                                     elif tok in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
-                                        # Hit a Unit Measure text, stop
                                         desc_end_idx = k
                                         break
                                 
-                                # Description is everything between Item# (index 0) and desc_end_idx
                                 description = " ".join(parts[1:desc_end_idx])
                                 
                                 items.append({
