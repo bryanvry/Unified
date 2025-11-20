@@ -56,12 +56,15 @@ class JCSalesParser:
         # Create a normalized UPC column for matching
         pb_df['match_upc'] = pb_df['Upc'].apply(normalize_for_match)
         
-        # --- FIX START ---
-        # Create lookup dictionary for fast searching: match_upc -> Row Data
-        # We use set_index to make match_upc the index, then convert to dict
-        # This handles the 'Index object has no attribute to_dict' error by operating on the DataFrame
+        # --- FIX: Create lookup dictionaries robustly ---
+        # Map normalized UPC -> Index in PB dataframe (to grab full row later)
+        # We use a simple dictionary comprehension
+        pb_map_idx = dict(zip(pb_df['match_upc'], pb_df.index))
+        
+        # Also keep a dict for fast lookup of pricing data
+        # .set_index(...).to_dict('index') works on DataFrame, not Index
         pb_data_map = pb_df.set_index('match_upc').to_dict('index')
-        # --- FIX END ---
+        # ------------------------------------------------
 
         # 4. Merge Logic
         parsed_rows = []
@@ -98,6 +101,9 @@ class JCSalesParser:
             
             # Format the UPC for the Goal Sheet if match found
             if final_upc_raw:
+                 # User requested using the matched UPC. We'll standard formatting if needed, 
+                 # but here we stick to the raw match or normalized version.
+                 # Usually POS needs 12 digits.
                  final_upc_display = normalize_output_upc(final_upc_raw)
 
             # --- Calculations ---
@@ -123,6 +129,7 @@ class JCSalesParser:
                     now_price = cents / 100.0
                     
                     # DELTA
+                    # Watch out for strings or NaNs in pricebook numbers
                     pb_cost_cents = float(pb_entry.get('cost_cents', 0))
                     pb_cost_qty = float(pb_entry.get('cost_qty', 1))
                     if pb_cost_qty == 0: pb_cost_qty = 1
@@ -133,10 +140,10 @@ class JCSalesParser:
                     pass
 
                 # Add to POS update list
-                # We search the original dataframe for this match_upc to get the index
-                idx_list = pb_df.index[pb_df['match_upc'] == final_upc_raw].tolist()
-                if idx_list:
-                     pos_update_indices.extend(idx_list)
+                # We assume one match per normalized UPC in pricebook for simplicity,
+                # or grab the specific index we mapped earlier
+                if final_upc_raw in pb_map_idx:
+                     pos_update_indices.append(pb_map_idx[final_upc_raw])
 
             parsed_rows.append({
                 "UPC": final_upc_display,
@@ -164,6 +171,7 @@ class JCSalesParser:
             updates = {}
             for _, row in parsed_df.iterrows():
                 # Re-normalize output UPC to match key
+                # The output UPC might be formatted (12 digits), so we normalize it back
                 u = normalize_for_match(row['UPC'])
                 if u and u != "":
                     updates[u] = {
@@ -237,8 +245,11 @@ class JCSalesParser:
                                 cost = float(parts[um_p_idx].replace(',', ''))
                                 
                                 # The PACK (#/UM) is usually the integer immediately preceding the UNIT_P
+                                # UNIT_P is at float_indices[2]
                                 unit_p_idx = float_indices[2]
                                 
+                                # Look at the token before Unit Price. 
+                                # Sometimes there is a "1" or multiplier there.
                                 pack = 1
                                 desc_end_idx = unit_p_idx
                                 
