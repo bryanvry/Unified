@@ -1,7 +1,7 @@
 # parsers/jcsales.py
 # JC Sales PDF parser → returns (rows_df, invoice_number)
 # rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-# App (your app.py) computes UPC/RETAIL/NOW/DELTA and builds POS_update.
+# Your app.py computes UPC/RETAIL/NOW/DELTA and builds POS_update.
 
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
@@ -16,9 +16,6 @@ except Exception:
 
 
 # ---------- utils ----------
-def _digits(s: str) -> str:
-    return "".join(ch for ch in str(s or "") if ch.isdigit())
-
 def _to_float(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
@@ -260,24 +257,25 @@ class JCSalesParser:
     # --- regex-line fallback (third try; very tolerant) ---
     def _extract_by_regex_lines(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
         """
-        Works on plain text lines. Supports BOTH shapes:
+        Supports BOTH shapes (now with a trailing pack override):
 
         A) ITEM  DESC ...  PACK  UNIT  COST [EXT]
-        B) [row] ITEM  DESC ...  QTY  PACK UOM  UNIT  COST [EXT]    <-- e.g.
-           "1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 2.39 28.68 28.68"
-           where PACK is the number immediately before the UOM token.
+        B) [row] [opt letter] ITEM  DESC ...  QTY  PACK UOM  UNIT  COST [EXT] [PACK_OVERRIDE]
+           e.g. "1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 2.39 28.68 28.68 12"
+           or   "100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 0.85 20.40 20.40 24"
         """
         rows = []
         page_texts = []
         money = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
         uom = r"(?:PK|EA|CT|DZ|CS|CASE|PC|PCS)"
 
+        # A: ITEM DESC PACK UNIT COST [EXT] [PACK_OVERRIDE?]  (override rarely present here)
         patt_A = re.compile(
-            rf"^\s*(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{money}\s+{money}(?:\s+{money})?\s*$"
+            rf"^\s*(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{money}\s+{money}(?:\s+{money})?(?:\s+(?P<packov>\d+))?\s*$"
         )
-        # optional leading row#, then item#, desc, qty, pack, UOM, unit, cost, [ext]
+        # B: optional row and/or letter before ITEM; trailing pack override allowed
         patt_B = re.compile(
-            rf"^\s*(?:\d+\s+)?(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+(\d+)\s+{uom}\s+{money}\s+{money}(?:\s+{money})?\s*$",
+            rf"^\s*(?:\d+\s+[A-Z]\s+|\d+\s+)?(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+(\d+)\s+{uom}\s+{money}\s+{money}(?:\s+{money})?(?:\s+(?P<packov>\d+))?\s*$",
             re.IGNORECASE
         )
 
@@ -286,15 +284,18 @@ class JCSalesParser:
             page_texts.append(txt)
             for raw in txt.splitlines():
                 line = " ".join(raw.split())  # collapse whitespace
+
                 mB = patt_B.search(line)
                 if mB:
                     item = mB.group(1).strip()
                     desc = mB.group(2).strip()
-                    # qty = mB.group(3)  # not used
-                    pack = _to_int(mB.group(4))
+                    # qty = mB.group(3)
+                    pack_hint = _to_int(mB.group(4))
                     unit = _to_float(mB.group(5))
                     cost = _to_float(mB.group(6))
-                    # ext = mB.group(7)  # optional
+                    pack_ov = mB.group("packov")
+                    pack = _to_int(pack_ov) if pack_ov else pack_hint
+
                     if not desc or pack <= 0:
                         continue
                     if unit is not None and cost is not None and unit > cost:
@@ -305,6 +306,7 @@ class JCSalesParser:
                         unit = cost / pack if pack > 0 else np.nan
                     if cost is None or np.isnan(cost) or cost <= 0:
                         continue
+
                     rows.append({
                         "ITEM": item,
                         "DESCRIPTION": desc,
@@ -318,13 +320,15 @@ class JCSalesParser:
                 if mA:
                     item = mA.group(1).strip()
                     desc = mA.group(2).strip()
-                    pack = _to_int(mA.group(3))
-                    val1 = _to_float(mA.group(4))
-                    val2 = _to_float(mA.group(5))
-                    # ext = mA.group(6)  # optional
+                    pack_hint = _to_int(mA.group(3))
+                    v1 = _to_float(mA.group(4))
+                    v2 = _to_float(mA.group(5))
+                    pack_ov = mA.group("packov")
+                    pack = _to_int(pack_ov) if pack_ov else pack_hint
+
                     if not desc or pack <= 0:
                         continue
-                    unit, cost = val1, val2
+                    unit, cost = v1, v2
                     if (unit is not None and cost is not None) and (unit > cost):
                         unit, cost = cost, unit
                     if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
@@ -333,6 +337,7 @@ class JCSalesParser:
                         unit = cost / pack if pack > 0 else np.nan
                     if cost is None or np.isnan(cost) or cost <= 0:
                         continue
+
                     rows.append({
                         "ITEM": item,
                         "DESCRIPTION": desc,
