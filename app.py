@@ -6,7 +6,7 @@ from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
-from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
+from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 
