@@ -1,7 +1,7 @@
 # parsers/jcsales.py
 # JC Sales PDF parser → returns (rows_df, invoice_number)
 # rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-# App layer (your app.py) computes UPC/RETAIL/NOW/DELTA and builds POS_update.
+# App (your app.py) already computes UPC/RETAIL/NOW/DELTA and builds POS_update.
 
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
@@ -15,7 +15,7 @@ except Exception:
     pdfplumber = None
 
 
-# ---------- small utils ----------
+# ---------- utils ----------
 def _digits(s: str) -> str:
     return "".join(ch for ch in str(s or "") if ch.isdigit())
 
@@ -41,12 +41,12 @@ def _canon(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-# ---------- header detection ----------
+# ---------- header detection for table strategy ----------
 def _find_header_map(header: List[str]) -> Optional[dict]:
     """
-    JC Sales header variants seen on PDF:
+    JC Sales variants seen:
       ITEM | DESCRIPTION | #/UM | UNIT_P | UM_P
-    We'll accept loose matches like "UNIT P", "UM P", "Qty/UM", etc.
+    Accept loose matches like 'UNIT P', 'UM P', 'Qty / UM', etc.
     """
     cmap = {_canon(h): h for h in header if h is not None}
 
@@ -65,11 +65,10 @@ def _find_header_map(header: List[str]) -> Optional[dict]:
 
     col_item = pick("item")
     col_desc = pick("description", "desc")
-    col_pack = pick("#/um", "qty/um", "qtypercase", "qtycase", "pack")
+    col_pack = pick("#/um", "qty/um", "qtypercase", "qtycase", "pack", "um", "perum")
     col_unit = pick("unit_p", "unit p", "unitprice", "unit")
-    col_cost = pick("um_p", "um p", "caseprice", "casecost", "umprice")
+    col_cost = pick("um_p", "um p", "caseprice", "casecost", "umprice", "cost")
 
-    # ITEM/DESCRIPTION/PACK and COST must exist; UNIT optional (recomputed if missing)
     if all([col_item, col_desc, col_pack, col_cost]):
         return {"ITEM": col_item, "DESCRIPTION": col_desc, "PACK": col_pack, "UNIT_P": col_unit, "UM_P": col_cost}
     return None
@@ -135,12 +134,10 @@ class JCSalesParser:
                         pack = _to_int(r.get(colmap["PACK"], ""))
                         unit = _to_float(r.get(colmap["UNIT_P"], ""))
                         cost = _to_float(r.get(colmap["UM_P"], ""))  # case cost
-
                         if not item or not desc or pack <= 0 or (cost is None) or np.isnan(cost):
                             continue
                         if unit is None or np.isnan(unit) or unit <= 0:
                             unit = cost / pack if pack > 0 else np.nan
-
                         rows.append({"ITEM": item, "DESCRIPTION": desc, "PACK": int(pack), "COST": float(cost), "UNIT": float(unit)})
 
         df_out = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
@@ -166,7 +163,7 @@ class JCSalesParser:
                 txt = " ".join([w["text"] for w in sorted(ws, key=lambda x: x["x0"])])
                 c = _canon(txt)
                 score = 0
-                for tok in ["item", "description", "um", "unit", "ump", "unitp", "#/um"]:
+                for tok in ["item", "description", "desc", "um", "unit", "ump", "unitp", "#/um", "qty/um", "pack"]:
                     if tok in c:
                         score += 1
                 if score >= 3 and score >= best_score:
@@ -191,7 +188,7 @@ class JCSalesParser:
             x_desc = xcenter_of("description","desc")
             x_pack = xcenter_of("#/um","qty/um","pack")
             x_unit = xcenter_of("unit_p","unit p","unit")
-            x_cost = xcenter_of("um_p","um p","casecost","caseprice","umprice")
+            x_cost = xcenter_of("um_p","um p","casecost","caseprice","umprice","cost")
 
             header_y = float(np.mean([w["top"] for w in header_words]))
             cols = {"item": x_item, "desc": x_desc, "pack": x_pack, "unit": x_unit, "cost": x_cost}
@@ -240,16 +237,16 @@ class JCSalesParser:
                 unit_txt = b.get("unit","").strip()
                 cost_txt = b.get("cost","").strip()
 
-                # numeric cleaning
                 pack = _to_int(pack_txt)
                 unit = _to_float(unit_txt)
                 cost = _to_float(cost_txt)
 
-                # tolerate unit missing; recompute from cost/pack later
                 if not item_txt or not desc_txt:
                     continue
                 if pack <= 0:
                     continue
+                if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
+                    cost = unit * pack
                 if cost is None or np.isnan(cost) or cost <= 0:
                     continue
                 if unit is None or np.isnan(unit) or unit <= 0:
@@ -260,29 +257,25 @@ class JCSalesParser:
         df = pd.DataFrame(all_rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if all_rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
         return df, page_texts
 
-    # --- regex-line fallback (third try) ---
+    # --- regex-line fallback (third try; very tolerant) ---
     def _extract_by_regex_lines(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
         """
-        Very tolerant: read page text lines and look for:
-          ITEM (5–7 digits) ... DESCRIPTION ... PACK (int) UNIT (float) COST (float)
-        Assumes UNIT precedes COST (as JC Sales header shows: UNIT_P then UM_P),
-        but will also accept reversed pair and swap if UNIT > COST.
+        Works on plain text lines:
+          ITEM (5–7 digits)  DESCRIPTION ...  PACK(int)  UNIT(float)  COST(float)
+        If the last two numbers appear reversed, we swap so UNIT <= COST.
         """
         rows = []
         page_texts = []
-        # UNIT and COST typically have 2 decimals
-        price_re = r"(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})"
+        price_re = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
         for pg in pdf.pages:
             txt = pg.extract_text() or ""
             page_texts.append(txt)
             for raw in txt.splitlines():
-                line = " ".join(raw.split())  # collapse spaces
-                # Look for two prices at end and one integer before them
-                # Grouping:
-                #   ITEM  DESC...  PACK  UNIT  COST
+                line = " ".join(raw.split())  # collapse whitespace
+                # Must start with ITEM code and contain letters in the description
                 m = re.search(
-                    rf"^\s*(\d{{5,7}})\s+(.*?)\s+(\d+)\s+{price_re}\s+{price_re}\s*$",
+                    rf"^\s*(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{price_re}\s+{price_re}\s*$",
                     line
                 )
                 if not m:
@@ -290,29 +283,27 @@ class JCSalesParser:
                 item = m.group(1)
                 desc = m.group(2).strip()
                 pack = _to_int(m.group(3))
-                val1 = _to_float(m.group(4))
-                val2 = _to_float(m.group(5))
-                if pack <= 0:
+                v1 = _to_float(m.group(4))
+                v2 = _to_float(m.group(5))
+                if pack <= 0 or not desc:
                     continue
-                # Heuristic: UNIT should be smaller; COST should be larger.
-                # If not, swap.
-                unit, cost = val1, val2
-                if unit is not None and cost is not None and unit > cost:
+                # Heuristic: UNIT should not exceed COST
+                unit, cost = v1, v2
+                if (unit is not None and cost is not None) and (unit > cost):
                     unit, cost = cost, unit
-                if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
-                    unit = cost / pack if pack > 0 else np.nan
+                # Fill missing pieces if one of them is missing
                 if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
                     cost = unit * pack
-
-                if not desc or (cost is None or np.isnan(cost) or cost <= 0):
+                if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
+                    unit = cost / pack if pack > 0 else np.nan
+                if cost is None or np.isnan(cost) or cost <= 0:
                     continue
-
                 rows.append({
                     "ITEM": item,
                     "DESCRIPTION": desc,
                     "PACK": int(pack),
                     "COST": float(cost),
-                    "UNIT": float(unit) if unit is not None and not np.isnan(unit) else (float(cost)/int(pack) if pack>0 else np.nan)
+                    "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
                 })
 
         df = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
@@ -342,7 +333,7 @@ class JCSalesParser:
         except Exception:
             pass
 
-        # 2) word-grid fallback
+        # 2) word-grid
         try:
             with pdfplumber.open(uploaded_pdf) as pdf:
                 df2, txt2 = self._extract_by_wordgrid(pdf)
@@ -352,7 +343,7 @@ class JCSalesParser:
         except Exception:
             pass
 
-        # 3) regex-line fallback
+        # 3) regex lines
         try:
             with pdfplumber.open(uploaded_pdf) as pdf:
                 df3, txt3 = self._extract_by_regex_lines(pdf)
