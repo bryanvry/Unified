@@ -1089,7 +1089,8 @@ if selected_vendor == "JC Sales":
                             return u1
                         if u2 and u2 in pb_set:
                             return u2
-                        return "No Match"
+                        return f"No Match {item}"
+
 
                     parsed["UPC"] = parsed["ITEM"].map(resolve_upc)
 
@@ -1118,7 +1119,7 @@ if selected_vendor == "JC Sales":
                     # (Values come straight from columns UNIT_P and UM_P in your PDF.)  # ref: OSI014135
 
                     # Build POS_update: keep pricebook cols, only invoice items with UPC != "No Match"
-                    matched = parsed_out[parsed_out["UPC"]!="No Match"].copy()
+                    matched = parsed_out[~parsed_out["UPC"].astype(str).str.startswith("No Match")].copy()
                     if not matched.empty:
                         matched = matched.rename(columns={"UPC": "__norm"})
                         pb2 = pb.copy()
