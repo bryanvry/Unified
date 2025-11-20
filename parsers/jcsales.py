@@ -1,7 +1,7 @@
 # parsers/jcsales.py
 # JC Sales PDF parser → returns (rows_df, invoice_number)
 # rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-# App (your app.py) already computes UPC/RETAIL/NOW/DELTA and builds POS_update.
+# App (your app.py) computes UPC/RETAIL/NOW/DELTA and builds POS_update.
 
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
@@ -260,51 +260,86 @@ class JCSalesParser:
     # --- regex-line fallback (third try; very tolerant) ---
     def _extract_by_regex_lines(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
         """
-        Works on plain text lines:
-          ITEM (5–7 digits)  DESCRIPTION ...  PACK(int)  UNIT(float)  COST(float)
-        If the last two numbers appear reversed, we swap so UNIT <= COST.
+        Works on plain text lines. Supports BOTH shapes:
+
+        A) ITEM  DESC ...  PACK  UNIT  COST [EXT]
+        B) [row] ITEM  DESC ...  QTY  PACK UOM  UNIT  COST [EXT]    <-- e.g.
+           "1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 2.39 28.68 28.68"
+           where PACK is the number immediately before the UOM token.
         """
         rows = []
         page_texts = []
-        price_re = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
+        money = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
+        uom = r"(?:PK|EA|CT|DZ|CS|CASE|PC|PCS)"
+
+        patt_A = re.compile(
+            rf"^\s*(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{money}\s+{money}(?:\s+{money})?\s*$"
+        )
+        # optional leading row#, then item#, desc, qty, pack, UOM, unit, cost, [ext]
+        patt_B = re.compile(
+            rf"^\s*(?:\d+\s+)?(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+(\d+)\s+{uom}\s+{money}\s+{money}(?:\s+{money})?\s*$",
+            re.IGNORECASE
+        )
 
         for pg in pdf.pages:
             txt = pg.extract_text() or ""
             page_texts.append(txt)
             for raw in txt.splitlines():
                 line = " ".join(raw.split())  # collapse whitespace
-                # Must start with ITEM code and contain letters in the description
-                m = re.search(
-                    rf"^\s*(\d{{5,7}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{price_re}\s+{price_re}\s*$",
-                    line
-                )
-                if not m:
+                mB = patt_B.search(line)
+                if mB:
+                    item = mB.group(1).strip()
+                    desc = mB.group(2).strip()
+                    # qty = mB.group(3)  # not used
+                    pack = _to_int(mB.group(4))
+                    unit = _to_float(mB.group(5))
+                    cost = _to_float(mB.group(6))
+                    # ext = mB.group(7)  # optional
+                    if not desc or pack <= 0:
+                        continue
+                    if unit is not None and cost is not None and unit > cost:
+                        unit, cost = cost, unit
+                    if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
+                        cost = unit * pack
+                    if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
+                        unit = cost / pack if pack > 0 else np.nan
+                    if cost is None or np.isnan(cost) or cost <= 0:
+                        continue
+                    rows.append({
+                        "ITEM": item,
+                        "DESCRIPTION": desc,
+                        "PACK": int(pack),
+                        "COST": float(cost),
+                        "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
+                    })
                     continue
-                item = m.group(1)
-                desc = m.group(2).strip()
-                pack = _to_int(m.group(3))
-                v1 = _to_float(m.group(4))
-                v2 = _to_float(m.group(5))
-                if pack <= 0 or not desc:
-                    continue
-                # Heuristic: UNIT should not exceed COST
-                unit, cost = v1, v2
-                if (unit is not None and cost is not None) and (unit > cost):
-                    unit, cost = cost, unit
-                # Fill missing pieces if one of them is missing
-                if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
-                    cost = unit * pack
-                if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
-                    unit = cost / pack if pack > 0 else np.nan
-                if cost is None or np.isnan(cost) or cost <= 0:
-                    continue
-                rows.append({
-                    "ITEM": item,
-                    "DESCRIPTION": desc,
-                    "PACK": int(pack),
-                    "COST": float(cost),
-                    "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
-                })
+
+                mA = patt_A.search(line)
+                if mA:
+                    item = mA.group(1).strip()
+                    desc = mA.group(2).strip()
+                    pack = _to_int(mA.group(3))
+                    val1 = _to_float(mA.group(4))
+                    val2 = _to_float(mA.group(5))
+                    # ext = mA.group(6)  # optional
+                    if not desc or pack <= 0:
+                        continue
+                    unit, cost = val1, val2
+                    if (unit is not None and cost is not None) and (unit > cost):
+                        unit, cost = cost, unit
+                    if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
+                        cost = unit * pack
+                    if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
+                        unit = cost / pack if pack > 0 else np.nan
+                    if cost is None or np.isnan(cost) or cost <= 0:
+                        continue
+                    rows.append({
+                        "ITEM": item,
+                        "DESCRIPTION": desc,
+                        "PACK": int(pack),
+                        "COST": float(cost),
+                        "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
+                    })
 
         df = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
         return df, page_texts
