@@ -612,6 +612,7 @@ for k in [
         st.session_state[k] = None
 
 # ---------------- UI ----------------
+# DROPDOWN MENU CONFIGURATION
 VENDOR_OPTIONS = [
     "Unified (SVMERCH)", 
     "Southern Glazer's", 
@@ -621,9 +622,9 @@ VENDOR_OPTIONS = [
 ]
 
 selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
-st.markdown("---")
+st.divider()
 
-# ===== Unified (SVMERCH) =====
+# ===== Unified tab =====
 if selected_vendor == "Unified (SVMERCH)":
     st.title("🧾 Unified → POS Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
@@ -667,22 +668,13 @@ if selected_vendor == "Unified (SVMERCH)":
                 key="dl_full_csv",
             )
         with col3:
-            # Generate Excel in memory
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                st.session_state["gs1_df"].to_excel(writer, sheet_name="Goal Sheet 1", index=False)
-                st.session_state["unmatched_df"].to_excel(writer, sheet_name="Unmatched Items", index=False)
-                st.session_state["full_export_df"].to_excel(writer, sheet_name="FULL Data", index=False)
-            
             st.download_button(
-                "⬇️ Goal Sheet 1 + Audit — Excel",
-                data=excel_buffer.getvalue(),
-                file_name=f"Unified_Audit_Workbook_{ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_audit_xlsx"
+                "⬇️ Goal Sheet 1 (Preview) — CSV",
+                data=df_to_csv_bytes(st.session_state["gs1_df"]),
+                file_name=f"Goal_Sheet_1_{ts}.csv",
+                mime="text/csv",
+                key="dl_gs1_csv"
             )
-        
-        st.divider()
         
         st.subheader("Preview — FULL Export (first 200)")
         st.dataframe(st.session_state["full_export_df"].head(200), use_container_width=True)
@@ -694,7 +686,7 @@ if selected_vendor == "Unified (SVMERCH)":
         st.dataframe(st.session_state["unmatched_df"].head(200), use_container_width=True)
 
 
-# ===== Southern Glazer's =====
+# ===== Southern Glazer's tab =====
 if selected_vendor == "Southern Glazer's":
     st.title("Southern Glazer's Processor")
     inv_files = st.file_uploader("Upload SG invoice PDF(s) or CSV/XLSX", type=["pdf","csv","xlsx","xls"], accept_multiple_files=True, key="sg_inv")
@@ -746,64 +738,59 @@ if selected_vendor == "Southern Glazer's":
             inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
         st.download_button(
             "⬇️ Invoice Items (CSV)",
-            data=st.session_state["sg_invoice_items_df"].to_csv(index=False).encode("utf-8"),
+            data=df_to_csv_bytes(inv_items_df),
             file_name=f"sg_invoice_items_{sg_ts}.csv",
-            key="sg_dl_items"
+            mime="text/csv",
+            key="sg_dl_inv"
         )
 
         st.subheader("Updated Master (preview)")
-        if st.session_state["sg_updated_master"] is not None:
-            st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
-            st.download_button(
-                "⬇️ Updated Master (CSV)",
-                data=st.session_state["sg_updated_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_updated_master_{sg_ts}.csv",
-                key="sg_dl_master"
-            )
+        st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
+        st.download_button(
+            "⬇️ Updated Master (CSV)",
+            data=df_to_csv_bytes(st.session_state["sg_updated_master"]),
+            file_name=f"sg_updated_master_{sg_ts}.csv",
+            mime="text/csv",
+            key="sg_dl_mst"
+        )
         
         st.subheader("POS Update (preview)")
         if st.session_state["sg_pos_update"] is not None and not st.session_state["sg_pos_update"].empty:
             st.dataframe(st.session_state["sg_pos_update"], use_container_width=True)
             st.download_button(
                 "⬇️ POS Update (CSV)",
-                data=st.session_state["sg_pos_update"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["sg_pos_update"]),
                 file_name=f"sg_pos_update_{sg_ts}.csv",
+                mime="text/csv",
                 key="sg_dl_pos"
             )
         else:
-            st.info("No POS updates generated.")
+            st.info("No POS updates generated (pricebook missing or no matches).")
 
+        # additional tables
         if st.session_state["sg_cost_changes"] is not None and not st.session_state["sg_cost_changes"].empty:
-            st.subheader("Cost Changes")
+            st.write("---")
+            st.subheader("Cost Changes (Diff > 0.009)")
             st.dataframe(st.session_state["sg_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["sg_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_cost_changes_{sg_ts}.csv",
-                key="sg_dl_cc"
-            )
-        
+
         if st.session_state["sg_not_in_master"] is not None and not st.session_state["sg_not_in_master"].empty:
+            st.write("---")
             st.subheader("Items NOT in Master")
             st.dataframe(st.session_state["sg_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["sg_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_not_in_master_{sg_ts}.csv",
-                key="sg_dl_nim"
-            )
 
         if st.session_state["sg_pb_missing"] is not None and not st.session_state["sg_pb_missing"].empty:
+            st.write("---")
             st.subheader("Items in Invoice but NOT in Pricebook")
             st.dataframe(st.session_state["sg_pb_missing"], use_container_width=True)
             st.download_button(
                 "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["sg_pb_missing"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["sg_pb_missing"]),
                 file_name=f"pricebook_missing_sg_{sg_ts}.csv",
                 key="sg_dl_pb_missing"
             )
 
-# ===== Nevada Beverage =====
+
+# ===== Nevada Beverage tab =====
 if selected_vendor == "Nevada Beverage":
     st.title("Nevada Beverage Processor")
     inv_files = st.file_uploader("Upload Nevada invoice XLSX(s)", type=["xlsx","xls"], accept_multiple_files=True, key="nv_inv")
@@ -825,7 +812,7 @@ if selected_vendor == "Nevada Beverage":
             invoice_items_df = _ensure_invoice_cols(invoice_items_df)
 
             if invoice_items_df.empty:
-                st.error("Could not parse any Nevada items. Please check the file.")
+                st.error("Could not parse any Nevada items (no UPC/Item Name/Cost/Cases). Please check the file.")
             else:
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 pos_update = None
@@ -849,70 +836,68 @@ if selected_vendor == "Nevada Beverage":
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
         st.dataframe(st.session_state["nv_invoice_items_df"].head(100), use_container_width=True)
+
+        inv_items_df = st.session_state["nv_invoice_items_df"].copy()
+        if "UPC" in inv_items_df.columns:
+            inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
         st.download_button(
             "⬇️ Invoice Items (CSV)",
-            data=st.session_state["nv_invoice_items_df"].to_csv(index=False).encode("utf-8"),
+            data=df_to_csv_bytes(inv_items_df),
             file_name=f"nv_invoice_items_{nv_ts}.csv",
+            mime="text/csv",
             key="nv_dl_items"
         )
 
         st.subheader("Updated Master (preview)")
-        if st.session_state["nv_updated_master"] is not None:
-            st.dataframe(st.session_state["nv_updated_master"].head(100), use_container_width=True)
-            st.download_button(
-                "⬇️ Updated Master (CSV)",
-                data=st.session_state["nv_updated_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_updated_master_{nv_ts}.csv",
-                key="nv_dl_master"
-            )
+        st.dataframe(st.session_state["nv_updated_master"].head(100), use_container_width=True)
+        st.download_button(
+            "⬇️ Updated Master (CSV)",
+            data=df_to_csv_bytes(st.session_state["nv_updated_master"]),
+            file_name=f"nv_updated_master_{nv_ts}.csv",
+            mime="text/csv",
+            key="nv_dl_master"
+        )
         
         st.subheader("POS Update (preview)")
         if st.session_state["nv_pos_update"] is not None and not st.session_state["nv_pos_update"].empty:
             st.dataframe(st.session_state["nv_pos_update"], use_container_width=True)
             st.download_button(
                 "⬇️ POS Update (CSV)",
-                data=st.session_state["nv_pos_update"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["nv_pos_update"]),
                 file_name=f"nv_pos_update_{nv_ts}.csv",
+                mime="text/csv",
                 key="nv_dl_pos"
             )
         else:
             st.info("No POS updates generated.")
 
         if st.session_state["nv_cost_changes"] is not None and not st.session_state["nv_cost_changes"].empty:
-            st.subheader("Cost Changes")
+            st.write("---")
+            st.subheader("Cost Changes (Diff > 0.009)")
             st.dataframe(st.session_state["nv_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["nv_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_cost_changes_{nv_ts}.csv",
-                key="nv_dl_cc"
-            )
-        
+
         if st.session_state["nv_not_in_master"] is not None and not st.session_state["nv_not_in_master"].empty:
+            st.write("---")
             st.subheader("Items NOT in Master")
             st.dataframe(st.session_state["nv_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["nv_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_not_in_master_{nv_ts}.csv",
-                key="nv_dl_nim"
-            )
-        
+
         if st.session_state["nv_pb_missing"] is not None and not st.session_state["nv_pb_missing"].empty:
+            st.write("---")
             st.subheader("Items in Invoice but NOT in Pricebook")
             st.dataframe(st.session_state["nv_pb_missing"], use_container_width=True)
             st.download_button(
                 "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["nv_pb_missing"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["nv_pb_missing"]),
                 file_name=f"pricebook_missing_nv_{nv_ts}.csv",
                 key="nv_dl_pb_missing"
             )
 
 
-# ===== Breakthru =====
+# ===== Breakthru tab =====
 if selected_vendor == "Breakthru":
     st.title("Breakthru Processor")
-    inv_files = st.file_uploader("Upload Breakthru invoice CSV(s)", type=["csv"], accept_multiple_files=True, key="bt_inv")
+    # UPDATED: Added xlsx/csv support here as requested
+    inv_files = st.file_uploader("Upload Breakthru invoice PDF(s) or Excel/CSV", type=["pdf", "xlsx", "xls", "csv"], accept_multiple_files=True, key="bt_inv")
     master_xlsx = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="bt_master")
     pricebook_csv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="bt_pb")
 
@@ -931,7 +916,7 @@ if selected_vendor == "Breakthru":
             invoice_items_df = _ensure_invoice_cols(invoice_items_df)
 
             if invoice_items_df.empty:
-                st.error("Could not parse any Breakthru items. Check the PDF.")
+                st.error("Could not parse any Breakthru items. Check the file.")
             else:
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 pos_update = None
@@ -955,67 +940,64 @@ if selected_vendor == "Breakthru":
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
         st.dataframe(st.session_state["bt_invoice_items_df"].head(100), use_container_width=True)
+
+        inv_items_df = st.session_state["bt_invoice_items_df"].copy()
+        if "UPC" in inv_items_df.columns:
+            inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
         st.download_button(
             "⬇️ Invoice Items (CSV)",
-            data=st.session_state["bt_invoice_items_df"].to_csv(index=False).encode("utf-8"),
+            data=df_to_csv_bytes(inv_items_df),
             file_name=f"bt_invoice_items_{bt_ts}.csv",
+            mime="text/csv",
             key="bt_dl_items"
         )
 
         st.subheader("Updated Master (preview)")
-        if st.session_state["bt_updated_master"] is not None:
-            st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
-            st.download_button(
-                "⬇️ Updated Master (CSV)",
-                data=st.session_state["bt_updated_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bt_updated_master_{bt_ts}.csv",
-                key="bt_dl_master"
-            )
+        st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
+        st.download_button(
+            "⬇️ Updated Master (CSV)",
+            data=df_to_csv_bytes(st.session_state["bt_updated_master"]),
+            file_name=f"bt_updated_master_{bt_ts}.csv",
+            mime="text/csv",
+            key="bt_dl_master"
+        )
         
         st.subheader("POS Update (preview)")
         if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
             st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
             st.download_button(
                 "⬇️ POS Update (CSV)",
-                data=st.session_state["bt_pos_update"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["bt_pos_update"]),
                 file_name=f"bt_pos_update_{bt_ts}.csv",
+                mime="text/csv",
                 key="bt_dl_pos"
             )
         else:
             st.info("No POS updates generated.")
 
         if st.session_state["bt_cost_changes"] is not None and not st.session_state["bt_cost_changes"].empty:
-            st.subheader("Cost Changes")
+            st.write("---")
+            st.subheader("Cost Changes (Diff > 0.009)")
             st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["bt_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bt_cost_changes_{bt_ts}.csv",
-                key="bt_dl_cc"
-            )
-        
+
         if st.session_state["bt_not_in_master"] is not None and not st.session_state["bt_not_in_master"].empty:
+            st.write("---")
             st.subheader("Items NOT in Master")
             st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["bt_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bt_not_in_master_{bt_ts}.csv",
-                key="bt_dl_nim"
-            )
 
         if st.session_state["bt_pb_missing"] is not None and not st.session_state["bt_pb_missing"].empty:
+            st.write("---")
             st.subheader("Items in Invoice but NOT in Pricebook")
             st.dataframe(st.session_state["bt_pb_missing"], use_container_width=True)
             st.download_button(
                 "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["bt_pb_missing"].to_csv(index=False).encode("utf-8"),
+                data=df_to_csv_bytes(st.session_state["bt_pb_missing"]),
                 file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
                 key="bt_dl_pb_missing"
             )
 
 
-# ===== JC Sales (Future) =====
+# ===== JC Sales (Coming Soon) =====
 if selected_vendor == "JC Sales (Coming Soon)":
     st.title("🛒 JC Sales Invoice Processor")
     st.info("🚧 The JC Sales parser is currently under construction. Check back soon!")
