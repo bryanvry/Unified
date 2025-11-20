@@ -615,7 +615,21 @@ for k in [
 tabs = st.tabs(["Unified (SVMERCH)", "Southern Glazer's", "Nevada Beverage", "Breakthru"])
 
 # ===== Unified tab =====
-with tabs[0]:
+# ---------------- UI ----------------
+# REPLACED: Tabs with a Dropdown Menu
+VENDOR_OPTIONS = [
+    "Unified (SVMERCH)", 
+    "Southern Glazer's", 
+    "Nevada Beverage", 
+    "Breakthru", 
+    "JC Sales (Coming Soon)"
+]
+
+selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
+st.markdown("---") # Visual separator
+
+# ===== Unified tab =====
+if selected_vendor == "Unified (SVMERCH)":
     st.title("🧾 Unified → POS Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
 
@@ -651,494 +665,441 @@ with tabs[0]:
             )
         with col2:
             st.download_button(
-                "⬇️ FULL Export (all matched) — CSV",
+                "⬇️ FULL Export — CSV",
                 data=df_to_csv_bytes(st.session_state["full_export_df"]),
-                file_name=f"POS_Full_AllItems_{ts}.csv",
+                file_name=f"FULL_Unified_Export_{ts}.csv",
                 mime="text/csv",
                 key="dl_full_csv",
             )
         with col3:
+            # Generate Excel in memory
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+                st.session_state["gs1_df"].to_excel(writer, sheet_name="Goal Sheet 1", index=False)
+                st.session_state["unmatched_df"].to_excel(writer, sheet_name="Unmatched Items", index=False)
+                st.session_state["full_export_df"].to_excel(writer, sheet_name="FULL Data", index=False)
+            
             st.download_button(
-                "⬇️ Audit Workbook (xlsx)",
-                data=dfs_to_xlsx_bytes({
-                    "Changes Only": st.session_state["pos_update_df"],
-                    "Goal Sheet 1": st.session_state["gs1_df"],
-                    "Unmatched":    st.session_state["unmatched_df"],
-                }),
-                file_name=f"Unified_Audit_{ts}_with_GoalSheet1.xlsx",
+                "⬇️ Goal Sheet 1 + Audit — Excel",
+                data=excel_buffer.getvalue(),
+                file_name=f"Unified_Audit_Workbook_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_audit_xlsx",
+                key="dl_audit_xlsx"
             )
-
+        
+        st.divider()
+        
         st.subheader("Preview — FULL Export (first 200)")
-        fe = st.session_state["full_export_df"].loc[:, ~st.session_state["full_export_df"].columns.duplicated()].copy()
-        st.dataframe(fe.head(200), use_container_width=True)
-
+        st.dataframe(st.session_state["full_export_df"].head(200), use_container_width=True)
+        
         st.subheader("Preview — Goal Sheet 1 (first 100)")
-        gs = st.session_state["gs1_df"].loc[:, ~st.session_state["gs1_df"].columns.duplicated()].copy()
-        st.dataframe(gs.head(100), use_container_width=True)
+        st.dataframe(st.session_state["gs1_df"].head(100), use_container_width=True)
 
         st.subheader("Unmatched (first 200)")
-        um = st.session_state["unmatched_df"].loc[:, ~st.session_state["unmatched_df"].columns.duplicated()].copy()
-        st.dataframe(um.head(200), use_container_width=True)
-    else:
-        st.info("Upload a POS CSV and at least one Unified invoice file, then click **Process Unified**.")
+        st.dataframe(st.session_state["unmatched_df"].head(200), use_container_width=True)
+
 
 # ===== Southern Glazer's tab =====
-with tabs[1]:
-    st.title("Southern Glazer's Processor")
-    inv_files = st.file_uploader("Upload SG invoice PDF(s) or CSV/XLSX", type=["pdf","csv","xlsx","xls"], accept_multiple_files=True, key="sg_inv")
-    master_xlsx = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="sg_master")
-    pricebook_csv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="sg_pb")
+if selected_vendor == "Southern Glazer's":
+    st.title("🍷 Southern Glazer's Parser")
+    st.caption("Upload PDF invoices + Master File + Pricebook to detect new items, cost changes, and generate POS updates.")
 
-    if st.button("Process SG", type="primary"):
-        if not inv_files or not master_xlsx:
-            st.error("Please upload at least one SG invoice and the Master workbook.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sg_files = st.file_uploader("SG Invoices (PDF)", type=["pdf"], accept_multiple_files=True, key="sg_inv")
+    with c2:
+        sg_master = st.file_uploader("SG Master File (CSV/XLSX)", type=["csv","xlsx","xls"], key="sg_mst")
+    with c3:
+        sg_pb = st.file_uploader("Current Pricebook (CSV) (optional)", type=["csv"], key="sg_pb")
+
+    if st.button("Process Southern Glazer's", type="primary"):
+        if not sg_files or not sg_master:
+            st.warning("Please upload Invoices and Master File.")
         else:
-            sg_parser = SouthernGlazersParser()
-            parts = []
-            for f in inv_files:
-                f.seek(0)
-                df = sg_parser.parse(f)
-                if not df.empty:
-                    parts.append(df)
-            invoice_items_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
-            invoice_items_df = _ensure_invoice_cols(invoice_items_df)
+            with st.spinner("Parsing SG..."):
+                # 1. Parse Invoices
+                sg_parser = SouthernGlazersParser()
+                # Handle multiple files by iterating
+                all_dfs = []
+                for f in sg_files:
+                    # Parser expects a single file-like object
+                    # But user might upload multiple. 
+                    # Assuming parser.parse returns DataFrame.
+                    # We might need to reset pointer or bytes depending on implementation.
+                    # Since your parser uses pdfplumber on the file object, it should work.
+                    try:
+                        df_ = sg_parser.parse(f)
+                        all_dfs.append(df_)
+                    except Exception as e:
+                        st.error(f"Error parsing {f.name}: {e}")
+                
+                if all_dfs:
+                    inv_df = pd.concat(all_dfs, ignore_index=True)
+                    
+                    # 2. Load Master
+                    mst_df = load_dataframe(sg_master)
+                    
+                    # 3. Load Pricebook if present
+                    pb_df = load_dataframe(sg_pb) if sg_pb else None
 
-            if invoice_items_df.empty:
-                st.error("Could not parse any SG items (no UPC/Item Name/Cost/Cases). Please check the file.")
-            else:
-                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
-                pos_update = None
-                pb_missing = None
-                if pricebook_csv is not None and updated_master is not None:
-                    pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
+                    # 4. Logic
+                    # (A) Clean Master
+                    # Expects columns: Item Number, UPC, Pack, Description
+                    # Let's ensure types
+                    mst_df["Item Number"] = mst_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
+                    inv_df["Item Number"] = inv_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
+                    
+                    # (B) Identify new items
+                    # items in inv but not in master
+                    not_in_master = inv_df[~inv_df["Item Number"].isin(mst_df["Item Number"])].copy()
+                    
+                    # (C) Compare Costs
+                    # Merge inv + master on Item Number
+                    merged = pd.merge(inv_df, mst_df, on="Item Number", how="inner", suffixes=("_inv", "_mst"))
+                    
+                    # Check cost diff
+                    # Clean costs
+                    merged["Net Price"] = pd.to_numeric(merged["Net Price"], errors="coerce").fillna(0)
+                    merged["Cost"] = pd.to_numeric(merged["Cost"], errors="coerce").fillna(0) # master cost
+                    
+                    # Check Pack diff
+                    merged["Pack_inv"] = pd.to_numeric(merged["Pack_inv"], errors="coerce").fillna(0)
+                    merged["Pack_mst"] = pd.to_numeric(merged["Pack_mst"], errors="coerce").fillna(0)
+                    
+                    cost_diff = merged[abs(merged["Net Price"] - merged["Cost"]) > 0.009].copy()
+                    pack_diff = merged[merged["Pack_inv"] != merged["Pack_mst"]].copy()
+                    
+                    # (D) Updated Master
+                    # Start with original master
+                    updated_master = mst_df.copy()
+                    # Update costs for items found in invoice
+                    # Map new costs
+                    cost_map = inv_df.set_index("Item Number")["Net Price"].to_dict()
+                    updated_master["Cost"] = updated_master.apply(
+                        lambda row: cost_map.get(row["Item Number"], row["Cost"]), axis=1
+                    )
+                    
+                    # (E) POS Update (Pricebook logic)
+                    # Only if pricebook provided
+                    pos_update_df = pd.DataFrame()
+                    pb_missing = pd.DataFrame()
+                    
+                    if pb_df is not None:
+                        pos_update_df, pb_missing = _build_pricebook_update(pb_df, inv_df, "Item Number", "Net Price")
 
-                st.session_state["sg_invoice_items_df"] = invoice_items_df
-                st.session_state["sg_updated_master"]   = updated_master
-                st.session_state["sg_cost_changes"]     = cost_changes
-                st.session_state["sg_not_in_master"]    = not_in_master
-                st.session_state["sg_pack_missing"]     = pack_missing
-                st.session_state["sg_pos_update"]       = pos_update
-                st.session_state["sg_pb_missing"]       = pb_missing
-                st.session_state["sg_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                st.success("Southern Glazer's — processing complete.")
+                    # Save to session
+                    st.session_state["sg_invoice_items_df"] = inv_df
+                    st.session_state["sg_updated_master"]   = updated_master
+                    st.session_state["sg_cost_changes"]     = cost_diff
+                    st.session_state["sg_not_in_master"]    = not_in_master
+                    st.session_state["sg_pack_missing"]     = pack_diff
+                    st.session_state["sg_pos_update"]       = pos_update_df
+                    st.session_state["sg_pb_missing"]       = pb_missing
+                    st.session_state["sg_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    
+                    st.success("Southern Glazer's processed!")
 
     if st.session_state["sg_invoice_items_df"] is not None:
-        sg_ts = st.session_state["sg_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
-
+        sg_ts = st.session_state["sg_ts"]
+        
+        # Downloads
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        with sc1:
+            st.download_button(
+                "⬇️ Parsed Invoices (CSV)",
+                data=st.session_state["sg_invoice_items_df"].to_csv(index=False).encode("utf-8"),
+                file_name=f"sg_parsed_invoices_{sg_ts}.csv",
+                key="sg_dl_inv"
+            )
+        with sc2:
+            st.download_button(
+                "⬇️ Updated Master (CSV)",
+                data=st.session_state["sg_updated_master"].to_csv(index=False).encode("utf-8"),
+                file_name=f"sg_updated_master_{sg_ts}.csv",
+                key="sg_dl_mst"
+            )
+        with sc3:
+            if st.session_state["sg_pos_update"] is not None and not st.session_state["sg_pos_update"].empty:
+                st.download_button(
+                    "⬇️ POS Cost Update (CSV)",
+                    data=st.session_state["sg_pos_update"].to_csv(index=False).encode("utf-8"),
+                    file_name=f"sg_pos_update_{sg_ts}.csv",
+                    key="sg_dl_pos"
+                )
+        
+        st.divider()
         st.subheader("Invoice Items (parsed, in-invoice order)")
-        st.dataframe(st.session_state["sg_invoice_items_df"].head(100), use_container_width=True)
-
-        inv_items_df = st.session_state["sg_invoice_items_df"].copy()
-        if "UPC" in inv_items_df.columns:
-            inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
-        st.download_button(
-            "⬇️ Download Invoice Items (CSV)",
-            data=inv_items_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"sg_invoice_items_{sg_ts}.csv",
-            mime="text/csv",
-            key="sg_dl_invoice_items",
-        )
-
-        if st.session_state["sg_updated_master"] is not None:
-            st.subheader("Updated Master (preview)")
-            st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
-            bio_master = BytesIO()
-            with pd.ExcelWriter(bio_master, engine="openpyxl") as w:
-                st.session_state["sg_updated_master"].to_excel(w, index=False, sheet_name="Master")
-            st.download_button(
-                "⬇️ Download Updated Master (XLSX)",
-                data=bio_master.getvalue(),
-                file_name=f"Master_UPDATED_{sg_ts}.xlsx",
-                key="sg_dl_master_xlsx"
-            )
-
-        if st.session_state["sg_cost_changes"] is not None and not st.session_state["sg_cost_changes"].empty:
-            st.caption("Cost changes")
-            st.dataframe(st.session_state["sg_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["sg_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_cost_changes_{sg_ts}.csv",
-                key="sg_dl_cost_changes"
-            )
-
-        if st.session_state["sg_not_in_master"] is not None and not st.session_state["sg_not_in_master"].empty:
-            st.caption("Invoice UPCs not in Master")
+        st.dataframe(st.session_state["sg_invoice_items_df"], use_container_width=True)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Items Not In Master")
             st.dataframe(st.session_state["sg_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["sg_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_not_in_master_{sg_ts}.csv",
-                key="sg_dl_not_in_master"
-            )
+        with c2:
+            st.subheader("Cost Changes detected")
+            st.dataframe(st.session_state["sg_cost_changes"], use_container_width=True)
+            
+        st.subheader("Updated Master (preview)")
+        st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
 
-        if st.session_state["sg_pack_missing"] is not None and not st.session_state["sg_pack_missing"].empty:
-            st.caption("Added items with Pack == 0")
-            st.dataframe(st.session_state["sg_pack_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Added with Pack 0 (CSV)",
-                data=st.session_state["sg_pack_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"sg_added_pack_zero_{sg_ts}.csv",
-                key="sg_dl_pack_zero"
-            )
-
-        if st.session_state["sg_pos_update"] is not None:
+        if st.session_state["sg_pos_update"] is not None and not st.session_state["sg_pos_update"].empty:
             st.subheader("POS Update (preview)")
-            st.dataframe(st.session_state["sg_pos_update"].head(100), use_container_width=True)
-            bio_pos = BytesIO()
-            with pd.ExcelWriter(bio_pos, engine="openpyxl") as w:
-                st.session_state["sg_pos_update"].to_excel(w, index=False, sheet_name="POS_Update")
-            st.download_button(
-                "⬇️ Download POS Update (XLSX)",
-                data=bio_pos.getvalue(),
-                file_name=f"POS_Update_{sg_ts}.xlsx",
-                key="sg_dl_pos_update"
-            )
-
+            st.dataframe(st.session_state["sg_pos_update"], use_container_width=True)
+        
         if st.session_state["sg_pb_missing"] is not None and not st.session_state["sg_pb_missing"].empty:
-            st.warning("Some invoice items were not found in the pricebook.")
+            st.subheader("Items in Invoice but NOT in Pricebook")
             st.dataframe(st.session_state["sg_pb_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["sg_pb_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"pricebook_missing_{sg_ts}.csv",
-                key="sg_dl_pb_missing"
-            )
-    else:
-        st.info("Upload SG invoice(s) and Master, then click **Process SG**. Downloads will persist afterward.")
+
 
 # ===== Nevada Beverage tab =====
-with tabs[2]:
-    st.title("Nevada Beverage Processor")
-    st.caption("Upload the original Nevada Beverage PDF invoice(s).")
-    inv_files_nv = st.file_uploader(
-        "Upload NV invoice PDF(s)",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="nv_inv"
-    )
-    master_xlsx_nv = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="nv_master")
-    pricebook_csv_nv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="nv_pb")
+if selected_vendor == "Nevada Beverage":
+    st.title("🍺 Nevada Beverage Parser")
+    st.caption("Upload Excel invoices + Master File to detect updates.")
 
-    if st.button("Process NV", type="primary"):
-        if not inv_files_nv or not master_xlsx_nv:
-            st.error("Please upload at least one NV PDF and the Master workbook.")
+    nc1, nc2, nc3 = st.columns(3)
+    with nc1:
+        nv_files = st.file_uploader("Nevada Invoices (XLSX)", type=["xlsx","xls"], accept_multiple_files=True, key="nv_inv")
+    with nc2:
+        nv_master = st.file_uploader("Nevada Master (CSV/XLSX)", type=["csv","xlsx","xls"], key="nv_mst")
+    with nc3:
+        nv_pb = st.file_uploader("Current Pricebook (CSV)", type=["csv"], key="nv_pb")
+
+    if st.button("Process Nevada Beverage", type="primary"):
+        if not nv_files or not nv_master:
+            st.warning("Upload Invoices + Master.")
         else:
-            nv_parser = NevadaBeverageParser()
-            parts_nv = []
-            for f in inv_files_nv:
-                f.seek(0)
-                df = nv_parser.parse(f)
-                if df is not None and not df.empty:
-                    parts_nv.append(df)
-            invoice_items_nv = pd.concat(parts_nv, ignore_index=True) if parts_nv else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
-            invoice_items_nv = _ensure_invoice_cols(invoice_items_nv)
+            with st.spinner("Parsing Nevada..."):
+                nv_parser = NevadaBeverageParser()
+                all_nv = []
+                for f in nv_files:
+                    try:
+                        df_ = nv_parser.parse(f)
+                        all_nv.append(df_)
+                    except Exception as e:
+                        st.error(f"Error {f.name}: {e}")
+                
+                if all_nv:
+                    inv_df = pd.concat(all_nv, ignore_index=True)
+                    mst_df = load_dataframe(nv_master)
+                    pb_df  = load_dataframe(nv_pb) if nv_pb else None
+                    
+                    # Clean IDs
+                    # Nevada usually Item Number
+                    mst_df["Item Number"] = mst_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
+                    inv_df["Item Number"] = inv_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
 
-            if invoice_items_nv.empty:
-                st.error("Could not parse any NV items (no UPC/Item Name/Cost/Cases).")
-            else:
-                updated_master_nv, cost_changes_nv, not_in_master_nv, pack_missing_nv, invoice_unique_nv = _update_master_from_invoice(master_xlsx_nv, invoice_items_nv)
-                pos_update_nv = None
-                pb_missing_nv = None
-                if pricebook_csv_nv is not None and updated_master_nv is not None:
-                    pos_update_nv, pb_missing_nv = _build_pricebook_update(pricebook_csv_nv, updated_master_nv)
+                    # Logic similar to SG
+                    not_in_master = inv_df[~inv_df["Item Number"].isin(mst_df["Item Number"])].copy()
+                    
+                    merged = pd.merge(inv_df, mst_df, on="Item Number", how="inner", suffixes=("_inv", "_mst"))
+                    
+                    # Clean numeric
+                    merged["Cost"] = pd.to_numeric(merged["Cost"], errors="coerce").fillna(0) # inv cost
+                    # Master cost might be named differently? Assuming "Cost" based on base.py standard
+                    # Actually base.py says "Cost".
+                    # But NevadaBeverageParser output uses "Cost".
+                    # Master file likely has "Cost".
+                    
+                    # Check if master has "Cost". If not, maybe "Case Cost" or "Unit Cost"?
+                    # We'll assume user provides standard master.
+                    
+                    if "Cost" in merged.columns:
+                        # Wait, merge suffixes.
+                        # If both have "Cost", we get Cost_inv and Cost_mst
+                        pass
+                    
+                    # Actually we need to look at column names. 
+                    # Let's assume standard master: Item Number, Cost, etc.
+                    # In merge: Cost_inv, Cost_mst
+                    
+                    cost_diff = pd.DataFrame()
+                    if "Cost_inv" in merged.columns and "Cost_mst" in merged.columns:
+                         merged["Cost_inv"] = pd.to_numeric(merged["Cost_inv"], errors="coerce").fillna(0)
+                         merged["Cost_mst"] = pd.to_numeric(merged["Cost_mst"], errors="coerce").fillna(0)
+                         cost_diff = merged[abs(merged["Cost_inv"] - merged["Cost_mst"]) > 0.009].copy()
 
-                st.session_state["nv_invoice_items_df"] = invoice_items_nv
-                st.session_state["nv_updated_master"]   = updated_master_nv
-                st.session_state["nv_cost_changes"]     = cost_changes_nv
-                st.session_state["nv_not_in_master"]    = not_in_master_nv
-                st.session_state["nv_pack_missing"]     = pack_missing_nv
-                st.session_state["nv_pos_update"]       = pos_update_nv
-                st.session_state["nv_pb_missing"]       = pb_missing_nv
-                st.session_state["nv_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    updated_master = mst_df.copy()
+                    cost_map = inv_df.set_index("Item Number")["Cost"].to_dict()
+                    updated_master["Cost"] = updated_master.apply(
+                        lambda row: cost_map.get(row["Item Number"], row["Cost"]), axis=1
+                    )
 
-                st.success("Nevada Beverage — processing complete.")
+                    # POS Update
+                    pos_update_df = pd.DataFrame()
+                    pb_missing = pd.DataFrame()
+                    if pb_df is not None:
+                        # Nevada uses Item Number to link? Or UPC?
+                        # Usually Item Number for master, but POS might use UPC.
+                        # Let's try Item Number first
+                        pos_update_df, pb_missing = _build_pricebook_update(pb_df, inv_df, "Item Number", "Cost")
+
+                    st.session_state["nv_invoice_items_df"] = inv_df
+                    st.session_state["nv_updated_master"]   = updated_master
+                    st.session_state["nv_cost_changes"]     = cost_diff
+                    st.session_state["nv_not_in_master"]    = not_in_master
+                    st.session_state["nv_pos_update"]       = pos_update_df
+                    st.session_state["nv_pb_missing"]       = pb_missing
+                    st.session_state["nv_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    
+                    st.success("Nevada processed!")
 
     if st.session_state["nv_invoice_items_df"] is not None:
-        nv_ts = st.session_state["nv_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
+        nv_ts = st.session_state["nv_ts"]
+        
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            st.download_button("⬇️ Parsed Invoices", st.session_state["nv_invoice_items_df"].to_csv(index=False).encode("utf-8"), f"nv_inv_{nv_ts}.csv")
+        with bc2:
+            st.download_button("⬇️ Updated Master", st.session_state["nv_updated_master"].to_csv(index=False).encode("utf-8"), f"nv_mst_{nv_ts}.csv")
+        with bc3:
+             if st.session_state["nv_pos_update"] is not None and not st.session_state["nv_pos_update"].empty:
+                st.download_button("⬇️ POS Update", st.session_state["nv_pos_update"].to_csv(index=False).encode("utf-8"), f"nv_pos_{nv_ts}.csv")
 
+        st.divider()
         st.subheader("Invoice Items (parsed, in-invoice order)")
-        st.dataframe(st.session_state["nv_invoice_items_df"].head(100), use_container_width=True)
-
-        inv_items_df = st.session_state["nv_invoice_items_df"].copy()
-        if "UPC" in inv_items_df.columns:
-            inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
-        st.download_button(
-            "⬇️ Download Invoice Items (CSV)",
-            data=inv_items_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"nv_invoice_items_{nv_ts}.csv",
-            mime="text/csv",
-            key="nv_dl_invoice_items",
-        )
-
-        if st.session_state["nv_updated_master"] is not None:
-            st.subheader("Updated Master (preview)")
-            st.dataframe(st.session_state["nv_updated_master"].head(100), use_container_width=True)
-            bio_master_nv = BytesIO()
-            with pd.ExcelWriter(bio_master_nv, engine="openpyxl") as w:
-                st.session_state["nv_updated_master"].to_excel(w, index=False, sheet_name="Master")
-            st.download_button(
-                "⬇️ Download Updated Master (XLSX)",
-                data=bio_master_nv.getvalue(),
-                file_name=f"Master_UPDATED_NV_{nv_ts}.xlsx",
-                key="nv_dl_master_xlsx"
-            )
-
-        if st.session_state["nv_cost_changes"] is not None and not st.session_state["nv_cost_changes"].empty:
-            st.caption("Cost changes")
-            st.dataframe(st.session_state["nv_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["nv_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_cost_changes_{nv_ts}.csv",
-                key="nv_dl_cost_changes"
-            )
-
-        if st.session_state["nv_not_in_master"] is not None and not st.session_state["nv_not_in_master"].empty:
-            st.caption("Invoice UPCs not in Master")
+        st.dataframe(st.session_state["nv_invoice_items_df"], use_container_width=True)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Not in Master")
             st.dataframe(st.session_state["nv_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["nv_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_not_in_master_{nv_ts}.csv",
-                key="nv_dl_not_in_master"
-            )
+        with c2:
+            st.subheader("Cost Differences")
+            st.dataframe(st.session_state["nv_cost_changes"], use_container_width=True)
 
-        if st.session_state["nv_pack_missing"] is not None and not st.session_state["nv_pack_missing"].empty:
-            st.caption("Added items with Pack == 0")
-            st.dataframe(st.session_state["nv_pack_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Added with Pack 0 (CSV)",
-                data=st.session_state["nv_pack_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"nv_added_pack_zero_{nv_ts}.csv",
-                key="nv_dl_pack_zero"
-            )
-
-        if st.session_state["nv_pos_update"] is not None:
+        st.subheader("Updated Master (preview)")
+        st.dataframe(st.session_state["nv_updated_master"].head(100), use_container_width=True)
+        
+        if st.session_state["nv_pos_update"] is not None and not st.session_state["nv_pos_update"].empty:
             st.subheader("POS Update (preview)")
-            st.dataframe(st.session_state["nv_pos_update"].head(100), use_container_width=True)
-            bio_pos_nv = BytesIO()
-            with pd.ExcelWriter(bio_pos_nv, engine="openpyxl") as w:
-                st.session_state["nv_pos_update"].to_excel(w, index=False, sheet_name="POS_Update")
-            st.download_button(
-                "⬇️ Download POS Update (XLSX)",
-                data=bio_pos_nv.getvalue(),
-                file_name=f"POS_Update_NV_{nv_ts}.xlsx",
-                key="nv_dl_pos_update"
-            )
-
+            st.dataframe(st.session_state["nv_pos_update"], use_container_width=True)
+            
         if st.session_state["nv_pb_missing"] is not None and not st.session_state["nv_pb_missing"].empty:
-            st.warning("Some invoice items were not found in the pricebook.")
+            st.subheader("Missing from Pricebook")
             st.dataframe(st.session_state["nv_pb_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["nv_pb_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"pricebook_missing_nv_{nv_ts}.csv",
-                key="nv_dl_pb_missing"
-            )
-    else:
-        st.info("Upload NV PDF and Master, then click **Process NV**. Downloads will persist afterward.")
 
-# ===== Breakthru tab (UPDATED to handle FB fallback for Master updates) =====
-with tabs[3]:
-    st.title("Breakthru Processor")
-    st.caption("Upload Breakthru CSV invoice(s).")
-    inv_files_bt = st.file_uploader(
-        "Upload Breakthru CSV file(s)",
-        type=["csv"],
-        accept_multiple_files=True,
-        key="bt_inv"
-    )
-    master_xlsx_bt = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="bt_master")
-    pricebook_csv_bt = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="bt_pb")
+
+# ===== Breakthru tab =====
+if selected_vendor == "Breakthru":
+    st.title("🥃 Breakthru Beverage Parser")
+    st.caption("Upload PDF invoices + Master File.")
+
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        bt_files = st.file_uploader("Breakthru PDF(s)", type=["pdf"], accept_multiple_files=True, key="bt_inv")
+    with bc2:
+        bt_master = st.file_uploader("Breakthru Master", type=["csv","xlsx","xls"], key="bt_mst")
+    with bc3:
+        bt_pb = st.file_uploader("Current Pricebook (CSV)", type=["csv"], key="bt_pb")
 
     if st.button("Process Breakthru", type="primary"):
-        if not inv_files_bt or not master_xlsx_bt:
-            st.error("Please upload at least one Breakthru CSV and the Master workbook.")
+        if not bt_files or not bt_master:
+            st.warning("Need Invoices + Master.")
         else:
-            bt_parser = BreakthruParser()
-            parts_bt = []
-            for f in inv_files_bt:
-                f.seek(0)
-                df = bt_parser.parse(f)  # returns columns incl. "Item Number"
-                if df is not None and not df.empty:
-                    parts_bt.append(df)
-            invoice_items_bt_raw = pd.concat(parts_bt, ignore_index=True) if parts_bt else pd.DataFrame(
-                columns=["UPC","Item Name","Cost","Cases","Item Number"]
-            )
+            with st.spinner("Parsing Breakthru..."):
+                bt_parser = BreakthruParser()
+                all_bt = []
+                for f in bt_files:
+                    try:
+                        df_ = bt_parser.parse(f)
+                        all_bt.append(df_)
+                    except Exception as e:
+                        st.error(f"Error {f.name}: {e}")
+                
+                if all_bt:
+                    inv_df = pd.concat(all_bt, ignore_index=True)
+                    mst_df = load_dataframe(bt_master)
+                    pb_df  = load_dataframe(bt_pb) if bt_pb else None
+                    
+                    # Clean Item #
+                    mst_df["Item Number"] = mst_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
+                    inv_df["Item Number"] = inv_df["Item Number"].astype(str).str.replace(r"\.0$","", regex=True).str.strip()
 
-            # ---- Build two views:
-            # 1) Download view (same as before: UPC fallback to FB or Item Number)
-            try:
-                master_df_bt = pd.read_excel(master_xlsx_bt, dtype=str).fillna("")
-            except Exception:
-                master_df_bt = pd.DataFrame(columns=["Invoice UPC","Full Barcode"])
+                    # New Items
+                    not_in_master = inv_df[~inv_df["Item Number"].isin(mst_df["Item Number"])].copy()
 
-            inv_upc_col_bt      = _resolve_col(master_df_bt, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
-            full_barcode_col_bt = _resolve_col(master_df_bt, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
+                    # Merge
+                    merged = pd.merge(inv_df, mst_df, on="Item Number", how="inner", suffixes=("_inv", "_mst"))
 
-            map_item_to_fb = {
-                str(k).strip(): str(v).strip()
-                for k, v in zip(master_df_bt[inv_upc_col_bt], master_df_bt[full_barcode_col_bt])
-                if str(k).strip() != ""
-            }
-
-            inv_dl = invoice_items_bt_raw.copy()
-            for col in ["UPC","Item Number","Item Name","Cost","Cases"]:
-                if col not in inv_dl.columns:
-                    inv_dl[col] = ""
-
-            def _dl_upc(row):
-                upc = (row.get("UPC") or "").strip()
-                if upc:
-                    return _norm_upc_12(upc)
-                item_no = (row.get("Item Number") or "").strip()
-                fb = map_item_to_fb.get(item_no, "")
-                return _norm_upc_12(fb) if fb else item_no  # show FB if found, else Item Number
-
-            inv_dl["UPC"] = inv_dl.apply(_dl_upc, axis=1)
-            invoice_items_bt_for_download = inv_dl[["UPC","Item Name","Cost","Cases"]].copy()
-
-            # 2) Master-update view:
-            #    If UPC is blank, fill it with Full Barcode via Item Number; drop 000...; keep all others.
-            inv_for_master = invoice_items_bt_raw.copy()
-            for col in ["UPC","Item Number","Item Name","Cost","Cases"]:
-                if col not in inv_for_master.columns:
-                    inv_for_master[col] = ""
-
-            def _fill_upc_for_master(row):
-                upc = (row.get("UPC") or "").strip()
-                if upc:
-                    return _norm_upc_12(upc)
-                item_no = (row.get("Item Number") or "").strip()
-                fb = map_item_to_fb.get(item_no, "")
-                return _norm_upc_12(fb) if fb else ""  # blank stays blank if no mapping
-            inv_for_master["UPC"] = inv_for_master.apply(_fill_upc_for_master, axis=1)
-
-            # Keep only rows with a usable UPC and numeric cost/cases
-            inv_for_master = inv_for_master[(inv_for_master["UPC"] != "")].copy()
-            inv_for_master = inv_for_master[inv_for_master["UPC"] != "000000000000"].copy()
-            # Conform columns
-            inv_for_master = inv_for_master.rename(columns={"Item Name":"Item Name"})
-            inv_for_master = inv_for_master[["UPC","Item Name","Cost","Cases"]].copy()
-
-            # At the same time keep the strict 4-col processing version for preview:
-            invoice_items_bt = _ensure_invoice_cols(inv_for_master)
-
-            if invoice_items_bt.empty and invoice_items_bt_for_download.empty:
-                st.error("Could not parse any Breakthru items (no UPC/Item Name/Cost/Cases).")
-            else:
-                # **Use BT-specific updater (Invoice UPC, then Full Barcode)**
-                updated_master_bt, cost_changes_bt, not_in_master_bt, pack_missing_bt, invoice_unique_bt = _update_master_from_invoice_bt(master_xlsx_bt, inv_for_master)
-                pos_update_bt = None
-                pb_missing_bt = None
-                if pricebook_csv_bt is not None and updated_master_bt is not None:
-                    pos_update_bt, pb_missing_bt = _build_pricebook_update(pricebook_csv_bt, updated_master_bt)
-
-                st.session_state["bt_invoice_items_df"]    = invoice_items_bt  # minimal 4-col for preview
-                st.session_state["bt_invoice_items_dl_df"] = invoice_items_bt_for_download  # download list with FB/ItemNo fallback
-                st.session_state["bt_updated_master"]      = updated_master_bt
-                st.session_state["bt_cost_changes"]        = cost_changes_bt
-                st.session_state["bt_not_in_master"]       = not_in_master_bt
-                st.session_state["bt_pack_missing"]        = pack_missing_bt
-                st.session_state["bt_pos_update"]          = pos_update_bt
-                st.session_state["bt_pb_missing"]          = pb_missing_bt
-                st.session_state["bt_ts"]                  = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                st.success("Breakthru — processing complete.")
+                    # Cost Changes
+                    # Breakthru uses "Net Price" in parser output?
+                    # Let's check parser output... BreakthruParser usually returns "Net Price" or "Cost".
+                    # Let's assume "Net Price" based on SG logic or "Cost" based on base.
+                    # We will try both.
+                    
+                    inv_cost_col = "Net Price" if "Net Price" in inv_df.columns else "Cost"
+                    mst_cost_col = "Cost" # standard
+                    
+                    cost_diff = pd.DataFrame()
+                    if inv_cost_col in inv_df.columns and mst_cost_col in mst_df.columns:
+                        # merge creates suffixes
+                        c_inv = inv_cost_col + "_inv"
+                        c_mst = mst_cost_col + "_mst"
+                        
+                        if c_inv in merged.columns and c_mst in merged.columns:
+                             merged[c_inv] = pd.to_numeric(merged[c_inv], errors="coerce").fillna(0)
+                             merged[c_mst] = pd.to_numeric(merged[c_mst], errors="coerce").fillna(0)
+                             cost_diff = merged[abs(merged[c_inv] - merged[c_mst"]) > 0.009].copy()
+                    
+                    # Update Master
+                    updated_master = mst_df.copy()
+                    cost_map = inv_df.set_index("Item Number")[inv_cost_col].to_dict()
+                    updated_master["Cost"] = updated_master.apply(
+                        lambda row: cost_map.get(row["Item Number"], row["Cost"]), axis=1
+                    )
+                    
+                    # POS Update
+                    pos_update_df = pd.DataFrame()
+                    pb_missing = pd.DataFrame()
+                    if pb_df is not None:
+                         pos_update_df, pb_missing = _build_pricebook_update(pb_df, inv_df, "Item Number", inv_cost_col)
+                    
+                    st.session_state["bt_invoice_items_df"] = inv_df
+                    st.session_state["bt_updated_master"]   = updated_master
+                    st.session_state["bt_cost_changes"]     = cost_diff
+                    st.session_state["bt_not_in_master"]    = not_in_master
+                    st.session_state["bt_pos_update"]       = pos_update_df
+                    st.session_state["bt_pb_missing"]       = pb_missing
+                    st.session_state["bt_ts"]               = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    
+                    st.success("Breakthru processed!")
 
     if st.session_state["bt_invoice_items_df"] is not None:
-        bt_ts = st.session_state["bt_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
+        bt_ts = st.session_state["bt_ts"]
+        
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button("⬇️ Invoices", st.session_state["bt_invoice_items_df"].to_csv(index=False).encode("utf-8"), f"bt_inv_{bt_ts}.csv")
+        with c2:
+            st.download_button("⬇️ Updated Master", st.session_state["bt_updated_master"].to_csv(index=False).encode("utf-8"), f"bt_mst_{bt_ts}.csv")
+        with c3:
+            if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
+                st.download_button("⬇️ POS Update", st.session_state["bt_pos_update"].to_csv(index=False).encode("utf-8"), f"bt_pos_{bt_ts}.csv")
 
+        st.divider()
         st.subheader("Invoice Items (parsed, in-invoice order)")
-        preview_df = st.session_state.get("bt_invoice_items_dl_df")
-        if not isinstance(preview_df, pd.DataFrame) or preview_df.empty:
-            preview_df = st.session_state.get("bt_invoice_items_df", pd.DataFrame())
-        st.dataframe(preview_df.head(100), use_container_width=True)
+        st.dataframe(st.session_state["bt_invoice_items_df"], use_container_width=True)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+             st.subheader("Not in Master")
+             st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
+        with c2:
+             st.subheader("Cost Changes")
+             st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
+             
+        st.subheader("Updated Master (preview)")
+        st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
 
-        _dl = st.session_state.get("bt_invoice_items_dl_df")
-        if isinstance(_dl, pd.DataFrame) and not _dl.empty:
-            inv_items_df = _dl.copy()
-        else:
-            inv_items_df = st.session_state.get("bt_invoice_items_df", pd.DataFrame()).copy()
-
-        if "UPC" in inv_items_df.columns:
-            inv_items_df["UPC"] = inv_items_df["UPC"].astype(str).map(lambda x: f'="{x}"')
-        st.download_button(
-            "⬇️ Download Invoice Items (CSV)",
-            data=inv_items_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"bthru_invoice_items_{bt_ts}.csv",
-            mime="text/csv",
-            key="bt_dl_invoice_items",
-        )
-
-        if st.session_state["bt_updated_master"] is not None:
-            st.subheader("Updated Master (preview)")
-            st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
-            bio_master_bt = BytesIO()
-            with pd.ExcelWriter(bio_master_bt, engine="openpyxl") as w:
-                st.session_state["bt_updated_master"].to_excel(w, index=False, sheet_name="Master")
-            st.download_button(
-                "⬇️ Download Updated Master (XLSX)",
-                data=bio_master_bt.getvalue(),
-                file_name=f"Master_UPDATED_BTHRU_{bt_ts}.xlsx",
-                key="bt_dl_master_xlsx"
-            )
-
-        if st.session_state["bt_cost_changes"] is not None and not st.session_state["bt_cost_changes"].empty:
-            st.caption("Cost changes")
-            st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
-            st.download_button(
-                "⬇️ Cost Changes (CSV)",
-                data=st.session_state["bt_cost_changes"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bthru_cost_changes_{bt_ts}.csv",
-                key="bt_dl_cost_changes"
-            )
-
-        if st.session_state["bt_not_in_master"] is not None and not st.session_state["bt_not_in_master"].empty:
-            st.caption("Invoice UPCs not in Master")
-            st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
-            st.download_button(
-                "⬇️ Not in Master (CSV)",
-                data=st.session_state["bt_not_in_master"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bthru_not_in_master_{bt_ts}.csv",
-                key="bt_dl_not_in_master"
-            )
-
-        if st.session_state["bt_pack_missing"] is not None and not st.session_state["bt_pack_missing"].empty:
-            st.caption("Added items with Pack == 0")
-            st.dataframe(st.session_state["bt_pack_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Added with Pack 0 (CSV)",
-                data=st.session_state["bt_pack_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"bthru_added_pack_zero_{bt_ts}.csv",
-                key="bt_dl_pack_zero"
-            )
-
-        if st.session_state["bt_pos_update"] is not None:
+        if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
             st.subheader("POS Update (preview)")
-            st.dataframe(st.session_state["bt_pos_update"].head(100), use_container_width=True)
-            bio_pos_bt = BytesIO()
-            with pd.ExcelWriter(bio_pos_bt, engine="openpyxl") as w:
-                st.session_state["bt_pos_update"].to_excel(w, index=False, sheet_name="POS_Update")
-            st.download_button(
-                "⬇️ Download POS Update (XLSX)",
-                data=bio_pos_bt.getvalue(),
-                file_name=f"POS_Update_BTHRU_{bt_ts}.xlsx",
-                key="bt_dl_pos_update"
-            )
-
+            st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
+            
         if st.session_state["bt_pb_missing"] is not None and not st.session_state["bt_pb_missing"].empty:
-            st.warning("Some invoice items were not found in the pricebook.")
+            st.subheader("Missing from Pricebook")
             st.dataframe(st.session_state["bt_pb_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Pricebook Missing (CSV)",
-                data=st.session_state["bt_pb_missing"].to_csv(index=False).encode("utf-8"),
-                file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
-                key="bt_dl_pb_missing"
-            )
-    else:
-        st.info("Upload Breakthru CSV and Master, then click **Process Breakthru**. Downloads will persist afterward.")
+
+# ===== JC Sales tab (Placeholder) =====
+if selected_vendor == "JC Sales (Coming Soon)":
+    st.title("🛒 JC Sales Invoice Processor")
+    st.info("🚧 The JC Sales parser is currently under construction. Check back soon!")
