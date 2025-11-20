@@ -1,22 +1,12 @@
 # parsers/jcsales.py
-# JC Sales PDF parser -> returns parsed rows for app to build:
-#   ["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA","ITEM"]
+# JC Sales PDF parser
+# - parse(invoice_pdf) -> (rows_df, invoice_number)  **matches app.py expectation**
+# - parse_invoice(invoice_pdf, jc_master_xlsx, pricebook_csv) -> (parsed_df, pos_slice)
 #
-# Robust line pattern support:
-#   - Optional leading line number
-#   - Optional single-letter flag (T/C/etc.)
-#   - ITEM is 3–6 digits (may have leading zeros)
-#   - R-QTY S-QTY present
-#   - PACK layout variants supported:
-#       • "PK 12"   (UM then number)
-#       • "12PK"    (number then UM)
-#       • "12 PK"   (number then UM separated)
-#     plus optional trailing pack override at end of row.
-#   - UNIT_P, UM_P, EXT_P are consecutive prices at the end.
-#
+# Row fields produced by the low-level parser: ["ITEM","DESCRIPTION","PACK","COST","UNIT"]
 # COST = UM_P (case price), UNIT = UNIT_P
-# Skip rows where S-QTY <= 0 or PACK <= 0
-#
+# Skips rows with shipped qty <= 0 or PACK <= 0
+
 from __future__ import annotations
 import re
 from typing import Tuple, Optional, List
@@ -121,13 +111,24 @@ class JCSalesParser:
         re.IGNORECASE | re.VERBOSE,
     )
 
-    def _parse_pdf_lines(self, pdf) -> pd.DataFrame:
+    _INV_RX = re.compile(r"\bOSI0?\d+\b", re.IGNORECASE)
+
+    def _extract_invoice_number(self, full_text: str) -> Optional[str]:
+        m = self._INV_RX.search(full_text or "")
+        return m.group(0) if m else None
+
+    def _parse_pdf_lines(self, pdf) -> Tuple[pd.DataFrame, Optional[str]]:
         rows: List[dict] = []
+        inv_no: Optional[str] = None
 
         for page in pdf.pages:
             text = page.extract_text() or ""
             if not text.strip():
                 continue
+
+            # capture invoice number once
+            if inv_no is None:
+                inv_no = self._extract_invoice_number(text)
 
             for raw in text.splitlines():
                 line = raw.strip()
@@ -174,12 +175,33 @@ class JCSalesParser:
                 )
 
         if not rows:
-            return pd.DataFrame(columns=self.WANT_COLS)
+            return pd.DataFrame(columns=self.WANT_COLS), inv_no
 
         out = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-        return out[["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]]
+        return out[["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]], inv_no
 
-    # Public API used by app.py
+    # ---------- Public APIs ----------
+
+    # 1) Minimal API used by current app.py: returns rows + invoice number
+    def parse(self, invoice_pdf) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Parse the JC Sales PDF only and return:
+          (rows_df, invoice_number)
+        rows_df columns: ["ITEM","DESCRIPTION","PACK","COST","UNIT"]
+        """
+        if pdfplumber is None:
+            return pd.DataFrame(columns=self.WANT_COLS), None
+        try:
+            invoice_pdf.seek(0)
+        except Exception:
+            pass
+        try:
+            with pdfplumber.open(invoice_pdf) as pdf:
+                return self._parse_pdf_lines(pdf)
+        except Exception:
+            return pd.DataFrame(columns=self.WANT_COLS), None
+
+    # 2) Rich API (optional): produces parsed sheet + POS slice using master & pricebook
     def parse_invoice(
         self,
         invoice_pdf,          # UploadedFile (pdf)
@@ -201,7 +223,7 @@ class JCSalesParser:
             pass
         try:
             with pdfplumber.open(invoice_pdf) as pdf:
-                body = self._parse_pdf_lines(pdf)
+                body, _ = self._parse_pdf_lines(pdf)
         except Exception:
             body = pd.DataFrame(columns=self.WANT_COLS)
 
@@ -226,7 +248,7 @@ class JCSalesParser:
         pb["_Upc_norm"] = pb["Upc"].astype(str).str.replace(r"\D", "", regex=True)
         pb["_Upc_norm"] = pb["_Upc_norm"].apply(self._lz_strip)
 
-        # 3) map ITEM -> (UPC1, UPC2) from master; pick one that exists in pricebook (leading-zero-insensitive)
+        # map ITEM -> UPC1/UPC2 from master, prefer the one that exists in pricebook (leading-zero-insensitive)
         if not jc_master.empty:
             mcols = {c.lower(): c for c in jc_master.columns}
             col_item = mcols.get("item")
@@ -261,7 +283,7 @@ class JCSalesParser:
         parsed = body.copy()
         parsed["UPC"] = parsed["ITEM"].astype(str).apply(resolve_upc)
 
-        # 4) compute UNIT/RETAIL/NOW/DELTA
+        # compute RETAIL/NOW/DELTA
         parsed["UNIT"] = parsed["UNIT"].astype(float)
         parsed["RETAIL"] = parsed["UNIT"] * 2
 
@@ -297,7 +319,7 @@ class JCSalesParser:
 
         parsed = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA","ITEM"]]
 
-        # 5) POS slice (matched UPCs only)
+        # POS slice (matched UPCs only)
         matched = parsed[~parsed["UPC"].astype(str).str.startswith("No Match")].copy()
         if matched.empty:
             pos_slice = pd.DataFrame(columns=pb.columns)
