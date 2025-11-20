@@ -1,10 +1,22 @@
 # parsers/jcsales.py
+#
 # JC Sales PDF parser → returns (rows_df, invoice_number)
-# rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-# Your app.py computes UPC/RETAIL/NOW/DELTA and builds POS_update.
-
+# rows_df columns (exactly what app.py expects from JC): ITEM, DESCRIPTION, PACK, COST, UNIT
+#
+# Line format seen in your sample:
+# LINE# [T|C]? ITEM  DESCRIPTION...  R-QTY  S-QTY  UM  #/UM  UNIT_P  UM_P  EXT_P [PACK_OVERRIDE]
+# Example:
+#   1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 12 2.39 28.68 28.68 12
+#   100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 24 0.85 20.40 20.40 24
+#
+# Rules:
+# - PACK = #/UM unless a trailing PACK_OVERRIDE integer exists; if present, use that.
+# - COST = UM_P (case price), UNIT = UNIT_P.
+# - Order preserved.
+# - Invoice number like OSI014135 is extracted (e.g., from "*OSI014135*").
+#
 from __future__ import annotations
-from typing import List, Optional, Tuple, Dict
+from typing import Tuple, List, Optional
 import re
 import numpy as np
 import pandas as pd
@@ -14,8 +26,48 @@ try:
 except Exception:
     pdfplumber = None
 
+WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
-# ---------- utils ----------
+_money = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
+# Primary tight regex based on your header:
+PRIMARY_LINE_RE = re.compile(
+    rf"""
+    ^\s*
+    \d+\s+                       # LINE #
+    (?:[A-Z]\s+)?                # optional flag (T/C)
+    (?P<item>\d{{5,6}})\s+       # ITEM (5 or 6 digits)
+    (?P<desc>.+?)\s+             # DESCRIPTION (greedy until numeric cols)
+    (?P<rqty>\d+)\s+             # R-QTY
+    (?P<sqty>\d+)\s+             # S-QTY
+    (?P<um>[A-Z]+)\s+            # UM (e.g., PK)
+    (?P<pack>\d+)\s+             # #/UM
+    (?P<unit>{_money})\s+        # UNIT_P
+    (?P<cost>{_money})\s+        # UM_P (case)
+    {_money}                     # EXT_P (ignored)
+    (?:\s+(?P<pack2>\d+))?       # optional trailing pack override
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# A very tolerant fallback: still expects the key numeric tail in order,
+# but doesn’t require the leading LINE#/flag explicitly.
+FALLBACK_LINE_RE = re.compile(
+    rf"""
+    ^\s*
+    (?:\d+\s+[A-Z]\s+|\d+\s+)?   # optional LINE# and/or flag
+    (?P<item>\d{{5,6}})\s+       # ITEM
+    (?P<desc>.+?)\s+
+    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_money})\s+(?P<cost>{_money})\s+{_money}
+    (?:\s+(?P<pack2>\d+))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+INVOICE_RE = re.compile(r"\b(OSI\d{5,})\b", re.IGNORECASE)
+
 def _to_float(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
@@ -28,369 +80,86 @@ def _to_float(x):
     except Exception:
         return np.nan
 
-def _to_int(x):
+def _to_int(x, default=0):
     try:
         return int(round(float(str(x).replace(",", "").strip())))
     except Exception:
-        return 0
+        return default
 
-def _canon(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def _extract_invoice_number(all_text: str) -> Optional[str]:
+    m = INVOICE_RE.search(all_text or "")
+    return m.group(1).upper() if m else None
 
+def _parse_lines(text: str) -> pd.DataFrame:
+    rows: List[dict] = []
+    for idx, raw in enumerate((text or "").splitlines()):
+        line = " ".join(raw.split())
+        if not line or "LINE # ITEM DESCRIPTION" in line.upper():
+            continue
 
-# ---------- header detection for table strategy ----------
-def _find_header_map(header: List[str]) -> Optional[dict]:
-    """
-    JC Sales variants seen:
-      ITEM | DESCRIPTION | #/UM | UNIT_P | UM_P
-    Accept loose matches like 'UNIT P', 'UM P', 'Qty / UM', etc.
-    """
-    cmap = {_canon(h): h for h in header if h is not None}
+        m = PRIMARY_LINE_RE.match(line)
+        if not m:
+            m = FALLBACK_LINE_RE.match(line)
+        if not m:
+            continue
 
-    def pick(*aliases):
-        for a in aliases:
-            ca = _canon(a)
-            if ca in cmap:
-                return cmap[ca]
-        # substring fallback
-        for a in aliases:
-            ca = _canon(a)
-            for k, orig in cmap.items():
-                if ca in k:
-                    return orig
-        return None
+        item = m.group("item").strip()
+        desc = m.group("desc").strip()
+        # rqty = _to_int(m.group("rqty"))  # not used
+        # sqty = _to_int(m.group("sqty"))  # not used
+        # um   = m.group("um").strip()     # not used (assumed PK)
+        pack = _to_int(m.group("pack"))
+        pack2 = m.group("pack2")
+        if pack2:
+            pack = _to_int(pack2) or pack
 
-    col_item = pick("item")
-    col_desc = pick("description", "desc")
-    col_pack = pick("#/um", "qty/um", "qtypercase", "qtycase", "pack", "um", "perum")
-    col_unit = pick("unit_p", "unit p", "unitprice", "unit")
-    col_cost = pick("um_p", "um p", "caseprice", "casecost", "umprice", "cost")
+        unit = _to_float(m.group("unit"))
+        cost = _to_float(m.group("cost"))
 
-    if all([col_item, col_desc, col_pack, col_cost]):
-        return {"ITEM": col_item, "DESCRIPTION": col_desc, "PACK": col_pack, "UNIT_P": col_unit, "UM_P": col_cost}
-    return None
+        if not item or not desc or pack <= 0 or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
+            continue
 
+        # sanity: if UNIT > COST, swap (rare, but safe)
+        if unit > cost:
+            unit, cost = cost, unit
+
+        rows.append({"ITEM": item, "DESCRIPTION": desc, "PACK": int(pack), "COST": float(cost), "UNIT": float(unit), "_order": idx})
+
+    if not rows:
+        return pd.DataFrame(columns=WANT_COLS)
+
+    df = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+    return df[WANT_COLS]
 
 class JCSalesParser:
     name = "JC Sales"
 
-    def __init__(self):
-        self.last_invoice_number: Optional[str] = None
-
-    # --- invoice number extractor ---
-    def _extract_invoice_number(self, page_texts: List[str]) -> Optional[str]:
-        txt = "\n".join(t for t in page_texts if t)
-        m = re.search(r"\b(OSI\d{5,})\b", txt, re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
-        m = re.search(r"Invoice\s*(No\.?|#|:)\s*([A-Z0-9\-]+)", txt, re.IGNORECASE)
-        if m:
-            return m.group(2).upper()
-        return None
-
-    # --- table strategy (first try) ---
-    def _extract_by_tables(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
-        rows = []
-        page_texts = []
-        table_settings_list = [
-            {"vertical_strategy": "lines", "horizontal_strategy": "lines",
-             "intersection_tolerance": 5, "snap_tolerance": 3,
-             "join_tolerance": 3, "edge_min_length": 3},
-            {"vertical_strategy": "text", "horizontal_strategy": "text"},
-        ]
-        for pg in pdf.pages:
-            page_texts.append(pg.extract_text() or "")
-            for settings in table_settings_list:
-                try:
-                    tables = pg.extract_tables(table_settings=settings)
-                except Exception:
-                    tables = []
-                for tbl in tables or []:
-                    if not tbl or len(tbl) < 2:
-                        continue
-                    # find non-empty header
-                    header = None
-                    header_idx = 0
-                    for i, r in enumerate(tbl[:6]):
-                        if any(str(x or "").strip() for x in r):
-                            header = [str(x or "").strip() for x in r]
-                            header_idx = i
-                            break
-                    if not header:
-                        continue
-                    colmap = _find_header_map(header)
-                    if not colmap:
-                        continue
-                    body = tbl[header_idx + 1 :]
-                    if not body:
-                        continue
-                    df = pd.DataFrame(body, columns=header)
-                    for _, r in df.iterrows():
-                        item = str(r.get(colmap["ITEM"], "")).strip()
-                        desc = str(r.get(colmap["DESCRIPTION"], "")).strip()
-                        pack = _to_int(r.get(colmap["PACK"], ""))
-                        unit = _to_float(r.get(colmap["UNIT_P"], ""))
-                        cost = _to_float(r.get(colmap["UM_P"], ""))  # case cost
-                        if not item or not desc or pack <= 0 or (cost is None) or np.isnan(cost):
-                            continue
-                        if unit is None or np.isnan(unit) or unit <= 0:
-                            unit = cost / pack if pack > 0 else np.nan
-                        rows.append({"ITEM": item, "DESCRIPTION": desc, "PACK": int(pack), "COST": float(cost), "UNIT": float(unit)})
-
-        df_out = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
-        return df_out, page_texts
-
-    # --- word-grid fallback (second try) ---
-    def _extract_by_wordgrid(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
-        page_texts = []
-        all_rows = []
-
-        def find_header_and_xcenters(page) -> Optional[Tuple[float, Dict[str, float]]]:
-            words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
-            if not words:
-                return None
-            # cluster by y to form lines
-            lines = {}
-            for w in words:
-                key = round(float(w["top"]) / 2.0, 0)
-                lines.setdefault(key, []).append(w)
-            header_key = None
-            best_score = 0
-            for key, ws in lines.items():
-                txt = " ".join([w["text"] for w in sorted(ws, key=lambda x: x["x0"])])
-                c = _canon(txt)
-                score = 0
-                for tok in ["item", "description", "desc", "um", "unit", "ump", "unitp", "#/um", "qty/um", "pack"]:
-                    if tok in c:
-                        score += 1
-                if score >= 3 and score >= best_score:
-                    best_score = score
-                    header_key = key
-            if header_key is None:
-                return None
-            header_words = sorted(lines[header_key], key=lambda x: x["x0"])
-
-            def xcenter_of(*aliases):
-                for a in aliases:
-                    ca = _canon(a)
-                    for w in header_words:
-                        if ca in _canon(w["text"]):
-                            return (w["x0"] + w["x1"]) / 2.0
-                # fallback: median
-                if header_words:
-                    return float(np.median([(w["x0"] + w["x1"]) / 2.0 for w in header_words]))
-                return None
-
-            x_item = xcenter_of("item")
-            x_desc = xcenter_of("description","desc")
-            x_pack = xcenter_of("#/um","qty/um","pack")
-            x_unit = xcenter_of("unit_p","unit p","unit")
-            x_cost = xcenter_of("um_p","um p","casecost","caseprice","umprice","cost")
-
-            header_y = float(np.mean([w["top"] for w in header_words]))
-            cols = {"item": x_item, "desc": x_desc, "pack": x_pack, "unit": x_unit, "cost": x_cost}
-            if sum(v is not None for v in cols.values()) < 3:
-                return None
-            return header_y, cols
-
-        def bucket(words_line, xcenters):
-            buckets = {"item": [], "desc": [], "pack": [], "unit": [], "cost": []}
-            for w in sorted(words_line, key=lambda x: x["x0"]):
-                xc = (w["x0"] + w["x1"]) / 2.0
-                best, best_dx = None, 1e9
-                for key, xx in xcenters.items():
-                    if xx is None:
-                        continue
-                    dx = abs(xc - xx)
-                    if dx < best_dx:
-                        best, best_dx = key, dx
-                buckets[best or "desc"].append(w["text"])
-            return {k: " ".join(v).strip() for k, v in buckets.items()}
-
-        for pg in pdf.pages:
-            page_texts.append(pg.extract_text() or "")
-            words = pg.extract_words(keep_blank_chars=False, use_text_flow=True)
-            if not words:
-                continue
-            header = find_header_and_xcenters(pg)
-            if not header:
-                continue
-            header_y, colx = header
-
-            # group lines below header
-            lines = {}
-            for w in words:
-                if w["top"] <= header_y + 1:
-                    continue
-                key = round(float(w["top"]) / 2.0, 0)
-                lines.setdefault(key, []).append(w)
-
-            for key in sorted(lines.keys()):
-                line_words = lines[key]
-                b = bucket(line_words, colx)
-                item_txt = b.get("item","").strip()
-                desc_txt = b.get("desc","").strip()
-                pack_txt = b.get("pack","").strip()
-                unit_txt = b.get("unit","").strip()
-                cost_txt = b.get("cost","").strip()
-
-                pack = _to_int(pack_txt)
-                unit = _to_float(unit_txt)
-                cost = _to_float(cost_txt)
-
-                if not item_txt or not desc_txt:
-                    continue
-                if pack <= 0:
-                    continue
-                if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
-                    cost = unit * pack
-                if cost is None or np.isnan(cost) or cost <= 0:
-                    continue
-                if unit is None or np.isnan(unit) or unit <= 0:
-                    unit = cost / pack if pack > 0 else np.nan
-
-                all_rows.append({"ITEM": item_txt, "DESCRIPTION": desc_txt, "PACK": int(pack), "COST": float(cost), "UNIT": float(unit)})
-
-        df = pd.DataFrame(all_rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if all_rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
-        return df, page_texts
-
-    # --- regex-line fallback (third try; very tolerant) ---
-    def _extract_by_regex_lines(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
-        """
-        Supports BOTH shapes (with optional trailing pack override):
-
-        A) ITEM  DESC ...  PACK  UNIT  COST [EXT] [PACK_OVERRIDE]
-        B) [row] [opt letter] ITEM  DESC ...  QTY  PACK UOM  UNIT  COST [EXT] [PACK_OVERRIDE]
-           e.g. "1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 2.39 28.68 28.68 12"
-           or   "100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 0.85 20.40 20.40 24"
-        """
-        rows = []
-        page_texts = []
-        money = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
-        uom = r"(?:PK|EA|CT|DZ|CS|CASE|PC|PCS)"
-
-        # A: ITEM DESC PACK UNIT COST [EXT] [PACK_OVERRIDE?]
-        patt_A = re.compile(
-            rf"^\s*(\d{{5,6}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+{money}\s+{money}(?:\s+{money})?(?:\s+(?P<packov>\d+))?\s*$",
-            re.IGNORECASE
-        )
-        # B: optional row and/or letter before ITEM; trailing pack override allowed
-        patt_B = re.compile(
-            rf"^\s*(?:\d+\s+[A-Z]\s+|\d+\s+)?(\d{{5,6}})\s+([A-Za-z0-9\-\&\/\.,'() ]+?)\s+(\d+)\s+(\d+)\s+{uom}\s+{money}\s+{money}(?:\s+{money})?(?:\s+(?P<packov>\d+))?\s*$",
-            re.IGNORECASE
-        )
-
-        for pg in pdf.pages:
-            txt = pg.extract_text() or ""
-            page_texts.append(txt)
-            for raw in txt.splitlines():
-                line = " ".join(raw.split())  # collapse whitespace
-
-                mB = patt_B.search(line)
-                if mB:
-                    item = mB.group(1).strip()
-                    desc = mB.group(2).strip()
-                    # qty = mB.group(3)
-                    pack_hint = _to_int(mB.group(4))
-                    unit = _to_float(mB.group(5))
-                    cost = _to_float(mB.group(6))
-                    pack_ov = mB.group("packov")
-                    pack = _to_int(pack_ov) if pack_ov else pack_hint
-
-                    if not desc or pack <= 0:
-                        continue
-                    if unit is not None and cost is not None and unit > cost:
-                        unit, cost = cost, unit
-                    if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
-                        cost = unit * pack
-                    if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
-                        unit = cost / pack if pack > 0 else np.nan
-                    if cost is None or np.isnan(cost) or cost <= 0:
-                        continue
-
-                    rows.append({
-                        "ITEM": item,
-                        "DESCRIPTION": desc,
-                        "PACK": int(pack),
-                        "COST": float(cost),
-                        "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
-                    })
-                    continue
-
-                mA = patt_A.search(line)
-                if mA:
-                    item = mA.group(1).strip()
-                    desc = mA.group(2).strip()
-                    pack_hint = _to_int(mA.group(3))
-                    v1 = _to_float(mA.group(4))  # could be UNIT
-                    v2 = _to_float(mA.group(5))  # could be COST
-                    pack_ov = mA.group("packov")
-                    pack = _to_int(pack_ov) if pack_ov else pack_hint
-
-                    if not desc or pack <= 0:
-                        continue
-                    unit, cost = v1, v2
-                    if (unit is not None and cost is not None) and (unit > cost):
-                        unit, cost = cost, unit
-                    if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
-                        cost = unit * pack
-                    if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
-                        unit = cost / pack if pack > 0 else np.nan
-                    if cost is None or np.isnan(cost) or cost <= 0:
-                        continue
-
-                    rows.append({
-                        "ITEM": item,
-                        "DESCRIPTION": desc,
-                        "PACK": int(pack),
-                        "COST": float(cost),
-                        "UNIT": float(unit) if unit is not None and not np.isnan(unit) else float(cost)/int(pack)
-                    })
-
-        df = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
-        return df, page_texts
-
-    # --- public API ---
     def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Returns (items_df, invoice_number)
+        items_df has columns: ITEM, DESCRIPTION, PACK, COST, UNIT
+        """
         if pdfplumber is None:
-            return pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]), None
+            return pd.DataFrame(columns=WANT_COLS), None
 
+        # Make sure we start from the beginning for re-reads
         try:
             uploaded_pdf.seek(0)
         except Exception:
             pass
 
-        name = (getattr(uploaded_pdf, "name", "") or "").lower()
-        if not name.endswith(".pdf"):
-            return pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]), None
+        fname = (getattr(uploaded_pdf, "name", "") or "").lower()
+        if not fname.endswith(".pdf"):
+            return pd.DataFrame(columns=WANT_COLS), None
 
-        # 1) tables
         try:
             with pdfplumber.open(uploaded_pdf) as pdf:
-                df1, txt1 = self._extract_by_tables(pdf)
-                if df1 is not None and not df1.empty:
-                    self.last_invoice_number = self._extract_invoice_number(txt1)
-                    return df1.reset_index(drop=True), (self.last_invoice_number or None)
+                texts = []
+                for p in pdf.pages:
+                    texts.append(p.extract_text() or "")
+                all_text = "\n".join(texts)
+                df = _parse_lines(all_text)
+                inv = _extract_invoice_number(all_text)
+                return df, inv
         except Exception:
-            pass
-
-        # 2) word-grid
-        try:
-            with pdfplumber.open(uploaded_pdf) as pdf:
-                df2, txt2 = self._extract_by_wordgrid(pdf)
-                if df2 is not None and not df2.empty:
-                    self.last_invoice_number = self._extract_invoice_number(txt2)
-                    return df2.reset_index(drop=True), (self.last_invoice_number or None)
-        except Exception:
-            pass
-
-        # 3) regex lines
-        try:
-            with pdfplumber.open(uploaded_pdf) as pdf:
-                df3, txt3 = self._extract_by_regex_lines(pdf)
-                self.last_invoice_number = self._extract_invoice_number(txt3)
-                return df3.reset_index(drop=True), (self.last_invoice_number or None)
-        except Exception:
-            pass
-
-        return pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]), None
+            return pd.DataFrame(columns=WANT_COLS), None
