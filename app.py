@@ -6,7 +6,15 @@ from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
-from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser
+from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
+# Try importing JCSalesParser safely
+try:
+    from parsers.jcsales import JCSalesParser
+except ImportError:
+    try:
+        from jcsales import JCSalesParser
+    except ImportError:
+        JCSalesParser = None # Placeholder if file is completely missingfrom parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 
