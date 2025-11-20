@@ -33,7 +33,7 @@ class JCSalesParser:
     name = "JC Sales"
 
     def parse(self, invoice_pdf, master_file, pricebook_file):
-        # 1. Parse PDF with strict layout preservation
+        # 1. Parse PDF with strict coordinate-based extraction
         invoice_items = self._extract_pdf_data(invoice_pdf)
         
         if not invoice_items:
@@ -52,7 +52,6 @@ class JCSalesParser:
         master_df['match_item'] = master_df['ITEM'].apply(normalize_for_match)
         
         # Create efficient lookup map: match_item -> row dict
-        # Drop duplicates to avoid explosion (keep first found)
         master_unique = master_df.drop_duplicates(subset=['match_item'])
         master_map = master_unique.set_index('match_item').to_dict('index')
 
@@ -61,10 +60,7 @@ class JCSalesParser:
         pb_df['match_upc'] = pb_df['Upc'].apply(normalize_for_match)
         
         # Lookup dictionaries
-        # Map normalized UPC -> Index in PB dataframe
         pb_map_idx = dict(zip(pb_df['match_upc'], pb_df.index))
-        
-        # Map normalized UPC -> Data row
         pb_unique = pb_df.drop_duplicates(subset=['match_upc'])
         pb_data_map = pb_unique.set_index('match_upc').to_dict('index')
 
@@ -126,7 +122,6 @@ class JCSalesParser:
                 except ValueError:
                     pass
 
-                # Collect index for POS Update file
                 if final_upc_raw in pb_map_idx:
                      pos_update_indices.append(pb_map_idx[final_upc_raw])
 
@@ -182,120 +177,130 @@ class JCSalesParser:
 
     def _extract_pdf_data(self, pdf_file):
         """
-        Extracts line items preserving strict order from PDF using PDFPlumber text lines.
+        Advanced Coordinate-Based Extraction logic.
+        1. Extract all words with coordinates.
+        2. Sort by Page -> Top -> Left.
+        3. Group words into lines based on 'top' alignment.
+        4. Parse lines based on X-position of key columns.
         """
         items = []
         
         with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                # Get all words/lines with their positions
-                # We use 'text' mode but we process line by line carefully
-                text = page.extract_text()
-                if not text: continue
+            for page_num, page in enumerate(pdf.pages):
+                # Extract words with positions
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
                 
-                lines = text.split('\n')
+                # Sort words: Top-to-bottom, then Left-to-right
+                # This is crucial for fixing the order issue!
+                words.sort(key=lambda w: (int(w['top']), int(w['x0'])))
                 
-                for line in lines:
-                    # CLEANUP: Remove likely header/footer noise
-                    if "PAGE" in line.upper() or "INVOICE" in line.upper() or "SUBTOTAL" in line.upper():
+                # Group words into lines
+                lines = []
+                if words:
+                    current_line = [words[0]]
+                    for w in words[1:]:
+                        # If word is on the same horizontal line (within tolerance)
+                        if abs(w['top'] - current_line[-1]['top']) < 5:
+                            current_line.append(w)
+                        else:
+                            lines.append(current_line)
+                            current_line = [w]
+                    lines.append(current_line)
+                
+                for line_words in lines:
+                    # Reconstruct the text line
+                    line_text = " ".join([w['text'] for w in line_words])
+                    
+                    # HEADER SKIP Logic
+                    # If line is clearly header junk, skip it
+                    if "PAGE" in line_text.upper() and "OF" in line_text.upper(): continue
+                    if "INVOICE" in line_text.upper(): continue
+                    if "SUBTOTAL" in line_text.upper(): continue
+
+                    # --- PARSING LOGIC ---
+                    # Valid item line must:
+                    # 1. Start with numeric Item Code
+                    # 2. End with numeric prices
+                    
+                    first_word = line_words[0]['text']
+                    if not (first_word.isdigit() and len(first_word) >= 3):
                         continue
                         
-                    parts = line.split()
-                    if len(parts) < 5: continue
+                    item_num = first_word
                     
-                    # START ANCHOR: Must start with Item # (3-6 digits)
-                    # Example: "14158 AXION DISH..."
-                    if not (parts[0].isdigit() and 3 <= len(parts[0]) <= 6):
-                        continue
-                        
-                    item_num = parts[0]
-                    
-                    # END ANCHOR: Look for the pricing block at the end of the line
-                    # Pattern: [PACK] [1?] [UNIT_P] [CASE_COST] [EXT_COST]
-                    # Example: ... PK 12 1 2.39 28.68 28.68
-                    
-                    # Scan from right to find floats
+                    # Find the pricing block at the end
+                    # We look for the last 3 numbers that look like prices
                     float_indices = []
-                    for i in range(len(parts)-1, -1, -1):
-                        clean_s = parts[i].replace(',', '')
-                        # Regex for price-like number (1.99, 20.40, 0.85)
+                    for i in range(len(line_words)-1, -1, -1):
+                        clean_s = line_words[i]['text'].replace(',', '')
                         if re.match(r'^\d+\.\d+$', clean_s):
                             float_indices.append(i)
+                            if len(float_indices) == 3:
+                                break
                     
-                    # We need typically 3 prices at end: Ext, UM_P (Cost), Unit_P
-                    # Sometimes Ext is missing or broken, but Cost and Unit are usually there.
-                    # Let's assume at least 2 floats found.
                     if len(float_indices) >= 2:
-                        # Indices are reversed: [Last, 2nd Last, ...]
-                        # UM_P (Cost) is usually the 2nd numeric value from right if 3 exist, or 1st if 2?
-                        # Standard Layout: Unit_P   UM_P    Ext_P
-                        #                  2.39     28.68   28.68
-                        
-                        # If 3 floats found:
+                        # Indices are reversed: [Ext_P_idx, UM_P_idx, Unit_P_idx]
+                        # UM_P (Cost) is usually the 2nd to last price
                         if len(float_indices) >= 3:
-                            um_p_idx = float_indices[1] # 28.68
-                            unit_p_idx = float_indices[2] # 2.39
+                            um_p_idx = float_indices[1]
+                            unit_p_idx = float_indices[2]
                         else:
-                            # Fallback logic? Maybe only 2 prices printed?
+                            # If only 2 prices found (rare), assume Case & Unit?
                             continue
 
-                        cost = float(parts[um_p_idx].replace(',', ''))
-                        
+                        try:
+                            cost = float(line_words[um_p_idx]['text'].replace(',', ''))
+                        except:
+                            continue
+                            
                         # FIND PACK
                         # Look to the left of Unit Price
-                        # There might be a '1' (multiplier?) and 'T' (tax)
+                        # Scan backwards from unit_p_idx
                         search_idx = unit_p_idx - 1
                         pack = 1
-                        desc_end_idx = unit_p_idx # Default end of desc
+                        desc_end_idx = unit_p_idx 
                         
-                        # Walk backwards
+                        found_pack = False
                         while search_idx > 0:
-                            tok = parts[search_idx]
+                            tok = line_words[search_idx]['text']
                             
-                            # If we hit "PK", "CS", "EA", stop.
+                            # Stop at UM code
                             if tok in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
-                                # The number we just passed (to the right) was likely the pack?
-                                # Wait, format is usually "PK 12". 
-                                # If we are at PK, check to right? No, we scanned left.
-                                # In "PK 12 1 2.39":
-                                # 2.39 is unit_p.
-                                # 1 is at unit_p - 1.
-                                # 12 is at unit_p - 2.
-                                # PK is at unit_p - 3.
                                 break
                             
                             if tok.isdigit():
                                 val = int(tok)
-                                # Heuristic: 1 is likely a multiplier if we find another number.
-                                # If we find > 1, it's definitely pack.
                                 if val > 1:
                                     pack = val
-                                    # Check if token to left is PK/CS
-                                    if parts[search_idx-1] in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
+                                    # Check left for "PK"
+                                    if line_words[search_idx-1]['text'] in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
                                         desc_end_idx = search_idx - 1
                                     else:
                                         desc_end_idx = search_idx
+                                    found_pack = True
                                     break
                                 elif val == 1:
-                                    # Keep looking left for the real pack
+                                    # Skip "1" if it's a multiplier, keep looking left
                                     pass
                             
                             search_idx -= 1
                         
-                        # If we exited loop without setting desc_end_idx firmly, use search_idx
-                        if desc_end_idx == unit_p_idx: 
-                             desc_end_idx = search_idx
-
-                        # Extract Description
-                        # parts[0] is Item Num
-                        # parts[1] to desc_end_idx is description + noise
-                        raw_desc_parts = parts[1:desc_end_idx]
+                        if not found_pack:
+                            # Fallback: sometimes pack is not explicitly listed as integer > 1
+                            # Just grab text up to the known unit measure
+                            pass
+                            
+                        # DESCRIPTION
+                        # From word 1 (after Item#) to desc_end_idx
+                        raw_desc_words = line_words[1:desc_end_idx]
                         
-                        # CLEANUP: Remove "T", "N", "1" artifacts from description
+                        # CLEANUP ARTIFACTS
+                        # Remove "T", "N", "1" only if they are standalone tokens
                         clean_desc = []
-                        for p in raw_desc_parts:
-                            if p not in ['T', 'N', '1']:
-                                clean_desc.append(p)
+                        for w in raw_desc_words:
+                            t = w['text']
+                            if t not in ['T', 'N', '1']:
+                                clean_desc.append(t)
                         
                         description = " ".join(clean_desc)
                         
