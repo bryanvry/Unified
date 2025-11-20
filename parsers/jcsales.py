@@ -56,14 +56,17 @@ class JCSalesParser:
         # Create a normalized UPC column for matching
         pb_df['match_upc'] = pb_df['Upc'].apply(normalize_for_match)
         
-        # --- FIX: Create lookup dictionaries robustly ---
-        # Map normalized UPC -> Index in PB dataframe (to grab full row later)
-        # We use a simple dictionary comprehension
+        # --- FIX: Handle Duplicate UPCs in Pricebook ---
+        # Map normalized UPC -> Index in PB dataframe
+        # We use a dictionary comprehension which is safe for duplicates (last one wins)
         pb_map_idx = dict(zip(pb_df['match_upc'], pb_df.index))
         
-        # Also keep a dict for fast lookup of pricing data
-        # .set_index(...).to_dict('index') works on DataFrame, not Index
-        pb_data_map = pb_df.set_index('match_upc').to_dict('index')
+        # Create lookup dictionary for pricing data
+        # We MUST drop duplicates in 'match_upc' before setting it as index
+        # to avoid "DataFrame index must be unique" error.
+        # We keep the first occurrence of each UPC.
+        pb_unique = pb_df.drop_duplicates(subset=['match_upc'])
+        pb_data_map = pb_unique.set_index('match_upc').to_dict('index')
         # ------------------------------------------------
 
         # 4. Merge Logic
