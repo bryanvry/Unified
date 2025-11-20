@@ -75,7 +75,6 @@ def _find_header_map(header: List[str]) -> Optional[dict]:
     return None
 
 
-# ---------- parser class ----------
 class JCSalesParser:
     name = "JC Sales"
 
@@ -147,7 +146,7 @@ class JCSalesParser:
         df_out = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
         return df_out, page_texts
 
-    # --- word-grid (robust) fallback ---
+    # --- word-grid fallback (second try) ---
     def _extract_by_wordgrid(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
         page_texts = []
         all_rows = []
@@ -167,8 +166,8 @@ class JCSalesParser:
                 txt = " ".join([w["text"] for w in sorted(ws, key=lambda x: x["x0"])])
                 c = _canon(txt)
                 score = 0
-                for tok in ["item", "description", "um", "unit", "um_p", "unit_p", "#/um"]:
-                    if tok.replace("_","") in c:
+                for tok in ["item", "description", "um", "unit", "ump", "unitp", "#/um"]:
+                    if tok in c:
                         score += 1
                 if score >= 3 and score >= best_score:
                     best_score = score
@@ -206,7 +205,7 @@ class JCSalesParser:
                 xc = (w["x0"] + w["x1"]) / 2.0
                 best, best_dx = None, 1e9
                 for key, xx in xcenters.items():
-                    if xx is None: 
+                    if xx is None:
                         continue
                     dx = abs(xc - xx)
                     if dx < best_dx:
@@ -261,6 +260,64 @@ class JCSalesParser:
         df = pd.DataFrame(all_rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if all_rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
         return df, page_texts
 
+    # --- regex-line fallback (third try) ---
+    def _extract_by_regex_lines(self, pdf: "pdfplumber.PDF") -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Very tolerant: read page text lines and look for:
+          ITEM (5–7 digits) ... DESCRIPTION ... PACK (int) UNIT (float) COST (float)
+        Assumes UNIT precedes COST (as JC Sales header shows: UNIT_P then UM_P),
+        but will also accept reversed pair and swap if UNIT > COST.
+        """
+        rows = []
+        page_texts = []
+        # UNIT and COST typically have 2 decimals
+        price_re = r"(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})"
+
+        for pg in pdf.pages:
+            txt = pg.extract_text() or ""
+            page_texts.append(txt)
+            for raw in txt.splitlines():
+                line = " ".join(raw.split())  # collapse spaces
+                # Look for two prices at end and one integer before them
+                # Grouping:
+                #   ITEM  DESC...  PACK  UNIT  COST
+                m = re.search(
+                    rf"^\s*(\d{{5,7}})\s+(.*?)\s+(\d+)\s+{price_re}\s+{price_re}\s*$",
+                    line
+                )
+                if not m:
+                    continue
+                item = m.group(1)
+                desc = m.group(2).strip()
+                pack = _to_int(m.group(3))
+                val1 = _to_float(m.group(4))
+                val2 = _to_float(m.group(5))
+                if pack <= 0:
+                    continue
+                # Heuristic: UNIT should be smaller; COST should be larger.
+                # If not, swap.
+                unit, cost = val1, val2
+                if unit is not None and cost is not None and unit > cost:
+                    unit, cost = cost, unit
+                if (unit is None or np.isnan(unit) or unit <= 0) and (cost is not None and not np.isnan(cost) and cost > 0):
+                    unit = cost / pack if pack > 0 else np.nan
+                if (cost is None or np.isnan(cost) or cost <= 0) and (unit is not None and not np.isnan(unit) and unit > 0):
+                    cost = unit * pack
+
+                if not desc or (cost is None or np.isnan(cost) or cost <= 0):
+                    continue
+
+                rows.append({
+                    "ITEM": item,
+                    "DESCRIPTION": desc,
+                    "PACK": int(pack),
+                    "COST": float(cost),
+                    "UNIT": float(unit) if unit is not None and not np.isnan(unit) else (float(cost)/int(pack) if pack>0 else np.nan)
+                })
+
+        df = pd.DataFrame(rows, columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"]) if rows else pd.DataFrame(columns=["ITEM","DESCRIPTION","PACK","COST","UNIT"])
+        return df, page_texts
+
     # --- public API ---
     def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, Optional[str]]:
         if pdfplumber is None:
@@ -289,8 +346,18 @@ class JCSalesParser:
         try:
             with pdfplumber.open(uploaded_pdf) as pdf:
                 df2, txt2 = self._extract_by_wordgrid(pdf)
-                self.last_invoice_number = self._extract_invoice_number(txt2)
-                return df2.reset_index(drop=True), (self.last_invoice_number or None)
+                if df2 is not None and not df2.empty:
+                    self.last_invoice_number = self._extract_invoice_number(txt2)
+                    return df2.reset_index(drop=True), (self.last_invoice_number or None)
+        except Exception:
+            pass
+
+        # 3) regex-line fallback
+        try:
+            with pdfplumber.open(uploaded_pdf) as pdf:
+                df3, txt3 = self._extract_by_regex_lines(pdf)
+                self.last_invoice_number = self._extract_invoice_number(txt3)
+                return df3.reset_index(drop=True), (self.last_invoice_number or None)
         except Exception:
             pass
 
