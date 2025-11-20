@@ -98,6 +98,9 @@ def _build_pricebook_update(pricebook_csv_file, updated_master_df):
         if isinstance(pricebook_csv_file, pd.DataFrame):
              pb = pricebook_csv_file
         else:
+             # Seek to start if it's an open file object
+             if hasattr(pricebook_csv_file, 'seek'):
+                 pricebook_csv_file.seek(0)
              pb = pd.read_csv(pricebook_csv_file, dtype=str, keep_default_na=False, na_values=[])
     except Exception:
         return (pd.DataFrame(), pd.DataFrame())
@@ -366,13 +369,7 @@ def load_dataframe(uploaded_file):
     except Exception as e:
         st.error(f"Error loading {uploaded_file.name}: {e}")
         return None
-```
 
-### **Part 2: The User Interface (Append to the end of `app.py`)**
-
-This code starts with `# ---------------- UI ----------------`. Paste it after the code block above.
-
-```python
 # ---------------- UI ----------------
 
 # DROPDOWN MENU CONFIGURATION
@@ -473,6 +470,7 @@ if selected_vendor == "Southern Glazer's":
             if invoice_items_df.empty:
                 st.error("Could not parse any SG items (no UPC/Item Name/Cost/Cases). Please check the file.")
             else:
+                # Logic Fix: Reverted to using your existing _update_master helper
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 
                 pos_update = None
@@ -532,6 +530,7 @@ if selected_vendor == "Southern Glazer's":
         else:
             st.info("No POS updates generated (pricebook missing or no matches).")
 
+        # additional tables
         if st.session_state["sg_cost_changes"] is not None and not st.session_state["sg_cost_changes"].empty:
             st.write("---")
             st.subheader("Cost Changes (Diff > 0.009)")
@@ -578,11 +577,13 @@ if selected_vendor == "Nevada Beverage":
             if invoice_items_df.empty:
                 st.error("Could not parse any Nevada items (no UPC/Item Name/Cost/Cases). Please check the file.")
             else:
+                # Logic Fix: Reverted to using your existing _update_master helper
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
+                    # Logic Fix: Pass the FILE OBJECT, not a loaded df
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
