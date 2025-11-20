@@ -2,86 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-import sys
-import os
-import importlib.util
 from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
 
-# --- ROBUST IMPORT FOR JC SALES ---
-def get_jcsales_parser():
-    """Try to import JCSalesParser, falling back to manual file load if needed."""
-    # 1. Try standard import
-    try:
-        from parsers import JCSalesParser
-        return JCSalesParser
-    except ImportError:
-        pass
-
-    # 2. Try importing from local file in 'parsers' folder manually
-    try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(current_dir, "parsers", "jcsales.py")
-        
-        if os.path.exists(file_path):
-            spec = importlib.util.spec_from_file_location("JCSalesParserModule", file_path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["JCSalesParserModule"] = module
-            spec.loader.exec_module(module)
-            return module.JCSalesParser
-    except Exception as e:
-        print(f"Manual import failed: {e}")
-    
-    return None
-
-JCSalesParser = get_jcsales_parser()
-
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 
 # ---------------- shared helpers ----------------
 UNIFIED_IGNORE_UPCS = set(["000000000000", "003760010302", "023700052551"])
-
-# --- UTILS ported from utils.py for self-containment ---
-def digits_only(s):
-    return re.sub(r"\D", "", str(s)) if pd.notna(s) else ""
-
-def upc_check_digit(core11: str) -> str:
-    core11 = re.sub(r"\D","",core11).zfill(11)[:11]
-    if len(core11) != 11:
-        return "0"
-    d = [int(x) for x in core11]
-    return str((10 - ((sum(d[0::2])*3 + sum(d[1::2])) % 10)) % 10)
-
-def normalize_pos_upc(raw: str) -> str:
-    d = digits_only(raw)
-    if len(d) == 12: return d
-    if len(d) == 11: return d + upc_check_digit(d)
-    if len(d) > 12: d = d[-12:]
-    return d.zfill(12)
-
-def normalize_invoice_upc(raw: str) -> str:
-    d = digits_only(raw)
-    core11 = d[-11:] if len(d) >= 11 else d.zfill(11)
-    return core11 + upc_check_digit(core11)
-
-def first_int_from_text(s):
-    m = re.search(r"\d+", str(s) if pd.notna(s) else "")
-    return int(m.group(0)) if m else 1
-
-def find_col(cols, candidates):
-    for c in cols:
-        if any(x.lower() == c.lower() for x in candidates):
-            return c
-    # fuzzy match
-    for c in cols:
-        if any(x.lower() in c.lower() for x in candidates):
-            return c
-    return None
-
-
 def _build_pricebook_update(pricebook_csv_file, updated_master_df):
     """
     Build POS update sheet from updated Master.
@@ -94,249 +24,550 @@ def _build_pricebook_update(pricebook_csv_file, updated_master_df):
         return (pd.DataFrame(), pd.DataFrame())
 
     # Read pricebook
-    try:
-        if isinstance(pricebook_csv_file, pd.DataFrame):
-             pb = pricebook_csv_file
-        else:
-             # Seek to start if it's an open file object
-             if hasattr(pricebook_csv_file, 'seek'):
-                 pricebook_csv_file.seek(0)
-             pb = pd.read_csv(pricebook_csv_file, dtype=str, keep_default_na=False, na_values=[])
-    except Exception:
-        return (pd.DataFrame(), pd.DataFrame())
-        
+    pb = pd.read_csv(pricebook_csv_file, dtype=str, keep_default_na=False, na_values=[])
     if pb.empty:
         return (pd.DataFrame(), pd.DataFrame())
 
     # Resolve key columns
-    upc_col = "Upc" if "Upc" in pb.columns else "UPC"
-    if upc_col not in pb.columns:
-        return (pd.DataFrame(), pd.DataFrame())
+    upc_col = "Upc" if "Upc" in pb.columns else ("UPC" if "UPC" in pb.columns else pb.columns[0])
 
-    # Normalize PB UPCs
-    pb["_norm_upc"] = pb[upc_col].astype(str).apply(normalize_pos_upc)
+    # Normalize UPCs in pricebook and master
+    pb = pb.copy()
+    pb["__pb_upc_norm"] = pb[upc_col].astype(str).map(normalize_pos_upc)
 
-    # Filter master for items that have invoice quantity
-    if "Total" not in updated_master_df.columns:
-         return (pd.DataFrame(), pd.DataFrame())
+    mast = updated_master_df.copy()
+    fb_col = _resolve_col(mast, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
+    total_col = _resolve_col(mast, ["Total","TOTAL","total"], "Total")
+    cents_col = _resolve_col(mast, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
 
-    invoice_items = updated_master_df[pd.to_numeric(updated_master_df["Total"], errors='coerce').fillna(0) > 0].copy()
+    # Numeric Total; keep only >0
+    mast["__Total_num"] = mast[total_col].apply(_to_float_safe)
+    mast["__Cost_cents"] = mast[cents_col].apply(_to_int_safe)
+    mast["__fb_norm"] = mast[fb_col].astype(str).map(normalize_pos_upc)
 
-    if invoice_items.empty:
-        return (pd.DataFrame(), pd.DataFrame())
+    mast_used = mast[mast["__Total_num"] > 0].copy()
 
-    invoice_items["_norm_upc"] = invoice_items["Full Barcode"].astype(str).apply(normalize_pos_upc)
-
-    # Merge
-    merged = pd.merge(
-        pb,
-        invoice_items[["_norm_upc", "Total", "Cost"]],
-        on="_norm_upc",
-        how="left",
-        indicator=True
+    # Which master rows aren’t present in the pricebook
+    pb_upcs = set(pb["__pb_upc_norm"])
+    missing_mask = ~mast_used["__fb_norm"].isin(pb_upcs)
+    pricebook_missing = (
+        mast_used.loc[missing_mask, [fb_col, total_col, cents_col]]
+        .rename(columns={fb_col: "Full Barcode", total_col: "Total", cents_col: "Cost ¢"})
+        .reset_index(drop=True)
     )
 
-    # Items in Invoice but NOT in Pricebook
-    # We need to check which invoice_items did not find a match in pb
-    matched_upcs = set(merged[merged["_merge"] == "both"]["_norm_upc"])
-    missing_in_pb = invoice_items[~invoice_items["_norm_upc"].isin(matched_upcs)].copy()
+    # Keep only rows we can actually update (present in pricebook)
+    mast_used = mast_used[~missing_mask].copy()
+    if mast_used.empty:
+        return (pd.DataFrame(), pricebook_missing)
 
-    # Filter PB rows that matched (where we have updates)
-    pos_update = merged[merged["_merge"] == "both"].copy()
-    
-    # Update columns
-    pos_update["addstock"] = pd.to_numeric(pos_update["Total"], errors='coerce').fillna(0).astype(int)
-    
-    def cost_to_cents(val):
-        try:
-            return int(round(float(val) * 100))
-        except:
-            return 0
-            
-    pos_update["cost_cents"] = pos_update["Cost"].apply(cost_to_cents)
+    # Build mapping Full Barcode → (Total, Cost ¢)
+    map_total = dict(zip(mast_used["__fb_norm"], mast_used["__Total_num"]))
+    map_cents = dict(zip(mast_used["__fb_norm"], mast_used["__Cost_cents"]))
 
-    # Drop temp columns
-    pos_update = pos_update.drop(columns=["_norm_upc", "Total", "Cost", "_merge"])
-    
-    return pos_update, missing_in_pb
+    # Apply updates to a copy of the pricebook
+    out = pb.copy()
+    out["_new_addstock"] = out["__pb_upc_norm"].map(map_total).fillna(0)
+    out["_new_cost_cents"] = out["__pb_upc_norm"].map(map_cents).fillna(0).astype(int)
 
-def _ensure_invoice_cols(df):
-    required = ["UPC", "Item Name", "Cost", "Cases"]
-    for c in required:
-        if c not in df.columns:
-            df[c] = ""
-    return df[required]
+    # Only keep rows that were actually in the invoice (Total>0 mapping exists)
+    updated_rows = out[out["_new_addstock"] > 0].copy()
+    if updated_rows.empty:
+        return (pd.DataFrame(), pricebook_missing)
 
-def _update_master_from_invoice(master_file, invoice_df):
-    """
-    Updates Master file with Invoice data.
-    Returns: (updated_master, cost_changes, not_in_master, pack_missing, invoice_unique)
-    """
-    # Load Master
+    # Write into the canonical columns (create if missing)
+    if "addstock" not in updated_rows.columns:
+        updated_rows["addstock"] = 0
+    if "cost_cents" not in updated_rows.columns:
+        updated_rows["cost_cents"] = 0
+
+    updated_rows["addstock"] = updated_rows["_new_addstock"]
+    updated_rows["cost_cents"] = updated_rows["_new_cost_cents"]
+
+    # Drop helper cols
+    updated_rows = updated_rows.drop(columns=["_new_addstock","_new_cost_cents"], errors="ignore")
+
+    # Return just the updated subset (POS upload file) + the missing list
+    # Keep original order of columns
+    updated_rows = updated_rows[pb.columns] if set(pb.columns).issubset(set(updated_rows.columns)) else updated_rows
+    return (updated_rows.reset_index(drop=True), pricebook_missing.reset_index(drop=True))
+
+def digits_only(s):
+    return re.sub(r"\D", "", str(s)) if pd.notna(s) else ""
+
+def upc_check_digit(core11: str) -> str:
+    core11 = re.sub(r"\D","",core11).zfill(11)[:11]
+    if len(core11) != 11:
+        return "0"
+    d = [int(x) for x in core11]
+    return str((10 - ((sum(d[0::2])*3 + sum(d[1::2])) % 10)) % 10)
+
+def normalize_invoice_upc(raw: str) -> str:
+    d = digits_only(raw)
+    core11 = d[-11:] if len(d) >= 11 else d.zfill(11)
+    return core11 + upc_check_digit(core11)
+
+def normalize_pos_upc(raw: str) -> str:
+    d = digits_only(raw)
+    if len(d) == 12:
+        return d
+    if len(d) == 11:
+        return d + upc_check_digit(d)
+    if len(d) > 12:
+        d = d[-12:]
+    return d.zfill(12)
+
+def first_int_from_text(s):
+    m = re.search(r"\d+", str(s) if pd.notna(s) else "")
+    return int(m.group(0)) if m else np.nan
+
+def to_float(x):
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x,(int,float,np.number)):
+        return float(x)
+    s = str(x).replace("$","").replace(",","").strip()
     try:
-        mst = pd.read_excel(master_file, dtype=str)
+        return float(s)
     except:
-        return None, None, None, None, None
+        return np.nan
 
-    # Normalize Master UPCs (Full Barcode)
-    if "Full Barcode" not in mst.columns:
-        return None, None, None, None, None
+def find_col(cols, candidates):
+    low = [c.lower() for c in cols]
+    for cand in candidates:
+        if cand.lower() in low:
+            return cols[low.index(cand.lower())]
+    for cand in candidates:
+        for i,c in enumerate(low):
+            if cand.lower() in c:
+                return cols[i]
+    return None
 
-    mst["_norm_upc"] = mst["Full Barcode"].apply(normalize_pos_upc)
-    invoice_df["_norm_upc"] = invoice_df["UPC"].apply(normalize_pos_upc)
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
-    # 1. Identify Items NOT in Master
-    master_upcs = set(mst["_norm_upc"])
-    not_in_master = invoice_df[~invoice_df["_norm_upc"].isin(master_upcs)].copy()
+def dfs_to_xlsx_bytes(dfs: dict) -> bytes:
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for name, d in dfs.items():
+            d.to_excel(writer, sheet_name=name[:31], index=False)
+    bio.seek(0)
+    return bio.getvalue()
 
-    # 2. Merge Invoice into Master
-    # Aggregate invoice items (duplicate UPCs? sum cases, avg cost?)
-    inv_grp = invoice_df.groupby("_norm_upc").agg({
-        "Cost": "max", # Assume highest cost is new cost
-        "Cases": "sum"
-    }).reset_index()
-    
-    # Merge
-    merged = pd.merge(mst, inv_grp, on="_norm_upc", how="left", suffixes=("", "_new"))
-    
-    # 3. Detect Cost Changes
-    merged["Cost"] = pd.to_numeric(merged["Cost"], errors='coerce').fillna(0)
-    merged["Cost_new"] = pd.to_numeric(merged["Cost_new"], errors='coerce').fillna(0)
-    
-    # Identify changes (where Cost_new > 0 and different from Cost)
-    cost_changes = merged[
-        (merged["Cost_new"] > 0) & 
-        (abs(merged["Cost"] - merged["Cost_new"]) > 0.009)
-    ].copy()
-    
-    cost_changes["Old Cost"] = cost_changes["Cost"]
-    cost_changes["New Cost"] = cost_changes["Cost_new"]
-    
-    # 4. Update Master Cost
-    merged.loc[merged["Cost_new"] > 0, "Cost"] = merged["Cost_new"]
+def _to_int_safe(x):
+    try:
+        return int(round(float(str(x).replace(",", "").strip())))
+    except Exception:
+        return 0
 
-    # 5. Calculate Total = Pack * Cases (from invoice)
-    merged["Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(0)
-    merged["Cases"] = pd.to_numeric(merged["Cases"], errors='coerce').fillna(0)
-    
-    merged["Total"] = merged["Pack"] * merged["Cases"]
-    
-    # 6. Missing Pack (Items on invoice where Master Pack is 0 or NaN)
-    pack_missing = merged[
-        (merged["Cases"] > 0) & 
-        (merged["Pack"] <= 0)
-    ].copy()
+def _to_float_safe(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return 0.0
 
-    # Cleanup
-    final_master = merged.drop(columns=["_norm_upc", "Cost_new", "Cases"]) 
-    
-    return final_master, cost_changes, not_in_master, pack_missing, inv_grp
+def _norm_upc_12(u: str) -> str:
+    s = str(u or "").strip().replace("-", "").replace(" ", "")
+    s = "".join(ch for ch in s if ch.isdigit())
+    if len(s) == 13 and s.startswith("0"):
+        s = s[1:]
+    if len(s) > 12:
+        s = s[-12:]
+    if len(s) < 12:
+        s = s.zfill(12)
+    return s
 
-def df_to_csv_bytes(df):
-    return df.to_csv(index=False).encode('utf-8')
+def _resolve_col(df: pd.DataFrame, candidates, default_name):
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+    if default_name not in df.columns:
+        df[default_name] = ""
+    return default_name
 
-# --- UNIFIED HELPERS ---
-def process_unified(pos_csv_file, unified_files):
-    # Load POS
-    pos_df = pd.read_csv(pos_csv_file, dtype=str, keep_default_na=False)
-    
-    # Normalize POS UPCs
-    upc_header = "Upc" if "Upc" in pos_df.columns else "UPC"
-    pos_df["_norm_upc"] = pos_df[upc_header].apply(normalize_pos_upc)
-    
-    # Load Unified Parsed Data
-    from parsers import UnifiedParser as UPClass
-    parser = UPClass()
-    
-    all_inv_dfs = []
-    for f in unified_files:
-        try:
-            f.seek(0)
-            df = parser.parse(f)
-            all_inv_dfs.append(df)
-        except Exception as e:
-            st.error(f"Error parsing {f.name}: {e}")
-            
-    if not all_inv_dfs:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-    inv_all = pd.concat(all_inv_dfs, ignore_index=True)
-    
-    # Logic: Keep latest invoice date per UPC
-    inv_all["invoice_date"] = pd.to_datetime(inv_all["invoice_date"], errors='coerce')
-    inv_all = inv_all.sort_values("invoice_date", ascending=True)
-    inv_all = inv_all.drop_duplicates(subset=["UPC"], keep="last") # Keep latest
-    
-    # Filter Ignore List
-    inv_all = inv_all[~inv_all["UPC"].isin(UNIFIED_IGNORE_UPCS)]
-    
-    # Join Invoice -> POS
-    merged = pd.merge(
-        inv_all,
-        pos_df,
-        left_on="UPC",
-        right_on="_norm_upc",
-        how="left",
-        indicator=True
+# -------- SG/NV/Breakthru shared helpers --------
+def _ensure_invoice_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure columns: UPC, Item Name, Cost, Cases. Normalize UPC to 12-digit numeric string."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases"])
+    want = ["UPC","Item Name","Cost","Cases"]
+    out = {}
+    for w in want:
+        picked = None
+        for c in df.columns:
+            if str(c).strip().lower() == w.lower():
+                picked = c
+                break
+        out[w] = df[picked] if picked is not None else None
+    if any(v is None for v in out.values()):
+        return pd.DataFrame(columns=want)
+    res = pd.DataFrame({k: out[k] for k in want}).copy()
+    res["UPC"] = res["UPC"].map(_norm_upc_12).astype(str)
+    res["Item Name"] = res["Item Name"].astype(str)
+    res["Cost"] = pd.to_numeric(res["Cost"], errors="coerce")
+    res["Cases"] = pd.to_numeric(res["Cases"], errors="coerce").fillna(0).astype(int)
+    res = res[(res["UPC"] != "") & res["Cost"].notna()].copy()
+    return res
+
+def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
+    """Update Master using invoice_df (must have UPC, Item Name, Cost, Cases). Match on Master['Invoice UPC']."""
+    invoice_df = _ensure_invoice_cols(invoice_df)
+    if invoice_df.empty:
+        return (None, None, None, None, None)
+
+    master = pd.read_excel(master_xlsx, dtype=str).fillna("")
+
+    name_col         = _resolve_col(master, ["Name","NAME","name"], "Name")
+    pack_col         = _resolve_col(master, ["Pack","PACK","pack"], "Pack")
+    cases_col        = _resolve_col(master, ["Cases","CASES","cases"], "Cases")
+    total_col        = _resolve_col(master, ["Total","TOTAL","total"], "Total")
+    cost_dollar_col  = _resolve_col(master, ["Cost $","Cost$","COST $","cost $"], "Cost $")
+    cost_cent_col    = _resolve_col(master, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
+    inv_upc_col      = _resolve_col(master, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
+
+    master[pack_col]        = master[pack_col].apply(_to_int_safe)
+    master[cases_col]       = master[cases_col].apply(_to_int_safe)
+    master[total_col]       = master[total_col].apply(_to_float_safe)
+    master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
+    master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
+
+    invoice_unique = (
+        invoice_df
+        .groupby("UPC", as_index=False)
+        .agg({"Item Name":"last","Cost":"last","Cases":"sum"})
     )
-    
-    # Matched items
-    matched = merged[merged["_merge"] == "both"].copy()
-    
-    # 1. FULL EXPORT (Merged data)
-    full_export_df = matched.copy()
-    
-    # 2. POS UPDATE (Changes)
-    matched["+Cost"] = pd.to_numeric(matched["+Cost"], errors='coerce').fillna(0)
-    matched["Pack"] = pd.to_numeric(matched["Pack"], errors='coerce').fillna(1)
-    
-    matched["cost_cents_num"] = pd.to_numeric(matched["cost_cents"], errors='coerce').fillna(0)
-    matched["cost_qty_num"] = pd.to_numeric(matched["cost_qty"], errors='coerce').fillna(1)
-    
-    matched["new_cost_cents"] = (matched["+Cost"] * 100).astype(int)
-    
-    changes = matched[
-        (matched["new_cost_cents"] != matched["cost_cents_num"]) |
-        (matched["Pack"] != matched["cost_qty_num"])
-    ].copy()
-    
-    changes["cost_cents"] = changes["new_cost_cents"]
-    changes["cost_qty"] = changes["Pack"]
-    
-    pos_cols = [c for c in pos_df.columns if c != "_norm_upc"]
-    pos_update_df = changes[pos_cols].copy()
-    
-    # 3. Goal Sheet 1 (Audit)
+
+    inv_map = invoice_unique.set_index("UPC")[["Item Name","Cost","Cases"]].to_dict(orient="index")
+    inv_upcs = set(invoice_unique["UPC"])
+
+    changed_cost_rows = []
+    not_in_master_rows = []
+    pack_missing_on_added_rows = []
+
+    updated = master.copy()
+
+    for idx, row in updated.iterrows():
+        inv_upc = _norm_upc_12(row.get(inv_upc_col, ""))
+        if inv_upc in inv_map:
+            inv_rec   = inv_map[inv_upc]
+            new_cases = int(inv_rec["Cases"])
+            old_cost  = float(updated.at[idx, cost_dollar_col])
+            new_cost  = float(inv_rec["Cost"])
+
+            updated.at[idx, cases_col]       = new_cases
+            pack_val = int(row.get(pack_col, 0))
+            updated.at[idx, total_col]       = float(pack_val * new_cases)  # Total = Pack × Cases
+            updated.at[idx, cost_dollar_col] = new_cost
+            updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
+
+            if abs(old_cost - new_cost) > 1e-6:
+                changed_cost_rows.append({
+                    inv_upc_col: inv_upc,
+                    name_col: row.get(name_col, ""),
+                    "Old Cost $": old_cost,
+                    "New Cost $": new_cost
+                })
+
+            if new_cases > 0 and pack_val == 0:
+                pack_missing_on_added_rows.append({
+                    inv_upc_col: inv_upc,
+                    name_col: row.get(name_col, ""),
+                    "Cases": new_cases,
+                    "Pack": pack_val
+                })
+
+    master_inv = set(_norm_upc_12(x) for x in updated[inv_upc_col].fillna(""))
+    for u in sorted(inv_upcs - master_inv):
+        rec = inv_map.get(u, {})
+        not_in_master_rows.append({
+            inv_upc_col: u,
+            "Item Name": rec.get("Item Name",""),
+            "Cost": rec.get("Cost",""),
+            "Cases": rec.get("Cases",""),
+        })
+
+    return (
+        updated,
+        pd.DataFrame(changed_cost_rows),
+        pd.DataFrame(not_in_master_rows),
+        pd.DataFrame(pack_missing_on_added_rows),
+        invoice_unique
+    )
+
+def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
+    """
+    Breakthru variant: update by Invoice UPC first, then try Full Barcode for any still-unmatched rows.
+    `invoice_df` must have columns: UPC, Item Name, Cost, Cases.
+    UPC may be either Invoice UPC or Full Barcode (for rows where we filled from Item Number→FB).
+    """
+    invoice_df = _ensure_invoice_cols(invoice_df)
+    if invoice_df.empty:
+        return (None, None, None, None, None)
+
+    master = pd.read_excel(master_xlsx, dtype=str).fillna("")
+
+    name_col         = _resolve_col(master, ["Name","NAME","name"], "Name")
+    pack_col         = _resolve_col(master, ["Pack","PACK","pack"], "Pack")
+    cases_col        = _resolve_col(master, ["Cases","CASES","cases"], "Cases")
+    total_col        = _resolve_col(master, ["Total","TOTAL","total"], "Total")
+    cost_dollar_col  = _resolve_col(master, ["Cost $","Cost$","COST $","cost $"], "Cost $")
+    cost_cent_col    = _resolve_col(master, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
+    inv_upc_col      = _resolve_col(master, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
+    full_barcode_col = _resolve_col(master, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
+
+    # normalize numeric columns
+    master[pack_col]        = master[pack_col].apply(_to_int_safe)
+    master[cases_col]       = master[cases_col].apply(_to_int_safe)
+    master[total_col]       = master[total_col].apply(_to_float_safe)
+    master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
+    master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
+
+    invoice_unique = (
+        invoice_df
+        .groupby("UPC", as_index=False)
+        .agg({"Item Name":"last","Cost":"last","Cases":"sum"})
+    )
+    inv_map = invoice_unique.set_index("UPC")[["Item Name","Cost","Cases"]].to_dict(orient="index")
+
+    # Build lookup maps for master on both keys (normalized 12-digit)
+    master["__inv_norm"] = master[inv_upc_col].map(_norm_upc_12)
+    master["__fb_norm"]  = master[full_barcode_col].map(_norm_upc_12)
+
+    by_inv = {}
+    by_fb  = {}
+    for i, r in master.iterrows():
+        if r["__inv_norm"]:
+            by_inv.setdefault(r["__inv_norm"], []).append(i)
+        if r["__fb_norm"]:
+            by_fb.setdefault(r["__fb_norm"], []).append(i)
+
+    changed_cost_rows = []
+    not_in_master_rows = []
+    pack_missing_on_added_rows = []
+
+    updated = master.copy()
+    matched_upcs = set()
+
+    # pass 1: try Invoice UPC
+    for upc, rec in inv_map.items():
+        u = _norm_upc_12(upc)
+        idxs = by_inv.get(u, [])
+        if idxs:
+            matched_upcs.add(u)
+            for idx in idxs:
+                old_cost = float(updated.at[idx, cost_dollar_col])
+                new_cost = float(rec["Cost"])
+                new_cases = int(rec["Cases"])
+                pack_val = int(updated.at[idx, pack_col])
+
+                updated.at[idx, cases_col]       = new_cases
+                updated.at[idx, total_col]       = float(pack_val * new_cases)
+                updated.at[idx, cost_dollar_col] = new_cost
+                updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
+
+                if abs(old_cost - new_cost) > 1e-6:
+                    changed_cost_rows.append({
+                        inv_upc_col: updated.at[idx, inv_upc_col],
+                        name_col: updated.at[idx, name_col],
+                        "Old Cost $": old_cost,
+                        "New Cost $": new_cost
+                    })
+                if new_cases > 0 and pack_val == 0:
+                    pack_missing_on_added_rows.append({
+                        inv_upc_col: updated.at[idx, inv_upc_col],
+                        name_col: updated.at[idx, name_col],
+                        "Cases": new_cases,
+                        "Pack": pack_val
+                    })
+
+    # pass 2: try Full Barcode for those not matched via Invoice UPC
+    for upc, rec in inv_map.items():
+        u = _norm_upc_12(upc)
+        if u in matched_upcs:
+            continue
+        idxs = by_fb.get(u, [])
+        if idxs:
+            matched_upcs.add(u)
+            for idx in idxs:
+                old_cost = float(updated.at[idx, cost_dollar_col])
+                new_cost = float(rec["Cost"])
+                new_cases = int(rec["Cases"])
+                pack_val = int(updated.at[idx, pack_col])
+
+                updated.at[idx, cases_col]       = new_cases
+                updated.at[idx, total_col]       = float(pack_val * new_cases)
+                updated.at[idx, cost_dollar_col] = new_cost
+                updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
+
+                if abs(old_cost - new_cost) > 1e-6:
+                    changed_cost_rows.append({
+                        inv_upc_col: updated.at[idx, inv_upc_col],
+                        name_col: updated.at[idx, name_col],
+                        "Old Cost $": old_cost,
+                        "New Cost $": new_cost
+                    })
+                if new_cases > 0 and pack_val == 0:
+                    pack_missing_on_added_rows.append({
+                        inv_upc_col: updated.at[idx, inv_upc_col],
+                        name_col: updated.at[idx, name_col],
+                        "Cases": new_cases,
+                        "Pack": pack_val
+                    })
+
+    # anything still unmatched → not in master
+    for upc, rec in inv_map.items():
+        u = _norm_upc_12(upc)
+        if u not in matched_upcs:
+            not_in_master_rows.append({
+                "Lookup UPC": u,
+                "Item Name": rec.get("Item Name",""),
+                "Cost": rec.get("Cost",""),
+                "Cases": rec.get("Cases",""),
+            })
+
+    return (
+        updated.drop(columns=["__inv_norm","__fb_norm"]),
+        pd.DataFrame(changed_cost_rows),
+        pd.DataFrame(not_in_master_rows),
+        pd.DataFrame(pack_missing_on_added_rows),
+        invoice_unique
+    )
+
+# ---------------- Unified functions ----------------
+def parse_unified(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df_raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
+    else:
+        df_raw = pd.read_excel(uploaded_file, header=None, dtype=str)
+
+    header_tokens = [
+        "Item UPC","UPC","Brand","Description","Pack","Size","Cost",
+        "Net Case Cost","Case Qty","Invoice Date","Qty"
+    ]
+    best_row_idx, best_hits = None, 0
+    for i in range(min(200, len(df_raw))):
+        vals = [str(x) if pd.notna(x) else "" for x in df_raw.iloc[i].tolist()]
+        hits = sum(1 for v in vals for t in header_tokens if t.lower() in v.strip().lower())
+        if hits > best_hits:
+            best_hits, best_row_idx = hits, i
+    header_row = best_row_idx if best_row_idx is not None else 0
+
+    raw_header = df_raw.iloc[header_row].tolist()
+    clean_header, seen = [], {}
+    for i, h in enumerate(raw_header):
+        nm = (str(h) if pd.notna(h) else "").strip() or f"Unnamed_{i}"
+        nm = " ".join(nm.split())
+        if nm in seen:
+            seen[nm] += 1
+            nm = f"{nm}_{seen[nm]}"
+        else:
+            seen[nm] = 0
+        clean_header.append(nm)
+
+    inv_df = df_raw.iloc[header_row+1:].copy()
+    inv_df.columns = clean_header
+    inv_df = inv_df.dropna(how="all")
+    cols = list(inv_df.columns)
+
+    col_item_upc   = find_col(cols, ["Item UPC","UPC"])
+    col_brand      = find_col(cols, ["Brand"])
+    col_desc       = find_col(cols, ["Description","Item Description"])
+    col_pack       = find_col(cols, ["Pack","Case Pack","Qty per case"])
+    col_size       = find_col(cols, ["Size"])
+    col_cost       = find_col(cols, ["Cost"])
+    col_net_cost   = find_col(cols, ["Net Case Cost"])
+    col_case_qty   = find_col(cols, ["Case Qty","Case Quantity","Cases","Qty"])
+    col_inv_date   = find_col(cols, ["Invoice Date","Inv Date","Date"])
+
+    inv_df = inv_df[inv_df[col_item_upc].astype(str).apply(lambda x: len(re.sub(r"\D","", str(x))) >= 8)]
+    case_qty_num = pd.to_numeric(inv_df[col_case_qty].apply(first_int_from_text) if col_case_qty else np.nan, errors="coerce")
+    inv_df = inv_df[case_qty_num.fillna(0) > 0]
+
+    if col_inv_date:
+        inv_df["_invoice_date_parsed"] = pd.to_datetime(inv_df[col_inv_date], errors="coerce")
+    else:
+        inv_df["_invoice_date_parsed"] = pd.NaT
+    inv_df["_invoice_date"] = inv_df["_invoice_date_parsed"].dt.date
+
+    inv_tidy = pd.DataFrame()
+    inv_tidy["invoice_date"] = inv_df["_invoice_date"]
+    inv_tidy["inv_upc_raw"]  = inv_df[col_item_upc].astype(str)
+    inv_tidy["UPC"]          = inv_tidy["inv_upc_raw"].apply(normalize_invoice_upc)
+    inv_tidy["Brand"]        = inv_df[col_brand].astype(str) if col_brand else ""
+    inv_tidy["Description"]  = inv_df[col_desc].astype(str) if col_desc else ""
+    inv_tidy["Pack"]         = inv_df[col_pack].apply(first_int_from_text) if col_pack else np.nan
+    inv_tidy["Size"]         = inv_df[col_size].astype(str) if col_size else ""
+    inv_tidy["Cost"]         = inv_df[col_cost].apply(to_float) if col_cost else np.nan
+    inv_tidy["+Cost"]        = inv_df[col_net_cost].apply(to_float) if col_net_cost else inv_tidy["Cost"]
+    inv_tidy["Case Qty"]     = case_qty_num.loc[inv_df.index].astype("Int64")
+
+    inv_all = inv_tidy[~inv_tidy["UPC"].isin(UNIFIED_IGNORE_UPCS)].copy()
+    inv_all = inv_all.sort_values(["UPC","invoice_date"]).drop_duplicates(subset=["UPC"], keep="last")
+    return inv_all
+
+def process_unified(pos_csv_file, unified_files):
+    pos_df = pd.read_csv(pos_csv_file, dtype=str, keep_default_na=False, na_values=[])
+    pos_upc_col = "Upc" if "Upc" in pos_df.columns else ("UPC" if "UPC" in pos_df.columns else pos_df.columns[0])
+    pos_df["UPC_norm"] = pos_df[pos_upc_col].astype(str).apply(normalize_pos_upc)
+    pos_df["cost_qty_num"]   = pd.to_numeric(pos_df.get("cost_qty", np.nan), errors="coerce")
+    pos_df["cost_cents_num"] = pd.to_numeric(pos_df.get("cost_cents", np.nan), errors="coerce")
+    cents_col = "cents" if "cents" in pos_df.columns else next((c for c in pos_df.columns if "cent" in c.lower() and c.lower()!="cost_cents"), None)
+
+    frames = [parse_unified(f) for f in unified_files]
+    inv_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["UPC"])
+    if not inv_all.empty:
+        inv_all = inv_all.sort_values(["UPC","invoice_date"]).drop_duplicates(subset=["UPC"], keep="last")
+
+    merged = pos_df.merge(
+        inv_all[["UPC","Pack","+Cost","invoice_date","Brand","Description","Size","Cost"]],
+        left_on="UPC_norm", right_on="UPC", how="left"
+    )
+    matched = merged[~merged["UPC"].isna()].copy()
+
+    matched["new_cost_qty"]   = pd.to_numeric(matched["Pack"], errors="coerce")
+    matched.loc[matched["new_cost_qty"].isna() | (matched["new_cost_qty"]<=0), "new_cost_qty"] = 1
+    matched["new_cost_cents"] = (pd.to_numeric(matched["+Cost"], errors="coerce") * 100).round().astype("Int64")
+
+    original_pos_cols = [
+        c for c in pos_df.columns
+        if c not in ["UPC_norm","cost_qty_num","cost_cents_num","cost_qty","cost_cents"]
+    ]
+    out = matched.copy()
+    for col in original_pos_cols:
+        if col not in out.columns:
+            out[col] = ""
+
+    out["cost_qty"]   = matched["new_cost_qty"].astype(pd.Int64Dtype())
+    out["cost_cents"] = matched["new_cost_cents"].astype(pd.Int64Dtype())
+
+    full_export_df = out[original_pos_cols + ["cost_qty","cost_cents"]].copy()
+
+    qty_changed   = (matched["new_cost_qty"].astype("float64") != matched["cost_qty_num"].astype("float64"))
+    cents_changed = (matched["new_cost_cents"].astype("float64") != matched["cost_cents_num"].astype("float64"))
+    changed = matched[qty_changed | cents_changed].copy()
+    pos_update_df = full_export_df.loc[changed.index].copy()
+
     gs1 = matched.copy()
     gs1["+Cost"] = pd.to_numeric(gs1["+Cost"], errors="coerce")
-    gs1["Cost"]  = pd.to_numeric(gs1["Cost"], errors="coerce") # Unit Cost from Inv
+    gs1["Cost"]  = pd.to_numeric(gs1["Cost"], errors="coerce")
     gs1["Pack"]  = pd.to_numeric(gs1["Pack"], errors="coerce")
     gs1.loc[gs1["Pack"].isna() | (gs1["Pack"]<=0), "Pack"] = 1
-    
     gs1["Unit"]  = gs1["+Cost"] / gs1["Pack"]
-    
     gs1["D40%"]  = gs1["Unit"] / 0.6
-    gs1["40%"]   = (gs1["Cost"] / gs1["Pack"]) / 0.6 
-    
-    cents_col = "cents" if "cents" in pos_df.columns else "Price" 
-    if cents_col not in pos_df.columns: cents_col = None
-    
+    gs1["40%"]   = (gs1["Cost"] / gs1["Pack"]) / 0.6
+
     def cents_to_dollars(v):
         try:
             return float(str(v))/100.0
         except:
             return np.nan
-    
-    if cents_col:
-        gs1["$Now"] = gs1[cents_col].apply(cents_to_dollars)
-    else:
-        gs1["$Now"] = 0.0
+    gs1["$Now"] = gs1[cents_col].apply(cents_to_dollars) if cents_col else np.nan
 
     pos_unit_cost = gs1["cost_cents_num"] / 100.0
     with np.errstate(divide='ignore', invalid='ignore'):
         pos_unit = pos_unit_cost / gs1["cost_qty_num"]
         pos_d40  = pos_unit / 0.6
-        
     delta = gs1["D40%"] - pos_d40
     tol = 0.005
     gs1["Delta"] = delta.apply(lambda x: "=" if pd.notna(x) and abs(x)<tol else (round(float(x),2) if pd.notna(x) else np.nan))
@@ -345,7 +576,6 @@ def process_unified(pos_csv_file, unified_files):
     gs1_out["UPC"] = gs1_out["UPC"].astype(str).str.zfill(12)
     gs1_out = gs1_out.dropna(subset=["+Cost"]).sort_values("UPC").reset_index(drop=True)
 
-    # 4. Unmatched
     unmatched = inv_all[~inv_all["UPC"].isin(matched["UPC"])][
         ["UPC","Brand","Description","Pack","+Cost","Case Qty","invoice_date"]
     ].copy() if not inv_all.empty else pd.DataFrame()
@@ -354,6 +584,34 @@ def process_unified(pos_csv_file, unified_files):
     pos_update_df  = pos_update_df.loc[:,  ~pos_update_df.columns.duplicated()].copy()
 
     return full_export_df, pos_update_df, gs1_out, unmatched
+
+# ---------------- session state ----------------
+for k in ["full_export_df", "pos_update_df", "gs1_df", "unmatched_df", "ts"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+for k in [
+    "sg_invoice_items_df", "sg_updated_master", "sg_cost_changes",
+    "sg_not_in_master", "sg_pack_missing", "sg_pos_update", "sg_pb_missing", "sg_ts"
+]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+for k in [
+    "nv_invoice_items_df", "nv_updated_master", "nv_cost_changes",
+    "nv_not_in_master", "nv_pack_missing", "nv_pos_update", "nv_pb_missing", "nv_ts"
+]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+for k in [
+    "bt_invoice_items_df", "bt_invoice_items_dl_df", "bt_updated_master", "bt_cost_changes",
+    "bt_not_in_master", "bt_pack_missing", "bt_pos_update", "bt_pb_missing", "bt_ts"
+]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# ---------------- UI ----------------
 
 # --- HELPER: Define the missing function ---
 def load_dataframe(uploaded_file):
@@ -370,15 +628,13 @@ def load_dataframe(uploaded_file):
         st.error(f"Error loading {uploaded_file.name}: {e}")
         return None
 
-# ---------------- UI ----------------
-
-# DROPDOWN MENU CONFIGURATION
+# REPLACED: Tabs with a Dropdown Menu
 VENDOR_OPTIONS = [
     "Unified (SVMERCH)", 
     "Southern Glazer's", 
     "Nevada Beverage", 
     "Breakthru", 
-    "JC Sales"
+    "JC Sales (Coming Soon)"
 ]
 
 selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
@@ -407,7 +663,7 @@ if selected_vendor == "Unified (SVMERCH)":
 
             st.success(f"Done! FULL rows: {len(full_export_df)}  |  Only-changed: {len(pos_update_df)}  |  Unmatched: {len(unmatched)}")
 
-    if "full_export_df" in st.session_state and st.session_state["full_export_df"] is not None:
+    if st.session_state["full_export_df"] is not None:
         ts = st.session_state["ts"]
 
         col1, col2, col3 = st.columns(3)
@@ -476,6 +732,7 @@ if selected_vendor == "Southern Glazer's":
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
+                    # Logic Fix: Pass the FILE OBJECT (pricebook_csv), not a loaded dataframe
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
@@ -490,7 +747,7 @@ if selected_vendor == "Southern Glazer's":
 
                 st.success("Southern Glazer's — processing complete.")
 
-    if "sg_invoice_items_df" in st.session_state and st.session_state["sg_invoice_items_df"] is not None:
+    if st.session_state["sg_invoice_items_df"] is not None:
         sg_ts = st.session_state["sg_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
@@ -508,14 +765,15 @@ if selected_vendor == "Southern Glazer's":
         )
 
         st.subheader("Updated Master (preview)")
-        st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
-        st.download_button(
-            "⬇️ Updated Master (CSV)",
-            data=df_to_csv_bytes(st.session_state["sg_updated_master"]),
-            file_name=f"sg_updated_master_{sg_ts}.csv",
-            mime="text/csv",
-            key="sg_dl_mst"
-        )
+        if st.session_state["sg_updated_master"] is not None:
+            st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
+            st.download_button(
+                "⬇️ Updated Master (CSV)",
+                data=df_to_csv_bytes(st.session_state["sg_updated_master"]),
+                file_name=f"sg_updated_master_{sg_ts}.csv",
+                mime="text/csv",
+                key="sg_dl_mst"
+            )
         
         st.subheader("POS Update (preview)")
         if st.session_state["sg_pos_update"] is not None and not st.session_state["sg_pos_update"].empty:
@@ -530,7 +788,6 @@ if selected_vendor == "Southern Glazer's":
         else:
             st.info("No POS updates generated (pricebook missing or no matches).")
 
-        # additional tables
         if st.session_state["sg_cost_changes"] is not None and not st.session_state["sg_cost_changes"].empty:
             st.write("---")
             st.subheader("Cost Changes (Diff > 0.009)")
@@ -598,7 +855,7 @@ if selected_vendor == "Nevada Beverage":
 
                 st.success("Nevada Beverage — processing complete.")
 
-    if "nv_invoice_items_df" in st.session_state and st.session_state["nv_invoice_items_df"] is not None:
+    if st.session_state["nv_invoice_items_df"] is not None:
         nv_ts = st.session_state["nv_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
@@ -699,7 +956,7 @@ if selected_vendor == "Breakthru":
 
                 st.success("Breakthru — processing complete.")
 
-    if "bt_invoice_items_df" in st.session_state and st.session_state["bt_invoice_items_df"] is not None:
+    if st.session_state["bt_invoice_items_df"] is not None:
         bt_ts = st.session_state["bt_ts"] or datetime.now().strftime("%Y%m%d_%H%M%S")
 
         st.subheader("Invoice Items (parsed, in-invoice order)")
@@ -755,88 +1012,7 @@ if selected_vendor == "Breakthru":
             )
 
 
-# ===== JC SALES =====
-if selected_vendor == "JC Sales":
-    st.title("🛒 JC Sales Parser")
-    st.caption("Process JC Sales PDF Invoice against Master & Pricebook.")
-
-    if JCSalesParser is None:
-        st.error("⚠️ The JC Sales Parser module could not be loaded.")
-        st.info("Debug: Please ensure 'parsers/jcsales.py' exists.")
-    else:
-        jc_col1, jc_col2, jc_col3 = st.columns(3)
-        with jc_col1:
-            jc_invoice = st.file_uploader("JC Sales Invoice (PDF)", type=["pdf"], key="jc_inv")
-        with jc_col2:
-            jc_master = st.file_uploader("JC Sales Master (XLSX/CSV)", type=["xlsx", "xls", "csv"], key="jc_mst")
-        with jc_col3:
-            jc_pb = st.file_uploader("POS Pricebook (CSV)", type=["csv"], key="jc_pb")
-
-        if st.button("Process JC Sales", type="primary"):
-            if not jc_invoice or not jc_master or not jc_pb:
-                st.warning("Please upload Invoice, Master File, and Pricebook.")
-            else:
-                with st.spinner("Parsing JC Sales..."):
-                    try:
-                        # Instantiate the manually loaded class
-                        parser = JCSalesParser()
-                        
-                        # Reset file pointers
-                        jc_invoice.seek(0)
-                        jc_master.seek(0)
-                        jc_pb.seek(0)
-
-                        # Run Logic
-                        parsed_df, pos_update_df = parser.parse(jc_invoice, jc_master, jc_pb)
-                        
-                        st.session_state["jc_parsed"] = parsed_df
-                        st.session_state["jc_pos_update"] = pos_update_df
-                        
-                        inv_name = jc_invoice.name
-                        match = re.search(r"(OSI\d+)", inv_name, re.IGNORECASE)
-                        inv_num = match.group(1) if match else "Parsed_Invoice"
-                        st.session_state["jc_inv_num"] = inv_num
-                        
-                        st.success("Processing Complete!")
-                    except Exception as e:
-                        st.error(f"An error occurred: {e}")
-                        # Print full stack trace to console for debugging
-                        import traceback
-                        traceback.print_exc()
-
-        # Display Results
-        if "jc_parsed" in st.session_state and st.session_state["jc_parsed"] is not None:
-            inv_num = st.session_state.get("jc_inv_num", "Invoice")
-            
-            st.divider()
-            
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                st.subheader("Parsed Invoice (Goal Sheet)")
-                st.dataframe(st.session_state["jc_parsed"], use_container_width=True)
-                
-                # Create Excel file in memory
-                excel_buffer = BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                    st.session_state["jc_parsed"].to_excel(writer, index=False, sheet_name="Parsed")
-                
-                st.download_button(
-                    label=f"⬇️ Download parsed_{inv_num}.xlsx",
-                    data=excel_buffer.getvalue(),
-                    file_name=f"parsed_{inv_num}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-            with c2:
-                st.subheader("POS Update File")
-                st.dataframe(st.session_state["jc_pos_update"], use_container_width=True)
-                
-                # Download POS Update as CSV
-                csv_data = st.session_state["jc_pos_update"].to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label=f"⬇️ Download POS_update_{inv_num}.csv",
-                    data=csv_data,
-                    file_name=f"POS_update_{inv_num}.csv",
-                    mime="text/csv"
-                )
+# ===== JC Sales (Future) =====
+if selected_vendor == "JC Sales (Coming Soon)":
+    st.title("🛒 JC Sales Invoice Processor")
+    st.info("🚧 The JC Sales parser is currently under construction. Check back soon!")
