@@ -1029,7 +1029,7 @@ if selected_vendor == "JC Sales":
 
             # 1) Parse PDF → ITEM/DESCRIPTION/PACK/COST/UNIT + invoice number
             rows, inv_no = parser.parse(inv_pdf)
-            if rows is None or rows.empty:
+            if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
                 st.error("Could not parse any JC Sales lines.")
             else:
                 # 2) Load Master & Pricebook
