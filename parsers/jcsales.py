@@ -277,6 +277,7 @@ class JCSalesParser:
                                                 found_pack = True
                                                 break
                                     elif tok in ['PK', 'CS', 'EA', 'DZ', 'LB', 'CF']:
+                                        # Hit a Unit Measure text, stop
                                         desc_end_idx = k
                                         break
                                 
