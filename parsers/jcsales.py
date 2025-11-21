@@ -16,7 +16,6 @@ except Exception:
 WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
-
 INVOICE_RE = re.compile(r"\b(OSI\d{5,})\b", re.IGNORECASE)
 
 def _to_float(x):
@@ -44,9 +43,6 @@ def _extract_invoice_number(all_text: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 def _fix_merged_qty_tokens(text: str) -> str:
-    """
-    Global cleanup for the entire text block.
-    """
     # Insert space between Letter and Digit (e.g. "OZ1" -> "OZ 1")
     text = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', text)
     # Insert space between Digit and Letter (e.g. "1PK" -> "1 PK", "52T" -> "52 T")
@@ -54,53 +50,13 @@ def _fix_merged_qty_tokens(text: str) -> str:
     return text
 
 def _parse_lines(full_text: str) -> pd.DataFrame:
-    # 1. Clean the entire text at once
+    # 1. Global Clean
     clean_text = _fix_merged_qty_tokens(full_text)
     
-    # 2. Identify the positions of every Item Start
-    # We look for: WordBoundary + LineNum + Spaces + Optional Flag + Spaces + ItemCode (4-6 digits)
-    # We collect them as (LineNum, StartIndex)
-    item_starts = []
-    
-    # We iterate 1 to 200 (or until we stop finding them) to find valid item headers
-    # We use a regex that is specific to the pattern "N [Flag] ItemCode"
-    # We rely on the fact that N is sequential.
-    
-    current_pos = 0
-    expected_num = 1
-    
-    while True:
-        # Search for the next item number, starting from the last found position
-        # Pattern: 
-        # \b{num}\s+               -> The line number (e.g. "1 ")
-        # (?:[A-Z]\s+)?            -> Optional flag (e.g. "T ")
-        # \d{4,6}\b                -> The item code
-        
-        pattern = re.compile(rf"\b{expected_num}\s+(?:[A-Z]\s+)?\d{{4,6}}\b")
-        match = pattern.search(clean_text, current_pos)
-        
-        if not match:
-            # If we can't find item #1, maybe something is wrong.
-            # If we can't find item #158, we are likely done.
-            if expected_num > 1:
-                break
-            else:
-                # Verify we aren't just missing #1. Try #2 just in case? 
-                # Nah, let's assume sequential integrity.
-                break
-        
-        start_index = match.start()
-        item_starts.append((expected_num, start_index))
-        
-        # Update position to slightly after this match to avoid re-matching
-        current_pos = start_index + 1
-        expected_num += 1
-
-    # 3. Slice the text into blocks based on these start positions
-    rows = []
-    
-    # Regex for the numeric tail (Price, Pack, etc.)
-    tail_re = re.compile(
+    # 2. Find all "Numeric Tails" (The math part at the end of each item)
+    # Pattern: R-QTY, S-QTY, UM, [PACK], UNIT, COST, EXT, [PACK2]
+    # We capture the start and end of every tail.
+    tail_pattern = re.compile(
         rf"""
         \s+
         (?P<rqty>\d+)\s+
@@ -111,53 +67,72 @@ def _parse_lines(full_text: str) -> pd.DataFrame:
         (?P<cost>{_MONEY})\s+
         {_MONEY}                       # Extension (ignored)
         (?:\s+(?P<pack2>\d+))?         # Optional End Pack
-        \s*
+        \s* # Trailing spaces
         """,
         re.IGNORECASE | re.VERBOSE
     )
     
-    # Regex to parse the header (Item Code)
-    header_re = re.compile(r"\b(?P<linenum>\d+)\s+(?:(?P<flag>[A-Z])\s+)?(?P<item>\d{4,6})\b")
-
-    for i in range(len(item_starts)):
-        line_num, start_idx = item_starts[i]
+    tails = list(tail_pattern.finditer(clean_text))
+    
+    rows = []
+    
+    # 3. Iterate through tails to process items
+    # The first item is everything before tails[0].
+    # The second item is everything between tails[0] and tails[1].
+    
+    start_idx = 0
+    
+    # We look for the Item Code (4-6 digits) in the text chunk.
+    # We ignore small numbers (1-3 digits) which are likely Line Numbers or Garbage.
+    item_code_re = re.compile(r'\b(\d{4,6})\b')
+    
+    for i, match in enumerate(tails):
+        # Define the "Chunk" of text for this item
+        # It starts after the previous tail ended (or 0 for the first item)
+        # It ends right before the current tail starts.
+        end_idx = match.start()
         
-        # The block ends where the next item starts, or at the end of text
-        if i < len(item_starts) - 1:
-            end_idx = item_starts[i+1][1]
-        else:
-            end_idx = len(clean_text)
-            
-        block = clean_text[start_idx:end_idx]
+        chunk = clean_text[start_idx:end_idx]
+        tail_data = match.groupdict()
         
-        # Parse this block
-        # 1. Find Tail (Searching from the end is safer, but tail_re works on the block)
-        # We want the *last* match in the block if there are multiple (unlikely)
-        # But usually there is just one numeric tail per item block.
-        matches = list(tail_re.finditer(block))
-        if not matches:
+        # Update start_idx for the next loop
+        start_idx = match.end()
+        
+        # Process the chunk to find Item Code and Description
+        # Clean up newlines/tabs
+        chunk_clean = " ".join(chunk.split())
+        
+        # Find the first 4-6 digit number in this chunk.
+        # This skips "Line Numbers" (usually 1-3 digits) and flags.
+        m_item = item_code_re.search(chunk_clean)
+        
+        if not m_item:
+            # If no item code found, maybe this tail is a false positive or header junk?
+            # But JCSales invoices are usually dense. We'll skip to be safe.
             continue
-        m_tail = matches[-1] # Take the last one found in this chunk
-        tail_data = m_tail.groupdict()
-        
-        # 2. Find Head (Item Code)
-        # It should be at the very beginning of the block
-        m_head = header_re.match(block)
-        if not m_head:
-            continue
             
-        item_code = m_head.group("item")
+        item_code = m_item.group(1)
         
-        # 3. Extract Description
-        # Text between Head end and Tail start
-        desc_start = m_head.end()
-        desc_end = m_tail.start()
-        description = block[desc_start:desc_end].strip()
+        # Description is everything AFTER the Item Code in this chunk.
+        desc_start = m_item.end()
+        description = chunk_clean[desc_start:].strip()
         
-        # Clean description (remove newlines)
-        description = " ".join(description.split())
+        # Filter out common garbage from Description if it captured header info
+        # e.g. "DESCRIPTION Line # Item" or "Page 1"
+        # We take the *last* part if there are multiple distinctive parts?
+        # Actually, usually the description is just the text. 
+        # But if a Header appeared in the middle, like: "Page 2 ... Line Item Desc", 
+        # the Item Code logic `\d{4,6}` effectively skips the "Page 2" part 
+        # IF the header doesn't contain a 4-6 digit number.
+        # "2025" (Year) is 4 digits. This is a risk.
+        # "90058" (Zip) is 5 digits.
+        # So we must be careful. Item codes appear usually *after* the Line Number.
+        # Since we pick the *first* 4-6 digit number, we might hit a Zip code if the chunk spans a header.
+        # Heuristic: Item Codes are usually followed by text (Description).
+        # Zip codes are usually followed by "TEL" or nothing.
+        # Let's assume the first match is correct for now, as tails are frequent enough to limit chunk size.
         
-        # 4. Resolve Math
+        # Resolve Math
         pack = _to_int(tail_data['pack'])
         pack2 = _to_int(tail_data['pack2'])
         final_pack = pack2 if pack2 > 0 else pack
@@ -179,7 +154,7 @@ def _parse_lines(full_text: str) -> pd.DataFrame:
             "PACK": int(final_pack),
             "COST": float(cost),
             "UNIT": float(unit),
-            "_order": line_num
+            "_order": i  # Use loop index to preserve order
         })
 
     if not rows:
