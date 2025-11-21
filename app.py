@@ -1014,23 +1014,32 @@ if selected_vendor == "Breakthru":
 
 # ==== JC SALES ===============================================================
 if selected_vendor == "JC Sales":
-    st.title("JC Sales Processor")
+    st.title("JC Sales Processor (Text Paste)")
 
-    inv_pdf = st.file_uploader("Upload JC Sales invoice (PDF)", type=["pdf"], key="jc_pdf")
+    # CHANGED: Text Area instead of File Uploader for the Invoice
+    inv_text = st.text_area(
+        "Paste JC Sales Invoice Text (Select All in PDF -> Copy -> Paste)", 
+        height=300, 
+        key="jc_text"
+    )
+    
     pricebook_csv = st.file_uploader("Upload POS pricebook (CSV)", type=["csv"], key="jc_pb")
     master_xlsx = st.file_uploader("Upload JC Sales Master (XLSX)", type=["xlsx"], key="jc_master")
 
     if st.button("Process JC Sales", type="primary", key="jc_go"):
-        if not inv_pdf or not pricebook_csv or not master_xlsx:
-            st.error("Please upload the invoice PDF, pricebook CSV, and JC Sales Master XLSX.")
+        # CHANGED: Check for inv_text instead of inv_pdf
+        if not inv_text or not pricebook_csv or not master_xlsx:
+            st.error("Please paste the invoice text and upload pricebook/master files.")
         else:
             from parsers import JCSalesParser
             parser = JCSalesParser()
 
-            # 1) Parse PDF → ITEM/DESCRIPTION/PACK/COST/UNIT + invoice number
-            rows, inv_no = parser.parse(inv_pdf)
+            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT + invoice number
+            # CHANGED: Pass the text string directly
+            rows, inv_no = parser.parse(inv_text)
+            
             if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
-                st.error("Could not parse any JC Sales lines.")
+                st.error("Could not parse any JC Sales lines from the text.")
             else:
                 # 2) Load Master & Pricebook
                 try:
@@ -1091,7 +1100,6 @@ if selected_vendor == "JC Sales":
                             return u2
                         return f"No Match {item}"
 
-
                     parsed["UPC"] = parsed["ITEM"].map(resolve_upc)
 
                     # RETAIL = UNIT * 2
@@ -1112,11 +1120,6 @@ if selected_vendor == "JC Sales":
 
                     # Order & select final columns
                     parsed_out = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA"]].copy()
-
-                    # Example sanity (your two samples)
-                    # 118815 → PACK 24, COST 20.40, UNIT 0.85, RETAIL 1.70
-                    # AXION line 1 → PACK 12, COST 28.68, UNIT 2.39, RETAIL 4.78
-                    # (Values come straight from columns UNIT_P and UM_P in your PDF.)  # ref: OSI014135
 
                     # Build POS_update: keep pricebook cols, only invoice items with UPC != "No Match"
                     matched = parsed_out[~parsed_out["UPC"].astype(str).str.startswith("No Match")].copy()
@@ -1146,7 +1149,7 @@ if selected_vendor == "JC Sales":
 
                     st.success(f"JC Sales parsed: {len(parsed_out)} rows | POS updates: {len(pos_update)}")
 
-    # downloads + previews
+    # downloads + previews (unchanged logic)
     if st.session_state.get("jc_parsed_df") is not None:
         parsed_out = st.session_state["jc_parsed_df"]
         pos_update = st.session_state.get("jc_pos_update_df")
