@@ -1,13 +1,6 @@
 # parsers/jcsales.py
-#
 # JC Sales PDF parser → returns (rows_df, invoice_number)
-# rows_df columns (exactly what app.py expects from JC): ITEM, DESCRIPTION, PACK, COST, UNIT
-#
-# Handles:
-#  • ITEM can be 4–6 digits (e.g., 0522, 86624, 116870)
-#  • OCR-merged tokens before the first quantity (e.g., "16 OZ1 1 PK" → "16 OZ 1 1 PK")
-#  • Wrapped lines: if the numeric tail (R-QTY S-QTY UM #/UM UNIT_P UM_P EXT_P [PACK2]) is on the next line,
-#    we join lines until the tail is present.
+# rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
 
 from __future__ import annotations
 from typing import Tuple, List, Optional
@@ -22,10 +15,8 @@ except Exception:
 
 WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
-# Prices like 2.39, 28.68, with optional $ and thousands
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-# Full numeric tail after DESCRIPTION we want to detect on a (possibly-stitched) logical line
 _NUMERIC_TAIL = re.compile(
     rf"""
     \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
@@ -35,7 +26,6 @@ _NUMERIC_TAIL = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Main line pattern: LINE# [flag] ITEM DESCRIPTION TAIL
 PRIMARY_LINE_RE = re.compile(
     rf"""
     ^\s*
@@ -50,7 +40,6 @@ PRIMARY_LINE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Accept lines that may be missing the explicit leading line number / flag
 FALLBACK_LINE_RE = re.compile(
     rf"""
     ^\s*
@@ -93,11 +82,7 @@ def _extract_invoice_number(all_text: str) -> Optional[str]:
 
 
 def _fix_merged_qty_tokens(line: str) -> str:
-    """
-    Fix OCR-merged patterns right before R-QTY (first integer in the numeric tail).
-    - Insert a space at any letter→digit boundary.
-    Example: "... 16 OZ1 1 PK ..." → "... 16 OZ 1 1 PK ..."
-    """
+    # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
     return " ".join(line.split())
 
@@ -106,31 +91,31 @@ def _is_header_footer(l: str) -> bool:
     u = l.upper()
     if not u.strip():
         return True
-    # Skip typical JC headers / footers
     if "LINE # ITEM DESCRIPTION" in u:
-        return True
-    if "JCSALES" in u and "CUSTOMER COPY" in u:
         return True
     if "PAGE" in u and "PRINTED" in u:
         return True
     if "BILL TO:" in u or "SHIP TO:" in u:
         return True
-    if "INVOICE" in u and "OSI" in u:
-        # don't drop the line entirely; but often the useful data is elsewhere
-        return False
+    if "JCSALES" in u and "CUSTOMER COPY" in u:
+        return True
     return False
 
 
 def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
     """
-    Turn PDF text lines into logical lines that end with the full numeric tail.
-    If a candidate line looks like a JC item (has an ITEM code) but lacks the tail,
-    keep appending the next physical line until the tail is present or we hit a hard break.
+    Build logical lines that end with the full numeric tail.
+    IMPORTANT FIX: when encountering headers/footers, we DO NOT flush the buffer
+    if it doesn't yet contain a numeric tail; we simply skip the header/footer
+    and keep accumulating until the tail arrives.
     """
     logical = []
     buf = ""
 
-    def finalize_buffer():
+    def have_tail(s: str) -> bool:
+        return bool(_NUMERIC_TAIL.search(s))
+
+    def flush():
         nonlocal buf
         if buf.strip():
             logical.append(buf.strip())
@@ -140,36 +125,39 @@ def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
     while i < len(raw_lines):
         s = " ".join(raw_lines[i].split())
         i += 1
-        if _is_header_footer(s):
-            # Finish any existing buffer and skip headers/footers
-            finalize_buffer()
-            continue
 
-        # Always fix merged tokens early
+        # always fix merged tokens first
         s = _fix_merged_qty_tokens(s)
 
-        # Start or extend buffer
+        if _is_header_footer(s):
+            # if current buffer already complete, flush; else keep accumulating across the header
+            if have_tail(buf):
+                flush()
+            continue
+
+        # append to buffer
         if not buf:
             buf = s
         else:
             buf = (buf + " " + s).strip()
 
-        # If this buffer already contains a numeric tail, we can finalize it.
-        if _NUMERIC_TAIL.search(buf):
-            finalize_buffer()
-            continue
+        # if buffer now complete, flush it
+        if have_tail(buf):
+            flush()
 
-        # Otherwise keep accumulating; at EOF, finalize whatever we have.
-        if i == len(raw_lines):
-            finalize_buffer()
+        # if EOF and something remains, flush whatever is there
+        if i == len(raw_lines) and buf.strip():
+            # Only flush if it looks like an item line: contains an ITEM code and at least one money value
+            if re.search(r"\b\d{4,6}\b", buf) and re.search(r"\d+\.\d{2}", buf):
+                flush()
+            else:
+                buf = ""
 
     return logical
 
 
 def _parse_lines(text: str) -> pd.DataFrame:
-    # Split, stitch, then parse
-    raw_lines = (text or "").splitlines()
-    logical_lines = _stitch_logical_lines(raw_lines)
+    logical_lines = _stitch_logical_lines((text or "").splitlines())
 
     rows: List[dict] = []
     for idx, raw in enumerate(logical_lines):
@@ -177,7 +165,6 @@ def _parse_lines(text: str) -> pd.DataFrame:
         if not line:
             continue
 
-        # Try primary, then fallback
         m = PRIMARY_LINE_RE.match(line)
         if not m:
             m = FALLBACK_LINE_RE.match(line)
@@ -186,6 +173,7 @@ def _parse_lines(text: str) -> pd.DataFrame:
 
         item = m.group("item").strip()
         desc = m.group("desc").strip()
+
         pack = _to_int(m.group("pack"))
         pack2 = m.group("pack2")
         if pack2:
@@ -194,10 +182,9 @@ def _parse_lines(text: str) -> pd.DataFrame:
         unit = _to_float(m.group("unit"))
         cost = _to_float(m.group("cost"))
 
+        # sanity checks
         if not item or not desc or pack <= 0 or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
             continue
-
-        # sanity: if UNIT > COST (rare OCR quirk), swap
         if unit > cost:
             unit, cost = cost, unit
 
@@ -221,13 +208,8 @@ class JCSalesParser:
     name = "JC Sales"
 
     def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, Optional[str]]:
-        """
-        Returns (items_df, invoice_number)
-        items_df has columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-        """
         if pdfplumber is None:
             return pd.DataFrame(columns=WANT_COLS), None
-
         try:
             uploaded_pdf.seek(0)
         except Exception:
