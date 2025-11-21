@@ -648,7 +648,6 @@ with st.sidebar:
         "JC Sales"
     ])
     st.divider()
-    st.caption(f"Current Mode: {selected_vendor}")
 
 # ===== Unified tab =====
 if selected_vendor == "Unified (SVMERCH)":
