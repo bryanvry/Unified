@@ -1037,7 +1037,6 @@ if selected_vendor == "JC Sales":
             parser = JCSalesParser()
 
             # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT
-            # We ignore the returned invoice number since we are using the date.
             rows, _ = parser.parse(inv_text)
             
             if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
@@ -1140,9 +1139,9 @@ if selected_vendor == "JC Sales":
                     else:
                         pos_update = pd.DataFrame()
 
-                    # Name: parsed_YYYY-MM-DD.xlsx
+                    # Name: jcsales_parsed_YYYY-MM-DD.xlsx
                     current_date = datetime.now().strftime("%Y-%m-%d")
-                    parsed_xlsx_name = f"parsed_{current_date}.xlsx"
+                    parsed_xlsx_name = f"jcsales_parsed_{current_date}.xlsx"
 
                     # Save to session
                     st.session_state["jc_parsed_df"] = parsed_out
@@ -1155,7 +1154,7 @@ if selected_vendor == "JC Sales":
     if st.session_state.get("jc_parsed_df") is not None:
         parsed_out = st.session_state["jc_parsed_df"]
         pos_update = st.session_state.get("jc_pos_update_df")
-        parsed_name = st.session_state.get("jc_parsed_name") or "parsed.xlsx"
+        parsed_name = st.session_state.get("jc_parsed_name") or "jcsales_parsed.xlsx"
 
         parsed_bytes = dfs_to_xlsx_bytes({"parsed": parsed_out})
         st.download_button(
@@ -1170,7 +1169,7 @@ if selected_vendor == "JC Sales":
             st.download_button(
                 "⬇️ Download POS_update (CSV)",
                 data=df_to_csv_bytes(pos_update),
-                file_name=f"POS_update_JCSales_{parsed_name.replace('parsed_', '').replace('.xlsx', '')}.csv",
+                file_name=f"POS_update_JCSales_{parsed_name.replace('jcsales_parsed_', '').replace('.xlsx', '')}.csv",
                 mime="text/csv",
                 key="jc_dl_pos_csv",
             )
