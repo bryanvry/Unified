@@ -1016,22 +1016,12 @@ if selected_vendor == "Breakthru":
 if selected_vendor == "JC Sales":
     st.title("JC Sales Processor (Text Paste)")
 
-    # Layout: Text area on left, Invoice Number input on right
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        inv_text = st.text_area(
-            "Paste JC Sales Invoice Text (Select All in PDF -> Copy -> Paste)", 
-            height=300, 
-            key="jc_text",
-            help="Paste the full text or just the item rows here."
-        )
-    with col2:
-        manual_inv_no = st.text_input(
-            "Invoice # (for filename)", 
-            placeholder="e.g. OSI12345", 
-            key="jc_manual_inv",
-            help="If left blank, we'll try to find 'OSI...' in the text."
-        )
+    inv_text = st.text_area(
+        "Paste JC Sales Invoice Text (Select All in PDF -> Copy -> Paste)", 
+        height=300, 
+        key="jc_text",
+        help="Paste the full text or just the item rows here."
+    )
     
     colA, colB = st.columns(2)
     with colA:
@@ -1046,16 +1036,9 @@ if selected_vendor == "JC Sales":
             from parsers import JCSalesParser
             parser = JCSalesParser()
 
-            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT + detected invoice number
-            rows, detected_inv_no = parser.parse(inv_text)
-            
-            # Determine Invoice Number for Filename:
-            # 1. Use Manual Input if provided
-            # 2. Else use Detected Regex from text
-            # 3. Else fallback to "Output"
-            inv_label = manual_inv_no.strip()
-            if not inv_label:
-                inv_label = detected_inv_no if detected_inv_no != "MANUAL_PASTE" else "Output"
+            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT
+            # We ignore the returned invoice number since we are using the date.
+            rows, _ = parser.parse(inv_text)
             
             if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
                 st.error("Could not parse any JC Sales lines from the text.")
@@ -1157,8 +1140,9 @@ if selected_vendor == "JC Sales":
                     else:
                         pos_update = pd.DataFrame()
 
-                    # Name: parsed_<Invoice>.xlsx
-                    parsed_xlsx_name = f"parsed_{inv_label}.xlsx"
+                    # Name: parsed_YYYY-MM-DD.xlsx
+                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    parsed_xlsx_name = f"parsed_{current_date}.xlsx"
 
                     # Save to session
                     st.session_state["jc_parsed_df"] = parsed_out
