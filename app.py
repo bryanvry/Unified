@@ -9,7 +9,17 @@ from datetime import datetime
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
-
+# --- NEW: Force Sidebar to be smaller ---
+st.markdown(
+    """
+    <style>
+        section[data-testid="stSidebar"] {
+            width: 250px !important; # Set the width to your liking
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 # ---------------- shared helpers ----------------
 UNIFIED_IGNORE_UPCS = set(["000000000000", "003760010302", "023700052551"])
 def _build_pricebook_update(pricebook_csv_file, updated_master_df):
