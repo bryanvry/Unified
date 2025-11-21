@@ -651,7 +651,7 @@ with st.sidebar:
 
 # ===== Unified tab =====
 if selected_vendor == "Unified (SVMERCH)":
-    st.title("🧾 Unified → POS Processor")
+    st.title("Unified Processor")
     st.caption("Upload Unified invoice(s) + POS CSV to get POS updates, full export, and an audit workbook with Goal Sheet 1.")
 
     pos_file = st.file_uploader("Upload POS pricebook CSV", type=["csv"], accept_multiple_files=False, key="un_pos")
