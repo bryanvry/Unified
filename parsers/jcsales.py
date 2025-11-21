@@ -8,7 +8,7 @@
 #  • OCR-merged tokens before the first quantity (e.g., "16 OZ1 1 PK" → "16 OZ 1 1 PK")
 #  • Wrapped lines: if the numeric tail (R-QTY S-QTY UM #/UM UNIT_P UM_P EXT_P [PACK2]) is on the next line,
 #    we join lines until the tail is present.
-#
+
 from __future__ import annotations
 from typing import Tuple, List, Optional
 import re
@@ -159,9 +159,7 @@ def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
             finalize_buffer()
             continue
 
-        # Otherwise, keep looping and appending subsequent lines until tail appears.
-        # The loop above will keep accumulating until _NUMERIC_TAIL matches or we run out.
-        # At EOF, finalize whatever we have (may not parse).
+        # Otherwise keep accumulating; at EOF, finalize whatever we have.
         if i == len(raw_lines):
             finalize_buffer()
 
