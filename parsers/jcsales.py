@@ -17,63 +17,12 @@ WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-# UPDATED: Strict Tail Check
-# This regex is used ONLY to decide when a line is "complete".
-# It now enforces that a PACK count must be present either in the middle OR at the end.
-# This prevents the parser from "flushing" a line early if the pack count is trailing (e.g. ... 14.28 12).
-_NUMERIC_TAIL = re.compile(
-    rf"""
-    \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
-    (?:
-        # Option 1: Pack is in the middle (Standard)
-        # e.g. ... PK 12 2.39 28.68 28.68
-        \d+\s+{_MONEY}\s+{_MONEY}\s+{_MONEY}
-        |
-        # Option 2: Pack is at the end (The "Failing" Lines)
-        # e.g. ... PK 1.19 14.28 14.28 12
-        {_MONEY}\s+{_MONEY}\s+{_MONEY}\s+\d+
-    )
-    \s*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Parsing Regex (Permissive)
-# Once the line is stitched correctly by _NUMERIC_TAIL, this regex extracts the data.
-# We keep this flexible (optional groups) to capture data from either format.
-PRIMARY_LINE_RE = re.compile(
-    rf"""
-    ^\s*
-    \d+\s+                       # LINE #
-    (?:[A-Z]\s+)?                # optional flag (T/C)
-    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
-    (?P<desc>.+?)\s+             # DESCRIPTION (lazy)
-    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
-    (?:(?P<pack>\d+)\s+)?        # Optional Middle Pack
-    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}
-    (?:\s+(?P<pack2>\d+))?       # Optional End Pack
-    \s*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-FALLBACK_LINE_RE = re.compile(
-    rf"""
-    ^\s*
-    (?:\d+\s+[A-Z]\s+|\d+\s+)?   # optional LINE# and/or flag
-    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
-    (?P<desc>.+?)\s+
-    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
-    (?:(?P<pack>\d+)\s+)?
-    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}
-    (?:\s+(?P<pack2>\d+))?
-    \s*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
 INVOICE_RE = re.compile(r"\b(OSI\d{5,})\b", re.IGNORECASE)
 
+# Regex to find the start of a new item line
+# Matches: Start of line, Line Number, Optional Flag (T/C), Item Code (4-6 digits)
+# Example: "52 T 116870 " or "1 14158 "
+ITEM_START_RE = re.compile(r'^\s*(\d+)\s+(?:[A-Z]\s+)?(?:\d{4,6})\b', re.IGNORECASE)
 
 def _to_float(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -87,7 +36,6 @@ def _to_float(x):
     except Exception:
         return np.nan
 
-
 def _to_int(x, default=0):
     if x is None:
         return default
@@ -96,144 +44,147 @@ def _to_int(x, default=0):
     except Exception:
         return default
 
-
 def _extract_invoice_number(all_text: str) -> Optional[str]:
     m = INVOICE_RE.search(all_text or "")
     return m.group(1).upper() if m else None
 
-
 def _fix_merged_qty_tokens(line: str) -> str:
+    """
+    Fixes common OCR merging issues.
+    e.g. "OZ1" -> "OZ 1"
+    e.g. "1PK" -> "1 PK"
+    """
     # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
     # insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
     line = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', line)
     return " ".join(line.split())
 
-
-def _is_header_footer(l: str) -> bool:
-    u = l.upper()
-    if not u.strip():
-        return True
-    if "LINE # ITEM DESCRIPTION" in u:
-        return True
-    if "PAGE" in u and "PRINTED" in u:
-        return True
-    if "BILL TO:" in u or "SHIP TO:" in u:
-        return True
-    if "JCSALES" in u and "CUSTOMER COPY" in u:
-        return True
-    return False
-
-
-def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
-    """
-    Build logical lines that end with the full numeric tail.
-    """
-    logical = []
-    buf = ""
-
-    def have_tail(s: str) -> bool:
-        return bool(_NUMERIC_TAIL.search(s))
-
-    def flush():
-        nonlocal buf
-        if buf.strip():
-            logical.append(buf.strip())
-        buf = ""
-
-    i = 0
-    while i < len(raw_lines):
-        s = " ".join(raw_lines[i].split())
-        i += 1
-
-        # always fix merged tokens first
-        s = _fix_merged_qty_tokens(s)
-
-        if _is_header_footer(s):
-            # if current buffer already complete, flush; else keep accumulating across the header
-            if have_tail(buf):
-                flush()
-            continue
-
-        # append to buffer
-        if not buf:
-            buf = s
-        else:
-            buf = (buf + " " + s).strip()
-
-        # if buffer now complete, flush it
-        if have_tail(buf):
-            flush()
-
-        # if EOF and something remains, flush whatever is there
-        if i == len(raw_lines) and buf.strip():
-            # Only flush if it looks like an item line: contains an ITEM code and at least one money value
-            # AND satisfies strict tail check (so we don't flush partial garbage)
-            if re.search(r"\b\d{4,6}\b", buf) and have_tail(buf):
-                flush()
-            else:
-                buf = ""
-
-    return logical
-
-
 def _parse_lines(text: str) -> pd.DataFrame:
-    logical_lines = _stitch_logical_lines((text or "").splitlines())
+    # Split full text into physical lines
+    raw_lines = (text or "").splitlines()
+    
+    # Group physical lines into logical "Item Blocks" based on Line Numbers
+    item_blocks = []
+    current_block = []
+    
+    for line in raw_lines:
+        cleaned_line = line.strip()
+        if not cleaned_line:
+            continue
+            
+        # Check if this line starts a new item (e.g. "52 T 116870...")
+        if ITEM_START_RE.match(cleaned_line):
+            # If we have a previous block accumulating, save it
+            if current_block:
+                item_blocks.append(" ".join(current_block))
+            # Start new block
+            current_block = [cleaned_line]
+        else:
+            # This is likely a wrapped description line or garbage header
+            # We append it to the current block if one exists
+            if current_block:
+                current_block.append(cleaned_line)
+                
+    # Append the final block
+    if current_block:
+        item_blocks.append(" ".join(current_block))
 
-    rows: List[dict] = []
-    for idx, raw in enumerate(logical_lines):
-        line = raw.strip()
-        if not line:
+    # Now parse each block independently
+    rows = []
+    
+    # Regex to extract data from the TAIL of the block
+    # We look for the sequence of numbers at the end of the string.
+    # Pattern: R-QTY, S-QTY, UM, [PACK], UNIT, COST, EXT, [PACK2]
+    tail_re = re.compile(
+        rf"""
+        \s+
+        (?P<rqty>\d+)\s+
+        (?P<sqty>\d+)\s+
+        (?P<um>[A-Z]+)\s+
+        (?:(?P<pack>\d+)\s+)?          # Optional Middle Pack
+        (?P<unit>{_MONEY})\s+
+        (?P<cost>{_MONEY})\s+
+        {_MONEY}                       # Extension (ignored)
+        (?:\s+(?P<pack2>\d+))?         # Optional End Pack
+        \s*$
+        """,
+        re.IGNORECASE | re.VERBOSE
+    )
+    
+    # Regex to extract data from the HEAD of the block
+    head_re = re.compile(
+        r"""
+        ^\s*
+        (?P<linenum>\d+)\s+
+        (?:[A-Z]\s+)?
+        (?P<item>\d{4,6})\s+
+        (?P<desc_start>.*?)
+        $
+        """, 
+        re.VERBOSE
+    )
+
+    for block_idx, raw_block in enumerate(item_blocks):
+        # 1. Fix merged tokens (e.g. OZ1 -> OZ 1)
+        block = _fix_merged_qty_tokens(raw_block)
+        
+        # 2. Find the Numeric Tail
+        m_tail = tail_re.search(block)
+        if not m_tail:
+            # If we can't find the math columns, skip this block (likely header/footer garbage)
+            continue
+            
+        tail_data = m_tail.groupdict()
+        
+        # 3. Isolate the Head (Everything before the tail)
+        head_part = block[:m_tail.start()]
+        
+        # 4. Parse the Head
+        m_head = head_re.match(head_part)
+        if not m_head:
+            continue
+            
+        item_code = m_head.group("item").strip()
+        # The description is whatever is left in the head part
+        description = m_head.group("desc_start").strip()
+        
+        # 5. Resolve Pack Size
+        # Pack might be in the middle group ('pack') or at the end ('pack2')
+        pack = _to_int(tail_data['pack'])
+        pack2 = _to_int(tail_data['pack2'])
+        
+        # Use the trailing pack if present, otherwise the middle pack
+        final_pack = pack2 if pack2 > 0 else pack
+        if final_pack <= 0:
+            final_pack = 1
+            
+        # 6. Resolve Cost and Unit
+        unit = _to_float(tail_data['unit'])
+        cost = _to_float(tail_data['cost'])
+        
+        if unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
             continue
 
-        m = PRIMARY_LINE_RE.match(line)
-        if not m:
-            m = FALLBACK_LINE_RE.match(line)
-        if not m:
-            continue
-
-        item = m.group("item").strip()
-        desc = m.group("desc").strip()
-
-        # Logic: Pack might be in 'pack' (middle) or 'pack2' (end)
-        pack = _to_int(m.group("pack"), default=0)
-        pack2_val = _to_int(m.group("pack2"), default=0)
-        
-        # If the pack was at the end (pack2), use that.
-        if pack2_val > 0:
-            pack = pack2_val
-        
-        # Fallback: If absolutely no pack found (shouldn't happen with strict tail), default to 1
-        if pack <= 0:
-            pack = 1
-
-        unit = _to_float(m.group("unit"))
-        cost = _to_float(m.group("cost"))
-
-        # sanity checks
-        if not item or not desc or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
-            continue
-        
-        # Sanity Check: Ensure Unit Price is the smaller value
-        # (Sometimes columns shift, but Unit < Cost for Pack > 1)
-        if unit > cost and pack > 1:
+        # Sanity swap: if unit > cost (and pack > 1), it's likely swapped or Unit is actually Case Cost
+        if unit > cost and final_pack > 1:
             unit, cost = cost, unit
-
+            
         rows.append({
-            "ITEM": item,
-            "DESCRIPTION": desc,
-            "PACK": int(pack),
+            "ITEM": item_code,
+            "DESCRIPTION": description,
+            "PACK": int(final_pack),
             "COST": float(cost),
             "UNIT": float(unit),
-            "_order": idx
+            "_order": int(m_head.group("linenum")) # Keep line number for sorting
         })
 
     if not rows:
         return pd.DataFrame(columns=WANT_COLS)
 
+    # Sort by line number to ensure original invoice order
     df = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
     return df[WANT_COLS]
-
 
 class JCSalesParser:
     name = "JC Sales"
