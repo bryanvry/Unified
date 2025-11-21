@@ -3,7 +3,7 @@
 # rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
 
 from __future__ import annotations
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 import re
 import numpy as np
 import pandas as pd
@@ -11,8 +11,7 @@ import pandas as pd
 WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-# Regex for the text format you provided:
-# 1 14158 AXION ... 1 1 PK 2.39 28.68 28.68 12
+# Regex for the text format:
 # Line# | [Flag] | ItemCode | Desc | RQty | SQty | UM | [Pack] | Unit | Cost | Ext | [Pack2]
 LINE_RE = re.compile(
     rf"""
@@ -55,13 +54,11 @@ class JCSalesParser:
     def parse(self, text_input: str) -> Tuple[pd.DataFrame, Optional[str]]:
         """
         Parses raw text pasted from the PDF.
-        Arguments:
-            text_input: The huge string of text you pasted.
         """
         rows = []
         
         # Split input into lines
-        lines = text_input.strip().splitlines()
+        lines = (text_input or "").strip().splitlines()
         
         for line in lines:
             line = line.strip()
@@ -70,7 +67,6 @@ class JCSalesParser:
             # Try to match our clean regex
             m = LINE_RE.match(line)
             if not m:
-                # Skip headers/garbage lines that don't look like items
                 continue
                 
             data = m.groupdict()
@@ -109,8 +105,7 @@ class JCSalesParser:
         # Sort by Line Number
         df = pd.DataFrame(rows).sort_values("_order").reset_index(drop=True)
         
-        # Attempt to find Invoice Number in the text (if you paste the header too)
-        # If you only paste items, this will be None, which is fine.
+        # Attempt to find Invoice Number in the text
         inv_match = re.search(r"\b(OSI\d{5,})\b", text_input, re.IGNORECASE)
         invoice_number = inv_match.group(1).upper() if inv_match else "MANUAL_PASTE"
         
