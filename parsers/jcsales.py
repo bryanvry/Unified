@@ -1,16 +1,9 @@
 # parsers/jcsales.py
-# Robust JC Sales PDF parser that:
-#  • extracts invoice number (e.g., OSI014135)
-#  • reads each text line and parses from the RIGHT edge
-#    tail = [PACK(int), EXT_P($), UM_P($), UNIT_P($), 'PK', S_QTY(int), R_QTY(int)]
-#  • everything left of R_QTY is DESCRIPTION (with ITEM just before it)
-#  • handles optional flag after LINE ("T", "C", etc.) and squeezed spaces (e.g. "OZ1 1 PK")
-#
-# Returns: (rows_df, invoice_no)
-# rows_df columns (stable names for app): 
-#   ["LINE","ITEM","DESCRIPTION","R_QTY","S_QTY","UM","PACK","UNIT_P","UM_P","EXT_P"]
+# JC Sales PDF parser → returns (rows_df, invoice_number)
+# rows_df columns: ITEM, DESCRIPTION, PACK, COST, UNIT
 
 from __future__ import annotations
+from typing import Tuple, List, Optional
 import re
 import numpy as np
 import pandas as pd
@@ -20,237 +13,218 @@ try:
 except Exception:
     pdfplumber = None
 
+WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
-class JCSalesParser:
-    WANT_COLS = ["LINE","ITEM","DESCRIPTION","R_QTY","S_QTY","UM","PACK","UNIT_P","UM_P","EXT_P"]
+_MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-    # ---------- utils ----------
-    @staticmethod
-    def _is_money(tok: str) -> bool:
-        return bool(re.fullmatch(r"-?\d+\.\d{2}", tok.replace(",", "")))
+_NUMERIC_TAIL = re.compile(
+    rf"""
+    \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-    @staticmethod
-    def _to_float(tok):
-        if tok is None:
-            return np.nan
-        if isinstance(tok, (int, float, np.number)):
-            return float(tok)
-        t = str(tok).replace(",", "").strip()
-        m = re.search(r"-?\d+(?:\.\d+)?", t)
-        return float(m.group(0)) if m else np.nan
+PRIMARY_LINE_RE = re.compile(
+    rf"""
+    ^\s*
+    \d+\s+                       # LINE #
+    (?:[A-Z]\s+)?                # optional flag (T/C)
+    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
+    (?P<desc>.+?)\s+             # DESCRIPTION (lazy)
+    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-    @staticmethod
-    def _to_int(tok):
-        if tok is None:
-            return np.nan
-        try:
-            return int(str(tok).strip())
-        except Exception:
-            return np.nan
+FALLBACK_LINE_RE = re.compile(
+    rf"""
+    ^\s*
+    (?:\d+\s+[A-Z]\s+|\d+\s+)?   # optional LINE# and/or flag
+    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
+    (?P<desc>.+?)\s+
+    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-    @staticmethod
-    def _clean_spaces(s: str) -> str:
-        # Fix common squeeze like "OZ1 1 PK" → "OZ 1 1 PK"
-        # general rule: ensure spaces between letter→digit and digit→letter boundaries
-        if not s:
-            return s
-        s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
-        s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
-        # collapse multi-spaces
-        s = re.sub(r"\s{2,}", " ", s).strip()
-        return s
+INVOICE_RE = re.compile(r"\b(OSI\d{5,})\b", re.IGNORECASE)
 
-    # ---------- invoice number ----------
-    def _extract_invoice_no(self, page) -> str | None:
-        txt = page.extract_text() or ""
-        m = re.search(r"OSI\d{6,}", txt)
-        if m:
-            return m.group(0)
-        m2 = re.search(r"\*([A-Z]{3}\d{6,})\*", txt)
-        return m2.group(1) if m2 else None
 
-    # ---------- line parser (reverse-tail) ----------
-    def _parse_text_line(self, raw: str):
-        """
-        Robust parse of a single invoice item line.
+def _to_float(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
+    s = str(x).replace("$", "").replace(",", "").strip()
+    s = re.sub(r"[^\d.\-]", "", s)
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
-        Expected head:  LINE [FLAG]? ITEM  DESCRIPTION ...  R_QTY  S_QTY  PK  UNIT_P  UM_P  EXT_P  PACK
-        Where tail is parsed from the RIGHT to be resilient to spacing glitches.
-        """
-        if not raw or len(raw) < 12:
-            return None
 
-        line = self._clean_spaces(raw)
+def _to_int(x, default=0):
+    try:
+        return int(round(float(str(x).replace(",", "").strip())))
+    except Exception:
+        return default
 
-        # Skip obvious non-data lines
-        if "Customer Copy" in line or "Printed." in line or "Page" in line:
-            return None
-        if "LINE # ITEM DESCRIPTION" in line:
-            return None
 
-        # Tokenize
-        toks = line.split()
-        if not toks:
-            return None
+def _extract_invoice_number(all_text: str) -> Optional[str]:
+    m = INVOICE_RE.search(all_text or "")
+    return m.group(1).upper() if m else None
 
-        # Must start with LINE number
-        if not re.fullmatch(r"\d{1,3}", toks[0]):
-            return None
-        line_no = int(toks[0])
 
-        # Optional single-letter flag after LINE
-        idx = 1
-        flag = None
-        if idx < len(toks) and re.fullmatch(r"[A-Z]", toks[idx]):
-            flag = toks[idx]
-            idx += 1
+def _fix_merged_qty_tokens(line: str) -> str:
+    # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
+    line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
+    return " ".join(line.split())
 
-        # Next must be ITEM (digits; can include leading zeros, length 3–6+)
-        if idx >= len(toks) or not re.fullmatch(r"\d{3,}", toks[idx]):
-            # Some lines might merge FLAG with ITEM (rare); give up
-            return None
-        item_tok = toks[idx]
-        idx += 1
 
-        head_tokens = toks[:idx]            # LINE (and optional flag) + ITEM
-        mid_tokens  = toks[idx:]            # DESCRIPTION + numeric tail
+def _is_header_footer(l: str) -> bool:
+    u = l.upper()
+    if not u.strip():
+        return True
+    if "LINE # ITEM DESCRIPTION" in u:
+        return True
+    if "PAGE" in u and "PRINTED" in u:
+        return True
+    if "BILL TO:" in u or "SHIP TO:" in u:
+        return True
+    if "JCSALES" in u and "CUSTOMER COPY" in u:
+        return True
+    return False
 
-        if len(mid_tokens) < 7:
-            return None  # not enough tokens to hold tail
 
-        # Walk from the right to pull the tail fields
-        rtoks = mid_tokens[::-1]  # reversed
-        # PACK (int)
-        pack_tok = None
-        while rtoks and not re.fullmatch(r"\d+", rtoks[0]):
-            # sometimes a stray character or space—try to salvage
-            rtoks.pop(0)
-        if not rtoks:
-            return None
-        pack_tok = rtoks.pop(0)
+def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
+    """
+    Build logical lines that end with the full numeric tail.
+    IMPORTANT FIX: when encountering headers/footers, we DO NOT flush the buffer
+    if it doesn't yet contain a numeric tail; we simply skip the header/footer
+    and keep accumulating until the tail arrives.
+    """
+    logical = []
+    buf = ""
 
-        # EXT_P ($)
-        if not rtoks:
-            return None
-        ext_tok = rtoks.pop(0)
-        if not self._is_money(ext_tok):
-            return None
+    def have_tail(s: str) -> bool:
+        return bool(_NUMERIC_TAIL.search(s))
 
-        # UM_P ($)
-        if not rtoks:
-            return None
-        um_p_tok = rtoks.pop(0)
-        if not self._is_money(um_p_tok):
-            return None
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            logical.append(buf.strip())
+        buf = ""
 
-        # UNIT_P ($)
-        if not rtoks:
-            return None
-        unit_p_tok = rtoks.pop(0)
-        if not self._is_money(unit_p_tok):
-            return None
+    i = 0
+    while i < len(raw_lines):
+        s = " ".join(raw_lines[i].split())
+        i += 1
 
-        # 'PK' literal (can be merged nearby; we already cleaned, so look for exact 'PK')
-        um_tok = None
-        if rtoks and rtoks[0] == "PK":
-            um_tok = rtoks.pop(0)
+        # always fix merged tokens first
+        s = _fix_merged_qty_tokens(s)
+
+        if _is_header_footer(s):
+            # if current buffer already complete, flush; else keep accumulating across the header
+            if have_tail(buf):
+                flush()
+            continue
+
+        # append to buffer
+        if not buf:
+            buf = s
         else:
-            # If absent, still assume UM=PK (JC uses PK)
-            um_tok = "PK"
+            buf = (buf + " " + s).strip()
 
-        # S_QTY (int)
-        if not rtoks:
-            return None
-        s_qty_tok = rtoks.pop(0)
-        if not re.fullmatch(r"\d+", s_qty_tok):
-            return None
+        # if buffer now complete, flush it
+        if have_tail(buf):
+            flush()
 
-        # R_QTY (int)
-        if not rtoks:
-            return None
-        r_qty_tok = rtoks.pop(0)
-        if not re.fullmatch(r"\d+", r_qty_tok):
-            return None
+        # if EOF and something remains, flush whatever is there
+        if i == len(raw_lines) and buf.strip():
+            # Only flush if it looks like an item line: contains an ITEM code and at least one money value
+            if re.search(r"\b\d{4,6}\b", buf) and re.search(r"\d+\.\d{2}", buf):
+                flush()
+            else:
+                buf = ""
 
-        # Remaining (reversed) tokens form DESCRIPTION, but currently reversed.
-        desc_tokens = rtoks[::-1]  # put back in forward order
+    return logical
 
-        # Build fields
-        item = item_tok
-        desc = " ".join(desc_tokens).strip()
-        r_qty = self._to_int(r_qty_tok)
-        s_qty = self._to_int(s_qty_tok)
-        pack  = self._to_int(pack_tok)
-        unit_p = self._to_float(unit_p_tok)
-        um_p   = self._to_float(um_p_tok)
-        ext_p  = self._to_float(ext_tok)
 
-        # Sanity: derive unit if missing math consistency
-        if (np.isnan(unit_p) or unit_p is None) and (um_p is not None and not np.isnan(um_p)) and (pack not in (np.nan, 0)):
-            unit_p = um_p / float(pack)
+def _parse_lines(text: str) -> pd.DataFrame:
+    logical_lines = _stitch_logical_lines((text or "").splitlines())
 
-        # Final guards
-        if not desc or pd.isna(pack):
-            return None
+    rows: List[dict] = []
+    for idx, raw in enumerate(logical_lines):
+        line = raw.strip()
+        if not line:
+            continue
 
-        return {
-            "LINE": int(line_no),
+        m = PRIMARY_LINE_RE.match(line)
+        if not m:
+            m = FALLBACK_LINE_RE.match(line)
+        if not m:
+            continue
+
+        item = m.group("item").strip()
+        desc = m.group("desc").strip()
+
+        pack = _to_int(m.group("pack"))
+        pack2 = m.group("pack2")
+        if pack2:
+            pack = _to_int(pack2) or pack
+
+        unit = _to_float(m.group("unit"))
+        cost = _to_float(m.group("cost"))
+
+        # sanity checks
+        if not item or not desc or pack <= 0 or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
+            continue
+        if unit > cost:
+            unit, cost = cost, unit
+
+        rows.append({
             "ITEM": item,
             "DESCRIPTION": desc,
-            "R_QTY": int(r_qty) if not pd.isna(r_qty) else np.nan,
-            "S_QTY": int(s_qty) if not pd.isna(s_qty) else np.nan,
-            "UM": um_tok or "PK",
-            "PACK": int(pack) if not pd.isna(pack) else np.nan,
-            "UNIT_P": float(unit_p) if not pd.isna(unit_p) else np.nan,
-            "UM_P": float(um_p) if not pd.isna(um_p) else np.nan,
-            "EXT_P": float(ext_p) if not pd.isna(ext_p) else np.nan,
-        }
+            "PACK": int(pack),
+            "COST": float(cost),
+            "UNIT": float(unit),
+            "_order": idx
+        })
 
-    # ---------- parse entire PDF ----------
-    def parse(self, uploaded_pdf):
+    if not rows:
+        return pd.DataFrame(columns=WANT_COLS)
+
+    df = pd.DataFrame(rows).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+    return df[WANT_COLS]
+
+
+class JCSalesParser:
+    name = "JC Sales"
+
+    def parse(self, uploaded_pdf) -> Tuple[pd.DataFrame, Optional[str]]:
         if pdfplumber is None:
-            return pd.DataFrame(columns=self.WANT_COLS), None
-
+            return pd.DataFrame(columns=WANT_COLS), None
         try:
             uploaded_pdf.seek(0)
         except Exception:
             pass
 
-        rows = []
-        inv_no = None
+        fname = (getattr(uploaded_pdf, "name", "") or "").lower()
+        if not fname.endswith(".pdf"):
+            return pd.DataFrame(columns=WANT_COLS), None
+
         try:
             with pdfplumber.open(uploaded_pdf) as pdf:
-                for pi, page in enumerate(pdf.pages):
-                    if inv_no is None:
-                        inv_no = self._extract_invoice_no(page)
-
-                    txt = page.extract_text() or ""
-                    if not txt.strip():
-                        continue
-
-                    # Some PDFs duplicate "Page 1 of 4 ..." lines; skip them
-                    for raw in txt.splitlines():
-                        raw = raw.strip()
-                        if not raw:
-                            continue
-                        parsed = self._parse_text_line(raw)
-                        if parsed:
-                            rows.append(parsed)
+                texts = [(p.extract_text() or "") for p in pdf.pages]
+                all_text = "\n".join(texts)
+                df = _parse_lines(all_text)
+                inv = _extract_invoice_number(all_text)
+                return df, inv
         except Exception:
-            return pd.DataFrame(columns=self.WANT_COLS), inv_no
-
-        if not rows:
-            return pd.DataFrame(columns=self.WANT_COLS), inv_no
-
-        df = pd.DataFrame(rows, columns=self.WANT_COLS)
-
-        # Deduplicate by LINE (keep first occurrence), keep order
-        if "LINE" in df.columns:
-            df = df.sort_values(["LINE"]).drop_duplicates(subset=["LINE"], keep="first")
-
-        # Keep only plausible rows (PACK present)
-        df = df[df["PACK"].notna()].copy()
-
-        # Final tidy
-        df = df.sort_values("LINE").reset_index(drop=True)
-        return df, inv_no
+            return pd.DataFrame(columns=WANT_COLS), None
