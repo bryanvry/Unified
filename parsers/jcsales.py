@@ -33,6 +33,12 @@ LINE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE
 )
 
+def _fix_merged_qty_tokens(text: str) -> str:
+    """Fixes merged tokens like 'OZ1' -> 'OZ 1' or '1PK' -> '1 PK'"""
+    text = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', text)
+    text = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', text)
+    return text
+
 def _to_float(x):
     if x is None: return np.nan
     s = str(x).replace("$", "").replace(",", "").strip()
@@ -55,10 +61,12 @@ class JCSalesParser:
         """
         Parses raw text pasted from the PDF.
         """
-        rows = []
+        # CRITICAL FIX: Clean the text before splitting
+        clean_text = _fix_merged_qty_tokens(text_input or "")
         
+        rows = []
         # Split input into lines
-        lines = (text_input or "").strip().splitlines()
+        lines = clean_text.strip().splitlines()
         
         for line in lines:
             line = line.strip()
@@ -106,7 +114,7 @@ class JCSalesParser:
         df = pd.DataFrame(rows).sort_values("_order").reset_index(drop=True)
         
         # Attempt to find Invoice Number in the text
-        inv_match = re.search(r"\b(OSI\d{5,})\b", text_input, re.IGNORECASE)
+        inv_match = re.search(r"\b(OSI\d{5,})\b", clean_text, re.IGNORECASE)
         invoice_number = inv_match.group(1).upper() if inv_match else "MANUAL_PASTE"
         
         return df[WANT_COLS], invoice_number
