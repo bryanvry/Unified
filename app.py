@@ -775,20 +775,20 @@ if selected_vendor == "Southern Glazer's":
 
         st.subheader("Updated Master (preview)")
         if st.session_state["sg_updated_master"] is not None:
-    st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
+            st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
 
     # Convert single sheet to XLSX bytes using existing helper
-    updated_master_bytes = dfs_to_xlsx_bytes({
-        "UpdatedMaster": st.session_state["sg_updated_master"]
-    })
+            updated_master_bytes = dfs_to_xlsx_bytes({
+                "UpdatedMaster": st.session_state["sg_updated_master"]
+            })
 
-    st.download_button(
-        "⬇️ Updated Master (XLSX)",
-        data=updated_master_bytes,
-        file_name=f"sg_updated_master_{sg_ts}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="sg_dl_mst_xlsx"
-    )
+            st.download_button(
+                "⬇️ Updated Master (XLSX)",
+                data=updated_master_bytes,
+                file_name=f"sg_updated_master_{sg_ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="sg_dl_mst_xlsx"
+            )
 
         
         st.subheader("POS Update (preview)")
