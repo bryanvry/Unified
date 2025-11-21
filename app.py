@@ -628,17 +628,17 @@ def load_dataframe(uploaded_file):
         st.error(f"Error loading {uploaded_file.name}: {e}")
         return None
 
-# REPLACED: Tabs with a Dropdown Menu
-VENDOR_OPTIONS = [
-    "Unified (SVMERCH)", 
-    "Southern Glazer's", 
-    "Nevada Beverage", 
-    "Breakthru", 
-    "JC Sales"
-]
-
-selected_vendor = st.selectbox("Select Vendor Source", VENDOR_OPTIONS)
-st.divider()
+with st.sidebar:
+    st.header("Navigation")
+    selected_vendor = st.radio("Select Vendor Source", [
+        "Unified (SVMERCH)", 
+        "Southern Glazer's", 
+        "Nevada Beverage", 
+        "Breakthru", 
+        "JC Sales"
+    ])
+    st.divider()
+    st.caption(f"Current Mode: {selected_vendor}")
 
 # ===== Unified tab =====
 if selected_vendor == "Unified (SVMERCH)":
@@ -1148,8 +1148,11 @@ if selected_vendor == "JC Sales":
                     st.session_state["jc_pos_update_df"] = pos_update
                     st.session_state["jc_parsed_name"] = parsed_xlsx_name
 
-                    st.success(f"JC Sales parsed: {len(parsed_out)} rows | POS updates: {len(pos_update)} | File: {parsed_xlsx_name}")
-
+                    st.success(f"Processing Complete! File: {parsed_xlsx_name}")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Rows Parsed", len(parsed_out))
+                    m2.metric("POS Updates", len(pos_update))
+                    m3.metric("Unmatched Items", len(parsed_out) - len(pos_update) if pos_update is not None else 0)
     # downloads + previews
     if st.session_state.get("jc_parsed_df") is not None:
         parsed_out = st.session_state["jc_parsed_df"]
@@ -1176,10 +1179,10 @@ if selected_vendor == "JC Sales":
         else:
             st.info("No POS updates generated (no matches).")
 
-        st.subheader("Preview — parsed (first 100)")
-        st.dataframe(parsed_out.head(100), use_container_width=True)
+        with st.expander("Preview Parsed Data (First 100 Rows)", expanded=True):
+            st.dataframe(parsed_out.head(100), use_container_width=True)
 
         if pos_update is not None and not pos_update.empty:
-            st.subheader("Preview — POS_update (first 100)")
-            st.dataframe(pos_update.head(100), use_container_width=True)
+            with st.expander("Preview POS Updates", expanded=False):
+                st.dataframe(pos_update.head(100), use_container_width=True)
 # ==== /JC SALES ==============================================================
