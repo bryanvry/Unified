@@ -3,11 +3,11 @@
 # JC Sales PDF parser → returns (rows_df, invoice_number)
 # rows_df columns (exactly what app.py expects from JC): ITEM, DESCRIPTION, PACK, COST, UNIT
 #
-# Line format (examples):
-#   1 14158 AXION DISH LIQUID LEMON 900ML 1 1 PK 12 2.39 28.68 28.68 12
-#   100 T 118815 TOY DOCTOR PLAY SET ASST COLOR 1 1 PK 24 0.85 20.40 20.40 24
-# Problem cases (OCR-merged):
-#   "... 16 OZ1 1 PK ..."  → needs a space before the first qty: "OZ 1 1 PK"
+# Handles:
+#  • ITEM can be 4–6 digits (e.g., 0522, 86624, 116870)
+#  • OCR-merged tokens before the first quantity (e.g., "16 OZ1 1 PK" → "16 OZ 1 1 PK")
+#  • Wrapped lines: if the numeric tail (R-QTY S-QTY UM #/UM UNIT_P UM_P EXT_P [PACK2]) is on the next line,
+#    we join lines until the tail is present.
 #
 from __future__ import annotations
 from typing import Tuple, List, Optional
@@ -22,37 +22,43 @@ except Exception:
 
 WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
-_money = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
+# Prices like 2.39, 28.68, with optional $ and thousands
+_MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-PRIMARY_LINE_RE = re.compile(
+# Full numeric tail after DESCRIPTION we want to detect on a (possibly-stitched) logical line
+_NUMERIC_TAIL = re.compile(
     rf"""
-    ^\s*
-    \d+\s+                       # LINE #
-    (?:[A-Z]\s+)?                # optional flag (T/C)
-    (?P<item>\d{{5,6}})\s+       # ITEM (5 or 6 digits)
-    (?P<desc>.+?)\s+             # DESCRIPTION (greedy until numeric cols)
-    (?P<rqty>\d+)\s+             # R-QTY
-    (?P<sqty>\d+)\s+             # S-QTY
-    (?P<um>[A-Z]+)\s+            # UM (e.g., PK)
-    (?P<pack>\d+)\s+             # #/UM
-    (?P<unit>{_money})\s+        # UNIT_P
-    (?P<cost>{_money})\s+        # UM_P (case)
-    {_money}                     # EXT_P (ignored)
-    (?:\s+(?P<pack2>\d+))?       # optional trailing pack override
+    \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
     \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Main line pattern: LINE# [flag] ITEM DESCRIPTION TAIL
+PRIMARY_LINE_RE = re.compile(
+    rf"""
+    ^\s*
+    \d+\s+                       # LINE #
+    (?:[A-Z]\s+)?                # optional flag (T/C)
+    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
+    (?P<desc>.+?)\s+             # DESCRIPTION (lazy)
+    (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Accept lines that may be missing the explicit leading line number / flag
 FALLBACK_LINE_RE = re.compile(
     rf"""
     ^\s*
     (?:\d+\s+[A-Z]\s+|\d+\s+)?   # optional LINE# and/or flag
-    (?P<item>\d{{5,6}})\s+       # ITEM
+    (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
     (?P<desc>.+?)\s+
     (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+(?P<pack>\d+)\s+
-    (?P<unit>{_money})\s+(?P<cost>{_money})\s+{_money}
-    (?:\s+(?P<pack2>\d+))?
+    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}(?:\s+(?P<pack2>\d+))?
     \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -89,32 +95,91 @@ def _extract_invoice_number(all_text: str) -> Optional[str]:
 def _fix_merged_qty_tokens(line: str) -> str:
     """
     Fix OCR-merged patterns right before R-QTY (first integer in the numeric tail).
-    Typical bad case: "... 16 OZ1 1 PK ..."  → add a space before the '1'.
-    Generic rule:
-      - Insert a space between a letter and a digit when that digit is the
-        start of the R-QTY/S-QTY cluster.
-    We’ll first do a conservative pass inserting spaces at letter→digit
-    boundaries, then collapse multi-spaces.
+    - Insert a space at any letter→digit boundary.
+    Example: "... 16 OZ1 1 PK ..." → "... 16 OZ 1 1 PK ..."
     """
-    # Only add space when a letter is immediately followed by a digit.
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
-    # Also handle cases like "OZ1 1 PK" where the first digit got glued to the unit token:
-    # After the above, "OZ 1 1 PK" is fine.
     return " ".join(line.split())
 
 
+def _is_header_footer(l: str) -> bool:
+    u = l.upper()
+    if not u.strip():
+        return True
+    # Skip typical JC headers / footers
+    if "LINE # ITEM DESCRIPTION" in u:
+        return True
+    if "JCSALES" in u and "CUSTOMER COPY" in u:
+        return True
+    if "PAGE" in u and "PRINTED" in u:
+        return True
+    if "BILL TO:" in u or "SHIP TO:" in u:
+        return True
+    if "INVOICE" in u and "OSI" in u:
+        # don't drop the line entirely; but often the useful data is elsewhere
+        return False
+    return False
+
+
+def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
+    """
+    Turn PDF text lines into logical lines that end with the full numeric tail.
+    If a candidate line looks like a JC item (has an ITEM code) but lacks the tail,
+    keep appending the next physical line until the tail is present or we hit a hard break.
+    """
+    logical = []
+    buf = ""
+
+    def finalize_buffer():
+        nonlocal buf
+        if buf.strip():
+            logical.append(buf.strip())
+        buf = ""
+
+    i = 0
+    while i < len(raw_lines):
+        s = " ".join(raw_lines[i].split())
+        i += 1
+        if _is_header_footer(s):
+            # Finish any existing buffer and skip headers/footers
+            finalize_buffer()
+            continue
+
+        # Always fix merged tokens early
+        s = _fix_merged_qty_tokens(s)
+
+        # Start or extend buffer
+        if not buf:
+            buf = s
+        else:
+            buf = (buf + " " + s).strip()
+
+        # If this buffer already contains a numeric tail, we can finalize it.
+        if _NUMERIC_TAIL.search(buf):
+            finalize_buffer()
+            continue
+
+        # Otherwise, keep looping and appending subsequent lines until tail appears.
+        # The loop above will keep accumulating until _NUMERIC_TAIL matches or we run out.
+        # At EOF, finalize whatever we have (may not parse).
+        if i == len(raw_lines):
+            finalize_buffer()
+
+    return logical
+
+
 def _parse_lines(text: str) -> pd.DataFrame:
+    # Split, stitch, then parse
+    raw_lines = (text or "").splitlines()
+    logical_lines = _stitch_logical_lines(raw_lines)
+
     rows: List[dict] = []
-    for idx, raw in enumerate((text or "").splitlines()):
-        if not raw:
-            continue
-        pre = " ".join(raw.split())
-        if not pre or "LINE # ITEM DESCRIPTION" in pre.upper():
+    for idx, raw in enumerate(logical_lines):
+        line = raw.strip()
+        if not line:
             continue
 
-        # Fix common OCR merges *before* applying the regex
-        line = _fix_merged_qty_tokens(pre)
-
+        # Try primary, then fallback
         m = PRIMARY_LINE_RE.match(line)
         if not m:
             m = FALLBACK_LINE_RE.match(line)
@@ -134,7 +199,7 @@ def _parse_lines(text: str) -> pd.DataFrame:
         if not item or not desc or pack <= 0 or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
             continue
 
-        # sanity: if UNIT > COST, swap (rare OCR oddities)
+        # sanity: if UNIT > COST (rare OCR quirk), swap
         if unit > cost:
             unit, cost = cost, unit
 
