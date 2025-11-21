@@ -19,10 +19,10 @@ _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
 INVOICE_RE = re.compile(r"\b(OSI\d{5,})\b", re.IGNORECASE)
 
-# Regex to find the start of a new item line
+# RELAXED Regex to find the start of a new item line
+# Now allows for merged tokens like "52T" or "T12345" by making spaces optional (\s*)
 # Matches: Start of line, Line Number, Optional Flag (T/C), Item Code (4-6 digits)
-# Example: "52 T 116870 " or "1 14158 "
-ITEM_START_RE = re.compile(r'^\s*(\d+)\s+(?:[A-Z]\s+)?(?:\d{4,6})\b', re.IGNORECASE)
+ITEM_START_RE = re.compile(r'^\s*(\d+)\s*(?:[A-Z]\s*)?(?:\d{4,6})\b', re.IGNORECASE)
 
 def _to_float(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -53,10 +53,11 @@ def _fix_merged_qty_tokens(line: str) -> str:
     Fixes common OCR merging issues.
     e.g. "OZ1" -> "OZ 1"
     e.g. "1PK" -> "1 PK"
+    e.g. "52T" -> "52 T" (Critical for line detection)
     """
     # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
-    # insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
+    # insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK", "52T" -> "52 T")
     line = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', line)
     return " ".join(line.split())
 
@@ -69,7 +70,10 @@ def _parse_lines(text: str) -> pd.DataFrame:
     current_block = []
     
     for line in raw_lines:
-        cleaned_line = line.strip()
+        # CRITICAL FIX: Clean the line *before* checking if it's a start line.
+        # This ensures "52T" becomes "52 T" so the regex matches it.
+        cleaned_line = _fix_merged_qty_tokens(line.strip())
+        
         if not cleaned_line:
             continue
             
@@ -94,7 +98,6 @@ def _parse_lines(text: str) -> pd.DataFrame:
     rows = []
     
     # Regex to extract data from the TAIL of the block
-    # We look for the sequence of numbers at the end of the string.
     # Pattern: R-QTY, S-QTY, UM, [PACK], UNIT, COST, EXT, [PACK2]
     tail_re = re.compile(
         rf"""
@@ -126,13 +129,12 @@ def _parse_lines(text: str) -> pd.DataFrame:
     )
 
     for block_idx, raw_block in enumerate(item_blocks):
-        # 1. Fix merged tokens (e.g. OZ1 -> OZ 1)
+        # 1. Fix merged tokens again (safety check)
         block = _fix_merged_qty_tokens(raw_block)
         
         # 2. Find the Numeric Tail
         m_tail = tail_re.search(block)
         if not m_tail:
-            # If we can't find the math columns, skip this block (likely header/footer garbage)
             continue
             
         tail_data = m_tail.groupdict()
@@ -146,11 +148,9 @@ def _parse_lines(text: str) -> pd.DataFrame:
             continue
             
         item_code = m_head.group("item").strip()
-        # The description is whatever is left in the head part
         description = m_head.group("desc_start").strip()
         
         # 5. Resolve Pack Size
-        # Pack might be in the middle group ('pack') or at the end ('pack2')
         pack = _to_int(tail_data['pack'])
         pack2 = _to_int(tail_data['pack2'])
         
@@ -176,7 +176,7 @@ def _parse_lines(text: str) -> pd.DataFrame:
             "PACK": int(final_pack),
             "COST": float(cost),
             "UNIT": float(unit),
-            "_order": int(m_head.group("linenum")) # Keep line number for sorting
+            "_order": int(m_head.group("linenum"))
         })
 
     if not rows:
