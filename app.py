@@ -1016,27 +1016,46 @@ if selected_vendor == "Breakthru":
 if selected_vendor == "JC Sales":
     st.title("JC Sales Processor (Text Paste)")
 
-    # CHANGED: Text Area instead of File Uploader for the Invoice
-    inv_text = st.text_area(
-        "Paste JC Sales Invoice Text (Select All in PDF -> Copy -> Paste)", 
-        height=300, 
-        key="jc_text"
-    )
+    # Layout: Text area on left, Invoice Number input on right
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        inv_text = st.text_area(
+            "Paste JC Sales Invoice Text (Select All in PDF -> Copy -> Paste)", 
+            height=300, 
+            key="jc_text",
+            help="Paste the full text or just the item rows here."
+        )
+    with col2:
+        manual_inv_no = st.text_input(
+            "Invoice # (for filename)", 
+            placeholder="e.g. OSI12345", 
+            key="jc_manual_inv",
+            help="If left blank, we'll try to find 'OSI...' in the text."
+        )
     
-    pricebook_csv = st.file_uploader("Upload POS pricebook (CSV)", type=["csv"], key="jc_pb")
-    master_xlsx = st.file_uploader("Upload JC Sales Master (XLSX)", type=["xlsx"], key="jc_master")
+    colA, colB = st.columns(2)
+    with colA:
+        pricebook_csv = st.file_uploader("Upload POS pricebook (CSV)", type=["csv"], key="jc_pb")
+    with colB:
+        master_xlsx = st.file_uploader("Upload JC Sales Master (XLSX)", type=["xlsx"], key="jc_master")
 
     if st.button("Process JC Sales", type="primary", key="jc_go"):
-        # CHANGED: Check for inv_text instead of inv_pdf
         if not inv_text or not pricebook_csv or not master_xlsx:
             st.error("Please paste the invoice text and upload pricebook/master files.")
         else:
             from parsers import JCSalesParser
             parser = JCSalesParser()
 
-            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT + invoice number
-            # CHANGED: Pass the text string directly
-            rows, inv_no = parser.parse(inv_text)
+            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT + detected invoice number
+            rows, detected_inv_no = parser.parse(inv_text)
+            
+            # Determine Invoice Number for Filename:
+            # 1. Use Manual Input if provided
+            # 2. Else use Detected Regex from text
+            # 3. Else fallback to "Output"
+            inv_label = manual_inv_no.strip()
+            if not inv_label:
+                inv_label = detected_inv_no if detected_inv_no != "MANUAL_PASTE" else "Output"
             
             if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
                 st.error("Could not parse any JC Sales lines from the text.")
@@ -1139,17 +1158,16 @@ if selected_vendor == "JC Sales":
                         pos_update = pd.DataFrame()
 
                     # Name: parsed_<Invoice>.xlsx
-                    label = inv_no or "parsed"
-                    parsed_xlsx_name = f"parsed_{label}.xlsx"
+                    parsed_xlsx_name = f"parsed_{inv_label}.xlsx"
 
                     # Save to session
                     st.session_state["jc_parsed_df"] = parsed_out
                     st.session_state["jc_pos_update_df"] = pos_update
                     st.session_state["jc_parsed_name"] = parsed_xlsx_name
 
-                    st.success(f"JC Sales parsed: {len(parsed_out)} rows | POS updates: {len(pos_update)}")
+                    st.success(f"JC Sales parsed: {len(parsed_out)} rows | POS updates: {len(pos_update)} | File: {parsed_xlsx_name}")
 
-    # downloads + previews (unchanged logic)
+    # downloads + previews
     if st.session_state.get("jc_parsed_df") is not None:
         parsed_out = st.session_state["jc_parsed_df"]
         pos_update = st.session_state.get("jc_pos_update_df")
@@ -1168,7 +1186,7 @@ if selected_vendor == "JC Sales":
             st.download_button(
                 "⬇️ Download POS_update (CSV)",
                 data=df_to_csv_bytes(pos_update),
-                file_name="POS_update_JCSales.csv",
+                file_name=f"POS_update_JCSales_{parsed_name.replace('parsed_', '').replace('.xlsx', '')}.csv",
                 mime="text/csv",
                 key="jc_dl_pos_csv",
             )
