@@ -1,18 +1,15 @@
 # parsers/jcsales.py
-# Robust JC Sales invoice parser (PDF only)
-# Returns: (DataFrame, invoice_no)
-# DataFrame columns: ITEM, DESCRIPTION, PACK, COST, UNIT
-#
-# Parsing logic:
-#   Right-to-left fixed tail per line:
-#       ... RQTY SQTY UM UNIT_P UM_P EXT_P PACK
-#   where UM == "PK", PACK is an int, and prices are decimals.
-#   Optional single-letter flag (e.g., "T" or "C") may appear after LINE#.
-#   No dependency on detecting the header — we parse any line matching shape.
+# Robust JC Sales PDF parser
+# - Tolerates missing spaces at alpha/number boundaries (e.g., "OZ1 1 PK")
+# - Handles optional T/C flags before ITEM
+# - Preserves invoice order
+# - Returns (DataFrame, invoice_no) where DataFrame has columns:
+#   ["LINE", "ITEM", "DESCRIPTION", "R_QTY", "S_QTY", "PACK", "UNIT", "COST", "UM_P", "EXT_P"]
+#   (Downstream app builds parsed_* with UPC mapping, NOW, DELTA, etc.)
 
 from __future__ import annotations
-from typing import List, Tuple, Optional
 import re
+import numpy as np
 import pandas as pd
 
 try:
@@ -21,247 +18,127 @@ except Exception:
     pdfplumber = None
 
 
-class JCSalesParser:
-    WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
-    FOOTER_CUES = ("Customer Copy", "Printed.", "times printed", "Page ")
+LINE_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<line>\d+)\s+                                 # LINE #
+    (?:[TC]\s+)?                                     # optional T/C flag
+    (?P<item>\d{3,6})\s+                             # ITEM (3-6 digits)
+    (?P<desc>.*?)                                    # DESCRIPTION (lazy)
+    \s+(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+              # R-QTY S-QTY
+    (?:PK|CS|EA)\s+                                  # UM (we key on PK but tolerate)
+    (?P<unit>\d+(?:\.\d{2})?)\s+                     # UNIT_P
+    (?P<ump>\d+(?:\.\d{2})?)\s+                      # UM_P
+    (?P<ext>\d+(?:\.\d{2})?)\s+                      # EXT_P
+    (?P<pack>\d+)\s*                                 # #/UM  (PACK)
+    $
+    """,
+    re.VERBOSE,
+)
 
-    # ---------- helpers ----------
-    @staticmethod
-    def _is_int_tok(tok: str) -> bool:
-        return bool(re.fullmatch(r"\d+", str(tok).strip()))
 
-    @staticmethod
-    def _to_float(tok: str) -> Optional[float]:
-        s = str(tok).replace(",", "").strip()
-        try:
-            return float(s)
-        except Exception:
-            return None
+def _fix_line_glitches(s: str) -> str:
+    """
+    Heal common OCR/text-flow glitches in JC Sales lines:
+    - Insert a space at alpha→digit boundaries (e.g., 'OZ1' -> 'OZ 1')
+    - Collapse excessive spaces
+    - Ensure ' PK ' token is preserved (UM), but allow CS/EA just in case
+    """
+    if not s:
+        return ""
+    t = s
 
-    @staticmethod
-    def _clean(s: str) -> str:
-        return re.sub(r"\s{2,}", " ", str(s or "").strip())
+    # Insert a space when a letter is immediately followed by a digit (OZ1 -> OZ 1)
+    t = re.sub(r"([A-Za-z])(?=\d)", r"\1 ", t)
 
-    def _page_lines_text(self, page) -> List[str]:
-        # Try a few tolerances to be robust to spacing/kerning
-        lines = []
-        for xt, yt in [(1, 3), (2, 4), (3, 6)]:
-            txt = page.extract_text(x_tolerance=xt, y_tolerance=yt) or ""
-            for ln in txt.splitlines():
-                s = ln.strip()
-                if not s:
-                    continue
-                if any(cue in s for cue in self.FOOTER_CUES):
-                    continue
-                lines.append(s)
-        # de-dup consecutive
-        out = []
-        for s in lines:
-            if not out or out[-1] != s:
-                out.append(s)
-        return out
+    # Also insert a space when a digit is immediately followed by a letter, but
+    # do NOT split decimals like 28.68; only digit->letter (e.g., '12PK' -> '12 PK')
+    t = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", t)
 
-    def _page_lines_words(self, page) -> List[str]:
-        words = page.extract_words(keep_blank_chars=False, use_text_flow=True) or []
-        if not words:
-            return []
-        rows = {}
-        for w in words:
-            key = round(float(w["top"]) / 2.5, 1)
-            rows.setdefault(key, []).append(w)
-        lines = []
-        for k in sorted(rows.keys()):
-            ws = sorted(rows[k], key=lambda x: x["x0"])
-            s = " ".join(w["text"] for w in ws).strip()
-            if not s:
-                continue
-            if any(cue in s for cue in self.FOOTER_CUES):
-                continue
-            lines.append(s)
-        return lines
+    # Normalize PK/CS/EA casing and spacing around it
+    t = re.sub(r"\s+(PK|CS|EA)\s+", r" \1 ", t, flags=re.IGNORECASE)
 
-    def _gather_lines(self, pdf) -> List[str]:
-        all_lines = []
-        for p in pdf.pages:
-            a = self._page_lines_text(p)
-            b = self._page_lines_words(p)
-            # preserve order, drop duplicates
-            merged = list(dict.fromkeys(a + b))
-            all_lines.extend(merged)
-        return all_lines
+    # Collapse runs of spaces
+    t = re.sub(r"\s{2,}", " ", t).strip()
 
-    def _find_invoice_no(self, lines: List[str]) -> Optional[str]:
-        # e.g., "*OSI014135*" or standalone token like OSI014135
-        for ln in lines:
-            m = re.search(r"\*([A-Za-z]{3}\d{6,})\*", ln)
-            if m:
-                return m.group(1)
-        for ln in lines:
-            m = re.search(r"\b([A-Za-z]{3}\d{6,})\b", ln)
-            if m:
-                return m.group(1)
-        return None
+    return t
 
-    # ---------- core line parser ----------
-    def _parse_line_rtl(self, s: str) -> Optional[Tuple[int, int, str, int, float, float]]:
-        """
-        Parse one invoice row by scanning tokens from the right:
-          ... RQTY SQTY UM UNIT_P UM_P EXT_P PACK
-        Returns: (line_no, item, description, pack, cost(UM_P), unit(UNIT_P))
-        """
-        toks = s.split()
-        if len(toks) < 10:
-            return None
 
-        # Right tail
-        try:
-            pack = int(toks[-1])
-        except Exception:
-            return None
+def _extract_invoice_no(all_text: str) -> str | None:
+    # Look for OSI number anywhere, e.g., *OSI014135*
+    m = re.search(r"\bOSI\d+\b", all_text)
+    if m:
+        return m.group(0)
+    # Fallback: the starred version in header
+    m2 = re.search(r"\*?(OSI\d+)\*?", all_text)
+    return m2.group(1) if m2 else None
 
-        ext_p  = self._to_float(toks[-2])
-        um_p   = self._to_float(toks[-3])
-        unit_p = self._to_float(toks[-4])
-        um     = toks[-5] if len(toks) >= 5 else None
-        if None in (ext_p, um_p, unit_p) or um is None:
-            return None
-        if um.upper() != "PK":
-            return None
 
-        # S-QTY / R-QTY immediately before UM
-        if not (self._is_int_tok(toks[-6]) and self._is_int_tok(toks[-7])):
-            return None
+def _parse_page_text(txt: str) -> list[dict]:
+    rows = []
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line or len(line) < 10:
+            continue
 
-        # From left: LINE#, optional FLAG, ITEM, then DESCRIPTION ... until R-QTY
-        i = 0
-        if not self._is_int_tok(toks[i]):
-            return None
-        line_no = int(toks[i]); i += 1
+        healed = _fix_line_glitches(line)
 
-        # Optional single-letter flag (T/C/etc.)
-        if i < len(toks) and re.fullmatch(r"[A-Z]{1,2}", toks[i]):
-            i += 1
-
-        if i >= len(toks) or not self._is_int_tok(toks[i]):
-            return None
-        item = int(toks[i]); i += 1
-
-        desc_end = len(toks) - 7  # up to the token before R-QTY
-        if i >= desc_end:
-            return None
-
-        desc = self._clean(" ".join(toks[i:desc_end]))
-        if not desc:
-            return None
-
-        return (line_no, item, desc, pack, float(um_p), float(unit_p))
-
-    def _parse_line_regex(self, s: str) -> Optional[Tuple[int, int, str, int, float, float]]:
-        """
-        Regex fallback allowing commas, optional flag, and noisy desc.
-        """
-        pat = re.compile(
-            r"""^\s*
-                 (?P<line>\d+)\s+
-                 (?:(?P<flag>[A-Z]{1,2})\s+)?     # optional flag
-                 (?P<item>\d+)\s+
-                 (?P<desc>.+?)\s+
-                 (?P<rqty>\d+)\s+
-                 (?P<sqty>\d+)\s+
-                 (?P<um>[A-Za-z]+)\s+
-                 (?P<unit>[\d,]+\.\d{2})\s+
-                 (?P<ump>[\d,]+\.\d{2})\s+
-                 (?P<ext>[\d,]+\.\d{2})\s+
-                 (?P<pack>\d+)\s*$
-            """,
-            re.VERBOSE
-        )
-        m = pat.match(s)
+        m = LINE_RE.match(healed)
         if not m:
-            return None
-        if m.group("um").upper() != "PK":
-            return None
-        line_no = int(m.group("line"))
-        item = int(m.group("item"))
-        desc = self._clean(m.group("desc"))
-        unit = self._to_float(m.group("unit"))
-        ump  = self._to_float(m.group("ump"))
-        pack = int(m.group("pack"))
-        if None in (unit, ump):
-            return None
-        return (line_no, item, desc, pack, float(ump), float(unit))
+            continue
 
-    def _parse_any_line(self, s: str) -> Optional[Tuple[int, int, str, int, float, float]]:
-        # primary: strict tail; fallback: regex
-        out = self._parse_line_rtl(s)
-        if out:
-            return out
-        return self._parse_line_regex(s)
+        gd = m.groupdict()
+        try:
+            rows.append(
+                {
+                    "LINE": int(gd["line"]),
+                    "ITEM": gd["item"],
+                    "DESCRIPTION": gd["desc"].strip(),
+                    "R_QTY": int(gd["rqty"]),
+                    "S_QTY": int(gd["sqty"]),
+                    "PACK": int(gd["pack"]),
+                    "UNIT": float(gd["unit"]),
+                    "COST": float(gd["ump"]),   # UM_P is the case cost ("COST" in parsed spec)
+                    "UM_P": float(gd["ump"]),
+                    "EXT_P": float(gd["ext"]),
+                }
+            )
+        except Exception:
+            # If any cast fails, skip this line
+            continue
+    return rows
 
-    # ---------- public ----------
-    def parse(self, uploaded_file) -> Tuple[pd.DataFrame, Optional[str]]:
-        if pdfplumber is None:
-            return pd.DataFrame(columns=self.WANT_COLS), None
+
+class JCSalesParser:
+    def parse(self, uploaded_pdf) -> tuple[pd.DataFrame | None, str | None]:
+        if pdfplumber is None or uploaded_pdf is None:
+            return None, None
 
         try:
-            uploaded_file.seek(0)
+            uploaded_pdf.seek(0)
         except Exception:
             pass
 
-        name = (getattr(uploaded_file, "name", "") or "").lower()
-        if not name.endswith(".pdf"):
-            return pd.DataFrame(columns=self.WANT_COLS), None
-
-        rows = []
-        seen = set()
-        invoice_no = None
-
         try:
-            with pdfplumber.open(uploaded_file) as pdf:
-                lines = self._gather_lines(pdf)
-                invoice_no = self._find_invoice_no(lines)
+            with pdfplumber.open(uploaded_pdf) as pdf:
+                all_rows = []
+                all_text_for_inv = []
+                for page in pdf.pages:
+                    txt = page.extract_text() or ""
+                    all_text_for_inv.append(txt)
+                    all_rows.extend(_parse_page_text(txt))
 
-                # Parse ANY line that matches; don't require seeing the header
-                for ln in lines:
-                    parsed = self._parse_any_line(ln)
-                    if not parsed:
-                        continue
-                    line_no, item, desc, pack, cost, unit = parsed
-                    if line_no in seen:
-                        continue
-                    seen.add(line_no)
-                    rows.append({
-                        "LINE": line_no,
-                        "ITEM": item,
-                        "DESCRIPTION": desc,
-                        "PACK": pack,
-                        "COST": cost,   # case-pack price (UM_P)
-                        "UNIT": unit,   # unit price (UNIT_P)
-                    })
+                inv_text = "\n".join(all_text_for_inv)
+                invoice_no = _extract_invoice_no(inv_text)
+
         except Exception:
-            return pd.DataFrame(columns=self.WANT_COLS), None
+            return None, None
 
-        if not rows:
-            return pd.DataFrame(columns=self.WANT_COLS), invoice_no
+        if not all_rows:
+            return None, invoice_no
 
-        df = pd.DataFrame(rows, columns=["LINE"] + self.WANT_COLS)
-
-        # Stable sort & hard de-dup signature
-        sig = (
-            df["LINE"].astype(str) + "||" +
-            df["ITEM"].astype(str) + "||" +
-            df["DESCRIPTION"].astype(str).str.strip() + "||" +
-            df["PACK"].astype(str) + "||" +
-            df["COST"].astype(str) + "||" +
-            df["UNIT"].astype(str)
-        )
-        df = df.loc[~sig.duplicated(keep="first")].copy()
-        df.sort_values("LINE", kind="stable", inplace=True)
-        df.drop(columns=["LINE"], inplace=True)
+        # Sort by LINE to preserve invoice order and de-dup exact repeats
+        df = pd.DataFrame(all_rows)
+        df = df.sort_values(["LINE"]).drop_duplicates(subset=["LINE", "ITEM", "DESCRIPTION", "PACK", "COST"], keep="first")
         df.reset_index(drop=True, inplace=True)
-
-        return df[self.WANT_COLS], invoice_no
-
-
-# what app.py imports
-JC_SALES_PARSER = JCSalesParser()
+        return df, invoice_no
