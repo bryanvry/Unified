@@ -18,7 +18,8 @@ WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
 # UPDATED: Made the middle pack optional "(?:(?P<pack>\d+)\s+)?"
-# This allows the regex to match lines where the pack count is at the very end.
+# This allows the regex to match lines where the pack count is missing from the middle
+# and appears at the end (caught by pack2).
 _NUMERIC_TAIL = re.compile(
     rf"""
     \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
@@ -94,7 +95,7 @@ def _extract_invoice_number(all_text: str) -> Optional[str]:
 def _fix_merged_qty_tokens(line: str) -> str:
     # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
-    # insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
+    # UPDATED: insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
     line = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', line)
     return " ".join(line.split())
 
@@ -183,17 +184,15 @@ def _parse_lines(text: str) -> pd.DataFrame:
         item = m.group("item").strip()
         desc = m.group("desc").strip()
 
-        # UPDATED LOGIC: Pack might be in 'pack' (middle) or 'pack2' (end)
+        # UPDATED: Handle logic where middle pack might be missing
         pack = _to_int(m.group("pack"), default=0)
-        pack2 = m.group("pack2")
+        pack2_val = _to_int(m.group("pack2"), default=0)
         
-        # If pack2 exists, it usually overrides or is the only pack available
-        if pack2:
-            p2 = _to_int(pack2)
-            if p2 > 0:
-                pack = p2
+        # If the pack was at the end (pack2), use that.
+        if pack2_val > 0:
+            pack = pack2_val
         
-        # If pack is still 0 or missing, default to 1 to avoid division by zero later
+        # Fallback: If absolutely no pack found, default to 1 to save the row
         if pack <= 0:
             pack = 1
 
@@ -203,8 +202,8 @@ def _parse_lines(text: str) -> pd.DataFrame:
         # sanity checks
         if not item or not desc or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
             continue
-        
-        # Sometimes unit/cost are swapped in extraction or logic, ensure unit is smaller (Cost per item)
+            
+        # Ensure Unit Price is the smaller value
         if unit > cost and pack > 1:
             unit, cost = cost, unit
 
