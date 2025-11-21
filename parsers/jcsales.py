@@ -17,20 +17,30 @@ WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 
 _MONEY = r"(\$?\d{1,3}(?:,\d{3})*\.\d{2}|\$?\d+\.\d{2})"
 
-# UPDATED: Made the middle pack optional "(?:(?P<pack>\d+)\s+)?"
-# This allows the regex to match lines where the pack count is missing from the middle
-# and appears at the end (caught by pack2).
+# UPDATED: Strict Tail Check
+# This regex is used ONLY to decide when a line is "complete".
+# It now enforces that a PACK count must be present either in the middle OR at the end.
+# This prevents the parser from "flushing" a line early if the pack count is trailing (e.g. ... 14.28 12).
 _NUMERIC_TAIL = re.compile(
     rf"""
     \b(?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
-    (?:(?P<pack>\d+)\s+)?
-    (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}
-    (?:\s+(?P<pack2>\d+))?
+    (?:
+        # Option 1: Pack is in the middle (Standard)
+        # e.g. ... PK 12 2.39 28.68 28.68
+        \d+\s+{_MONEY}\s+{_MONEY}\s+{_MONEY}
+        |
+        # Option 2: Pack is at the end (The "Failing" Lines)
+        # e.g. ... PK 1.19 14.28 14.28 12
+        {_MONEY}\s+{_MONEY}\s+{_MONEY}\s+\d+
+    )
     \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Parsing Regex (Permissive)
+# Once the line is stitched correctly by _NUMERIC_TAIL, this regex extracts the data.
+# We keep this flexible (optional groups) to capture data from either format.
 PRIMARY_LINE_RE = re.compile(
     rf"""
     ^\s*
@@ -39,9 +49,9 @@ PRIMARY_LINE_RE = re.compile(
     (?P<item>\d{{4,6}})\s+       # ITEM (4–6 digits)
     (?P<desc>.+?)\s+             # DESCRIPTION (lazy)
     (?P<rqty>\d+)\s+(?P<sqty>\d+)\s+(?P<um>[A-Z]+)\s+
-    (?:(?P<pack>\d+)\s+)?
+    (?:(?P<pack>\d+)\s+)?        # Optional Middle Pack
     (?P<unit>{_MONEY})\s+(?P<cost>{_MONEY})\s+{_MONEY}
-    (?:\s+(?P<pack2>\d+))?
+    (?:\s+(?P<pack2>\d+))?       # Optional End Pack
     \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -95,7 +105,7 @@ def _extract_invoice_number(all_text: str) -> Optional[str]:
 def _fix_merged_qty_tokens(line: str) -> str:
     # insert a space at any letter→digit boundary (e.g., "OZ1" → "OZ 1")
     line = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', line)
-    # UPDATED: insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
+    # insert a space at any digit→letter boundary (e.g., "1PK" → "1 PK")
     line = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', line)
     return " ".join(line.split())
 
@@ -158,7 +168,8 @@ def _stitch_logical_lines(raw_lines: List[str]) -> List[str]:
         # if EOF and something remains, flush whatever is there
         if i == len(raw_lines) and buf.strip():
             # Only flush if it looks like an item line: contains an ITEM code and at least one money value
-            if re.search(r"\b\d{4,6}\b", buf) and re.search(r"\d+\.\d{2}", buf):
+            # AND satisfies strict tail check (so we don't flush partial garbage)
+            if re.search(r"\b\d{4,6}\b", buf) and have_tail(buf):
                 flush()
             else:
                 buf = ""
@@ -184,7 +195,7 @@ def _parse_lines(text: str) -> pd.DataFrame:
         item = m.group("item").strip()
         desc = m.group("desc").strip()
 
-        # UPDATED: Handle logic where middle pack might be missing
+        # Logic: Pack might be in 'pack' (middle) or 'pack2' (end)
         pack = _to_int(m.group("pack"), default=0)
         pack2_val = _to_int(m.group("pack2"), default=0)
         
@@ -192,7 +203,7 @@ def _parse_lines(text: str) -> pd.DataFrame:
         if pack2_val > 0:
             pack = pack2_val
         
-        # Fallback: If absolutely no pack found, default to 1 to save the row
+        # Fallback: If absolutely no pack found (shouldn't happen with strict tail), default to 1
         if pack <= 0:
             pack = 1
 
@@ -202,8 +213,9 @@ def _parse_lines(text: str) -> pd.DataFrame:
         # sanity checks
         if not item or not desc or unit is None or np.isnan(unit) or cost is None or np.isnan(cost):
             continue
-            
-        # Ensure Unit Price is the smaller value
+        
+        # Sanity Check: Ensure Unit Price is the smaller value
+        # (Sometimes columns shift, but Unit < Cost for Pack > 1)
         if unit > cost and pack > 1:
             unit, cost = cost, unit
 
