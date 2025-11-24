@@ -64,8 +64,15 @@ class BreakthruParser:
         c_qty   = _find_col(cols, ["Quantity", "Qty"])
         c_itemn = _find_col(cols, OPT_ITEMNUM)
 
+        # NEW: fallback – if we can't find a UPC column at all, use Item Number as UPC
+        used_item_as_upc = False
+        if not c_upc and c_itemn:
+            c_upc = c_itemn
+            used_item_as_upc = True
+
         if not all([c_upc, c_name, c_net, c_qty]):
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
+
 
         qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
         net = (
@@ -91,10 +98,17 @@ class BreakthruParser:
         else:
             out["Item Number"] = ""
 
+        # NEW: row-level fallback – if UPC is blank but Item Number exists, use Item Number digits
+        if c_itemn:
+            itemnum_series = df[c_itemn].astype(str).str.strip()
+            mask_blank_upc = out["UPC"].eq("") & itemnum_series.ne("")
+            out.loc[mask_blank_upc, "UPC"] = itemnum_series[mask_blank_upc].map(_norm12)
+
         # Filter invalid rows for processing
         out = out[
             out["Cases"].gt(0) & out["Cost"].ge(0.01)
         ].copy()
+
 
         if out.empty:
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
