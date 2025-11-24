@@ -1052,11 +1052,9 @@ if selected_vendor == "Breakthru":
                 # Breakthru-specific master updater:
                 # - Uses UPC when present
                 # - Falls back to Item Number (you manually put Item Number into Master['Invoice UPC'] for those rows)
-                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = (
-                    _update_master_from_invoice_bt(
-                        master_xlsx,
-                        invoice_items_raw,
-                    )
+                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice_bt(
+                    master_xlsx,
+                    invoice_items_raw,
                 )
 
                 # Build a display/download copy where:
@@ -1147,92 +1145,6 @@ if selected_vendor == "Breakthru":
                 data=df_to_csv_bytes(st.session_state["bt_pb_missing"]),
                 file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
                 key="bt_dl_pb_missing",
-            )
-
-        
-        
-
-
-        st.subheader("POS Update (preview)")
-        if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
-            st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
-            st.download_button(
-                "⬇️ POS Update (CSV)",
-                data=df_to_csv_bytes(st.session_state["bt_pos_update"]),
-                file_name=f"bt_pos_update_{bt_ts}.csv",
-                key="bt_dl_pos",
-            )
-        else:
-            st.info("No POS updates generated.")
-
-        if st.session_state["bt_cost_changes"] is not None and not st.session_state["bt_cost_changes"].empty:
-            st.write("---")
-            st.subheader("Cost Changes (Diff > 0.009)")
-            st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
-
-        if st.session_state["bt_not_in_master"] is not None and not st.session_state["bt_not_in_master"].empty:
-            st.write("---")
-            st.subheader("Items NOT in Master")
-            st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
-
-        if st.session_state["bt_pb_missing"] is not None and not st.session_state["bt_pb_missing"].empty:
-            st.write("---")
-            st.subheader("Items in Invoice but NOT in Pricebook")
-            st.dataframe(st.session_state["bt_pb_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Pricebook Missing (CSV)",
-                data=df_to_csv_bytes(st.session_state["bt_pb_missing"]),
-                file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
-                key="bt_dl_pb_missing",
-            )
-
-                st.subheader("Updated Master (preview)")
-        if st.session_state["bt_updated_master"] is not None:
-            st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
-
-            bt_updated_master_bytes = dfs_to_xlsx_bytes({
-                "UpdatedMaster": st.session_state["bt_updated_master"]
-            })
-
-            st.download_button(
-                "⬇️ Updated Master (XLSX)",
-                data=bt_updated_master_bytes,
-                file_name=f"bt_updated_master_{bt_ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="bt_dl_master_xlsx"
-            )
-
-        st.subheader("POS Update (preview)")
-        if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
-            st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
-            st.download_button(
-                "⬇️ POS Update (CSV)",
-                data=df_to_csv_bytes(st.session_state["bt_pos_update"]),
-                file_name=f"bt_pos_update_{bt_ts}.csv",
-                key="bt_dl_pos"
-            )
-        else:
-            st.info("No POS updates generated.")
-
-        if st.session_state["bt_cost_changes"] is not None and not st.session_state["bt_cost_changes"].empty:
-            st.write("---")
-            st.subheader("Cost Changes (Diff > 0.009)")
-            st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
-
-        if st.session_state["bt_not_in_master"] is not None and not st.session_state["bt_not_in_master"].empty:
-            st.write("---")
-            st.subheader("Items NOT in Master")
-            st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
-
-        if st.session_state["bt_pb_missing"] is not None and not st.session_state["bt_pb_missing"].empty:
-            st.write("---")
-            st.subheader("Items in Invoice but NOT in Pricebook")
-            st.dataframe(st.session_state["bt_pb_missing"], use_container_width=True)
-            st.download_button(
-                "⬇️ Pricebook Missing (CSV)",
-                data=df_to_csv_bytes(st.session_state["bt_pb_missing"]),
-                file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
-                key="bt_dl_pb_missing"
             )
 
 
