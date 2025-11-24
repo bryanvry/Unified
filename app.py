@@ -987,18 +987,11 @@ if selected_vendor == "Breakthru":
         st.subheader("Updated Master (preview)")
         if st.session_state["bt_updated_master"] is not None:
             st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
-
-            # NEW: export Updated Master as XLSX instead of CSV
-            bt_updated_master_bytes = dfs_to_xlsx_bytes({
-                "UpdatedMaster": st.session_state["bt_updated_master"]
-            })
-
             st.download_button(
-                "⬇️ Updated Master (XLSX)",
-                data=bt_updated_master_bytes,
-                file_name=f"bt_updated_master_{bt_ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="bt_dl_master_xlsx",
+                "⬇️ Updated Master (CSV)",
+                data=df_to_csv_bytes(st.session_state["bt_updated_master"]),
+                file_name=f"bt_updated_master_{bt_ts}.csv",
+                key="bt_dl_master"
             )
         
         st.subheader("POS Update (preview)")
