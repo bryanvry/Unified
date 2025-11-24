@@ -1007,7 +1007,6 @@ if selected_vendor == "Nevada Beverage":
                 key="nv_dl_pb_missing"
             )
 
-
 # ===== Breakthru =====
 if selected_vendor == "Breakthru":
     st.title("Breakthru Processor")
@@ -1116,6 +1115,43 @@ if selected_vendor == "Breakthru":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="bt_dl_master_xlsx",
             )
+
+        st.subheader("POS Update (preview)")
+        if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
+            st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
+            st.download_button(
+                "⬇️ POS Update (CSV)",
+                data=df_to_csv_bytes(st.session_state["bt_pos_update"]),
+                file_name=f"bt_pos_update_{bt_ts}.csv",
+                key="bt_dl_pos",
+            )
+        else:
+            st.info("No POS updates generated.")
+
+        if st.session_state["bt_cost_changes"] is not None and not st.session_state["bt_cost_changes"].empty:
+            st.write("---")
+            st.subheader("Cost Changes (Diff > 0.009)")
+            st.dataframe(st.session_state["bt_cost_changes"], use_container_width=True)
+
+        if st.session_state["bt_not_in_master"] is not None and not st.session_state["bt_not_in_master"].empty:
+            st.write("---")
+            st.subheader("Items NOT in Master")
+            st.dataframe(st.session_state["bt_not_in_master"], use_container_width=True)
+
+        if st.session_state["bt_pb_missing"] is not None and not st.session_state["bt_pb_missing"].empty:
+            st.write("---")
+            st.subheader("Items in Invoice but NOT in Pricebook")
+            st.dataframe(st.session_state["bt_pb_missing"], use_container_width=True)
+            st.download_button(
+                "⬇️ Pricebook Missing (CSV)",
+                data=df_to_csv_bytes(st.session_state["bt_pb_missing"]),
+                file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
+                key="bt_dl_pb_missing",
+            )
+
+        
+        
+
 
         st.subheader("POS Update (preview)")
         if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
