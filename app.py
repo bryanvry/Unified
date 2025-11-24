@@ -1046,7 +1046,7 @@ if selected_vendor == "Breakthru":
                 else pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
             )
 
-                        if invoice_items_raw.empty:
+            if invoice_items_raw.empty:
                 st.error("Could not parse any Breakthru items. Check the file.")
             else:
                 # Breakthru-specific master updater:
@@ -1057,75 +1057,14 @@ if selected_vendor == "Breakthru":
                     invoice_items_raw,
                 )
 
-                # Build a display/download copy:
-                # For rows with missing UPC Number(Each), use Item Number to look up
-                # Full Barcode from Master['Invoice UPC'] and display that as UPC.
+                # Build a display/download copy where:
+                # For rows with blank UPC but a non-blank Item Number, show Item Number in the UPC column
                 inv_display = invoice_items_raw.copy()
-
-                if updated_master is not None and not updated_master.empty:
-                    mast = updated_master.copy()
-
-                    # Resolve column names on the master
-                    inv_upc_col = _resolve_col(mast, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
-                    fb_col      = _resolve_col(mast, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
-
-                    # Normalize master Invoice UPC and Full Barcode
-                    mast["__inv_norm"] = mast[inv_upc_col].astype(str).map(_norm_upc_12)
-                    mast["__fb_norm"]  = mast[fb_col].astype(str).map(_norm_upc_12)
-
-                    key_to_fb = dict(zip(mast["__inv_norm"], mast["__fb_norm"]))
-
-                    # Compute normalized keys on the invoice side
-                    inv_display["__upc_norm"] = inv_display["UPC"].astype(str).map(
-                        lambda x: _norm_upc_12(x) if str(x).strip() else ""
-                    )
-
-                    if "Item Number" in inv_display.columns:
-                        inv_display["__item_norm"] = inv_display["Item Number"].astype(str).map(
-                            lambda x: _norm_upc_12(x) if str(x).strip() else ""
-                        )
-                    else:
-                        inv_display["__item_norm"] = ""
-
+                if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
                     upc_str = inv_display["UPC"].astype(str).str.strip()
-                    item_str = (
-                        inv_display["Item Number"].astype(str).str.strip()
-                        if "Item Number" in inv_display.columns
-                        else ""
-                    )
+                    item_str = inv_display["Item Number"].astype(str).str.strip()
                     mask_blank_upc = upc_str.eq("") & item_str.ne("")
-
-                    # Lookup key: use UPC when present, else Item Number
-                    inv_display["__lookup"] = inv_display["__upc_norm"]
-                    inv_display.loc[mask_blank_upc, "__lookup"] = inv_display.loc[mask_blank_upc, "__item_norm"]
-
-                    # Map to Full Barcode from master
-                    inv_display["__fb_from_master"] = inv_display["__lookup"].map(key_to_fb)
-
-                    # Use Full Barcode from master for rows that originally had blank UPC
-                    mask_use_fb = mask_blank_upc & inv_display["__fb_from_master"].astype(str).str.strip().ne("")
-                    inv_display.loc[mask_use_fb, "UPC"] = inv_display.loc[mask_use_fb, "__fb_from_master"]
-
-                    # If still blank but Item Number exists and master had no Full Barcode,
-                    # fall back to showing Item Number as UPC
-                    if "Item Number" in inv_display.columns:
-                        upc_after = inv_display["UPC"].astype(str).str.strip()
-                        mask_still_blank = upc_after.eq("") & inv_display["Item Number"].astype(str).str.strip().ne("")
-                        inv_display.loc[mask_still_blank, "UPC"] = inv_display.loc[mask_still_blank, "Item Number"]
-
-                    # Drop helper columns
-                    inv_display = inv_display.drop(
-                        columns=["__upc_norm","__item_norm","__lookup","__fb_from_master"],
-                        errors="ignore",
-                    )
-                else:
-                    # Fallback: if we couldn't load master, fall back to old behavior:
-                    # show Item Number where UPC is blank
-                    if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
-                        upc_str = inv_display["UPC"].astype(str).str.strip()
-                        item_str = inv_display["Item Number"].astype(str).str.strip()
-                        mask_blank_upc = upc_str.eq("") & item_str.ne("")
-                        inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
+                    inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
 
                 # POS update from master (optional)
                 pos_update = None
