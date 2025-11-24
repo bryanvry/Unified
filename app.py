@@ -306,40 +306,121 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
 
 def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     """
-    Breakthru variant: update by Invoice UPC first, then try Full Barcode for any still-unmatched rows.
-    `invoice_df` must have columns: UPC, Item Name, Cost, Cases.
-    UPC may be either Invoice UPC or Full Barcode (for rows where we filled from Item Number→FB).
+    Breakthru variant:
+
+    - invoice_df comes from BreakthruParser and has columns:
+        UPC, Item Name, Cost, Cases, Item Number (optional)
+      Where:
+        * UPC is from "UPC Number(Each)" (may be blank)
+        * Item Number is the Breakthru item code
+
+    - Matching logic:
+        * If UPC is present → use UPC (normalized to 12 digits) as the key.
+        * If UPC is blank but Item Number is present → use Item Number (normalized) as the key.
+          You manually copy this Item Number into Master['Invoice UPC'] for those rows.
+
+    - Master:
+        * 'Invoice UPC' holds either invoice UPC or Item Number (for blank UPC invoices).
+        * 'Full Barcode' holds the canonical UPC.
+      We still keep a second pass that can match on Full Barcode if needed.
     """
-    invoice_df = _ensure_invoice_cols(invoice_df)
-    if invoice_df.empty:
+    if invoice_df is None or invoice_df.empty:
         return (None, None, None, None, None)
 
+    df = invoice_df.copy()
+
+    # ---- Pick invoice columns (case-insensitive helpers) ----
+    cols = list(df.columns)
+
+    def _pick_col(candidates, default):
+        low = [str(c).lower() for c in cols]
+        for cand in candidates:
+            if cand.lower() in low:
+                return cols[low.index(cand.lower())]
+        return default if default in df.columns else None
+
+    upc_col      = _pick_col(["UPC"], "UPC")
+    name_col_inv = _pick_col(["Item Name", "Description", "Item Description"], "Item Name")
+    cost_col     = _pick_col(["Cost"], "Cost")
+    cases_col    = _pick_col(["Cases", "Qty", "Quantity"], "Cases")
+    itemnum_col  = _pick_col(["Item Number", "ItemNumber", "Item No", "Item #", "Item"], "Item Number")
+
+    if not upc_col or not name_col_inv or not cost_col or not cases_col:
+        return (None, None, None, None, None)
+
+    # ---- Normalize invoice numeric fields ----
+    df[upc_col] = df[upc_col].astype(str).fillna("")
+    if itemnum_col and itemnum_col in df.columns:
+        df[itemnum_col] = df[itemnum_col].astype(str).fillna("")
+    else:
+        itemnum_col = None
+
+    df[cost_col] = pd.to_numeric(df[cost_col], errors="coerce")
+    df[cases_col] = pd.to_numeric(df[cases_col], errors="coerce").fillna(0).astype(int)
+
+    # ---- Build lookup key: prefer UPC, else Item Number ----
+    df["__inv_upc_norm"] = df[upc_col].astype(str).map(
+        lambda x: _norm_upc_12(x) if str(x).strip() else ""
+    )
+    if itemnum_col:
+        df["__itemnorm"] = df[itemnum_col].astype(str).map(
+            lambda x: _norm_upc_12(x) if str(x).strip() else ""
+        )
+    else:
+        df["__itemnorm"] = ""
+
+    df["__lookup"] = df["__inv_upc_norm"]
+    mask_blank = df["__lookup"].eq("") & df["__itemnorm"].ne("")
+    df.loc[mask_blank, "__lookup"] = df.loc[mask_blank, "__itemnorm"]
+
+    # Keep only rows with a usable key, non-null cost, and Cases > 0
+    df_valid = df[
+        df["__lookup"].ne("")
+        & df[cost_col].notna()
+        & df[cases_col].gt(0)
+    ].copy()
+
+    if df_valid.empty:
+        return (None, None, None, None, None)
+
+    # ---- Aggregate by lookup key ----
+    invoice_unique = (
+        df_valid
+        .groupby("__lookup", as_index=False)
+        .agg({
+            name_col_inv: "last",
+            cost_col: "last",
+            cases_col: "sum",
+        })
+        .rename(columns={
+            "__lookup": "Lookup UPC",
+            name_col_inv: "Item Name",
+            cost_col: "Cost",
+            cases_col: "Cases",
+        })
+    )
+
+    inv_map = invoice_unique.set_index("Lookup UPC")[["Item Name", "Cost", "Cases"]].to_dict(orient="index")
+
+    # ---- Load and normalize Master ----
     master = pd.read_excel(master_xlsx, dtype=str).fillna("")
 
     name_col         = _resolve_col(master, ["Name","NAME","name"], "Name")
     pack_col         = _resolve_col(master, ["Pack","PACK","pack"], "Pack")
-    cases_col        = _resolve_col(master, ["Cases","CASES","cases"], "Cases")
+    cases_col_m      = _resolve_col(master, ["Cases","CASES","cases"], "Cases")
     total_col        = _resolve_col(master, ["Total","TOTAL","total"], "Total")
     cost_dollar_col  = _resolve_col(master, ["Cost $","Cost$","COST $","cost $"], "Cost $")
     cost_cent_col    = _resolve_col(master, ["Cost ¢","Cost cents","Cost c","COST ¢"], "Cost ¢")
     inv_upc_col      = _resolve_col(master, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
     full_barcode_col = _resolve_col(master, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
 
-    # normalize numeric columns
     master[pack_col]        = master[pack_col].apply(_to_int_safe)
-    master[cases_col]       = master[cases_col].apply(_to_int_safe)
+    master[cases_col_m]     = master[cases_col_m].apply(_to_int_safe)
     master[total_col]       = master[total_col].apply(_to_float_safe)
     master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
     master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
 
-    invoice_unique = (
-        invoice_df
-        .groupby("UPC", as_index=False)
-        .agg({"Item Name":"last","Cost":"last","Cases":"sum"})
-    )
-    inv_map = invoice_unique.set_index("UPC")[["Item Name","Cost","Cases"]].to_dict(orient="index")
-
-    # Build lookup maps for master on both keys (normalized 12-digit)
+    # Build normalized maps for Invoice UPC and Full Barcode
     master["__inv_norm"] = master[inv_upc_col].map(_norm_upc_12)
     master["__fb_norm"]  = master[full_barcode_col].map(_norm_upc_12)
 
@@ -358,19 +439,19 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     updated = master.copy()
     matched_upcs = set()
 
-    # pass 1: try Invoice UPC
-    for upc, rec in inv_map.items():
-        u = _norm_upc_12(upc)
+    # ---- Pass 1: match on Invoice UPC (including Item Number-based Invoice UPC) ----
+    for key, rec in inv_map.items():
+        u = _norm_upc_12(key)
         idxs = by_inv.get(u, [])
         if idxs:
             matched_upcs.add(u)
             for idx in idxs:
-                old_cost = float(updated.at[idx, cost_dollar_col])
-                new_cost = float(rec["Cost"])
+                old_cost  = float(updated.at[idx, cost_dollar_col])
+                new_cost  = float(rec["Cost"])
                 new_cases = int(rec["Cases"])
-                pack_val = int(updated.at[idx, pack_col])
+                pack_val  = int(updated.at[idx, pack_col])
 
-                updated.at[idx, cases_col]       = new_cases
+                updated.at[idx, cases_col_m]     = new_cases
                 updated.at[idx, total_col]       = float(pack_val * new_cases)
                 updated.at[idx, cost_dollar_col] = new_cost
                 updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
@@ -378,33 +459,33 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
                 if abs(old_cost - new_cost) > 1e-6:
                     changed_cost_rows.append({
                         inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col: updated.at[idx, name_col],
+                        name_col:    updated.at[idx, name_col],
                         "Old Cost $": old_cost,
-                        "New Cost $": new_cost
+                        "New Cost $": new_cost,
                     })
                 if new_cases > 0 and pack_val == 0:
                     pack_missing_on_added_rows.append({
                         inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col: updated.at[idx, name_col],
-                        "Cases": new_cases,
-                        "Pack": pack_val
+                        name_col:    updated.at[idx, name_col],
+                        "Cases":     new_cases,
+                        "Pack":      pack_val,
                     })
 
-    # pass 2: try Full Barcode for those not matched via Invoice UPC
-    for upc, rec in inv_map.items():
-        u = _norm_upc_12(upc)
+    # ---- Pass 2: match on Full Barcode for any remaining keys ----
+    for key, rec in inv_map.items():
+        u = _norm_upc_12(key)
         if u in matched_upcs:
             continue
         idxs = by_fb.get(u, [])
         if idxs:
             matched_upcs.add(u)
             for idx in idxs:
-                old_cost = float(updated.at[idx, cost_dollar_col])
-                new_cost = float(rec["Cost"])
+                old_cost  = float(updated.at[idx, cost_dollar_col])
+                new_cost  = float(rec["Cost"])
                 new_cases = int(rec["Cases"])
-                pack_val = int(updated.at[idx, pack_col])
+                pack_val  = int(updated.at[idx, pack_col])
 
-                updated.at[idx, cases_col]       = new_cases
+                updated.at[idx, cases_col_m]     = new_cases
                 updated.at[idx, total_col]       = float(pack_val * new_cases)
                 updated.at[idx, cost_dollar_col] = new_cost
                 updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
@@ -412,35 +493,35 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
                 if abs(old_cost - new_cost) > 1e-6:
                     changed_cost_rows.append({
                         inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col: updated.at[idx, name_col],
+                        name_col:    updated.at[idx, name_col],
                         "Old Cost $": old_cost,
-                        "New Cost $": new_cost
+                        "New Cost $": new_cost,
                     })
                 if new_cases > 0 and pack_val == 0:
                     pack_missing_on_added_rows.append({
                         inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col: updated.at[idx, name_col],
-                        "Cases": new_cases,
-                        "Pack": pack_val
+                        name_col:    updated.at[idx, name_col],
+                        "Cases":     new_cases,
+                        "Pack":      pack_val,
                     })
 
-    # anything still unmatched → not in master
-    for upc, rec in inv_map.items():
-        u = _norm_upc_12(upc)
+    # ---- Anything still unmatched → "not in master" ----
+    for key, rec in inv_map.items():
+        u = _norm_upc_12(key)
         if u not in matched_upcs:
             not_in_master_rows.append({
                 "Lookup UPC": u,
-                "Item Name": rec.get("Item Name",""),
-                "Cost": rec.get("Cost",""),
-                "Cases": rec.get("Cases",""),
+                "Item Name":  rec.get("Item Name", ""),
+                "Cost":       rec.get("Cost", ""),
+                "Cases":      rec.get("Cases", ""),
             })
 
     return (
-        updated.drop(columns=["__inv_norm","__fb_norm"]),
+        updated.drop(columns=["__inv_norm", "__fb_norm"], errors="ignore"),
         pd.DataFrame(changed_cost_rows),
         pd.DataFrame(not_in_master_rows),
         pd.DataFrame(pack_missing_on_added_rows),
-        invoice_unique
+        invoice_unique,
     )
 
 # ---------------- Unified functions ----------------
@@ -934,7 +1015,7 @@ if selected_vendor == "Breakthru":
     master_xlsx = st.file_uploader("Upload Master workbook (.xlsx)", type=["xlsx"], key="bt_master")
     pricebook_csv = st.file_uploader("Upload pricebook CSV (optional for POS update)", type=["csv"], key="bt_pb")
 
-    if st.button("Process Breakthru", type="primary"):
+        if st.button("Process Breakthru", type="primary"):
         if not inv_files or not master_xlsx:
             st.error("Please upload at least one Breakthru invoice and the Master workbook.")
         else:
@@ -945,23 +1026,42 @@ if selected_vendor == "Breakthru":
                 df = bt_parser.parse(f)
                 if not df.empty:
                     parts.append(df)
-            invoice_items_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["UPC","Item Name","Cost","Cases"])
-            invoice_items_df = _ensure_invoice_cols(invoice_items_df)
 
-            if invoice_items_df.empty:
+            # Use the raw parser output so we KEEP Item Number and rows with blank UPC
+            invoice_items_raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+                columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"]
+            )
+
+            if invoice_items_raw.empty:
                 st.error("Could not parse any Breakthru items. Check the file.")
             else:
-                # Logic Fix: Reverted to using your existing helper
-                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
-                
+                # Breakthru-specific master updater:
+                # - Uses UPC when present
+                # - Falls back to Item Number (you manually put Item Number into Master['Invoice UPC'] for those rows)
+                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice_bt(
+                    master_xlsx,
+                    invoice_items_raw
+                )
+
+                # Build a display/download copy where:
+                # For rows with blank UPC but a non-blank Item Number, show Item Number in the UPC column
+                inv_display = invoice_items_raw.copy()
+                if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
+                    upc_str = inv_display["UPC"].astype(str).str.strip()
+                    item_str = inv_display["Item Number"].astype(str).str.strip()
+                    mask_blank_upc = upc_str.eq("") & item_str.ne("")
+                    inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
+
+                # POS update from master (optional)
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
-                    # Logic Fix: Pass the FILE OBJECT
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
-                st.session_state["bt_invoice_items_df"] = invoice_items_df
+                # Save into session
+                st.session_state["bt_invoice_items_df"] = inv_display          # for preview + download (UPC shows Item Number where needed)
+                st.session_state["bt_invoice_items_dl_df"] = invoice_items_raw # raw parsed (if you ever want it)
                 st.session_state["bt_updated_master"]   = updated_master
                 st.session_state["bt_cost_changes"]     = cost_changes
                 st.session_state["bt_not_in_master"]    = not_in_master
@@ -984,16 +1084,22 @@ if selected_vendor == "Breakthru":
             key="bt_dl_items"
         )
 
-        st.subheader("Updated Master (preview)")
+                st.subheader("Updated Master (preview)")
         if st.session_state["bt_updated_master"] is not None:
             st.dataframe(st.session_state["bt_updated_master"].head(100), use_container_width=True)
+
+            bt_updated_master_bytes = dfs_to_xlsx_bytes({
+                "UpdatedMaster": st.session_state["bt_updated_master"]
+            })
+
             st.download_button(
-                "⬇️ Updated Master (CSV)",
-                data=df_to_csv_bytes(st.session_state["bt_updated_master"]),
-                file_name=f"bt_updated_master_{bt_ts}.csv",
-                key="bt_dl_master"
+                "⬇️ Updated Master (XLSX)",
+                data=bt_updated_master_bytes,
+                file_name=f"bt_updated_master_{bt_ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="bt_dl_master_xlsx"
             )
-        
+
         st.subheader("POS Update (preview)")
         if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
             st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
