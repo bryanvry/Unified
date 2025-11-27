@@ -774,16 +774,16 @@ if selected_vendor == "Unified (SVMERCH)":
                 key="dl_full_csv",
             )
 
-with col3:
-    # Export Goal Sheet 1 as XLSX so UPC leading zeros are preserved
-    gs1_bytes = dfs_to_xlsx_bytes({"GoalSheet1": st.session_state["gs1_df"]})
-    st.download_button(
-        "⬇️ Goal Sheet 1 — XLSX",
-        data=gs1_bytes,
-        file_name=f"Goal_Sheet_1_{ts}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_gs1_xlsx",
-    )
+        with col3:
+            # Export Goal Sheet 1 as XLSX so UPC leading zeros are preserved
+            gs1_bytes = dfs_to_xlsx_bytes({"GoalSheet1": st.session_state["gs1_df"]})
+            st.download_button(
+                "⬇️ Goal Sheet 1 — XLSX",
+                data=gs1_bytes,
+                file_name=f"Goal_Sheet_1_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_gs1_xlsx",
+            )
 
         
         st.subheader("Preview — FULL Export (first 200)")
