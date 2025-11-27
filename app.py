@@ -773,14 +773,18 @@ if selected_vendor == "Unified (SVMERCH)":
                 mime="text/csv",
                 key="dl_full_csv",
             )
-        with col3:
-            st.download_button(
-                "⬇️ Goal Sheet 1 (Preview) — CSV",
-                data=df_to_csv_bytes(st.session_state["gs1_df"]),
-                file_name=f"Goal_Sheet_1_{ts}.csv",
-                mime="text/csv",
-                key="dl_gs1_csv"
-            )
+
+with col3:
+    # Export Goal Sheet 1 as XLSX so UPC leading zeros are preserved
+    gs1_bytes = dfs_to_xlsx_bytes({"GoalSheet1": st.session_state["gs1_df"]})
+    st.download_button(
+        "⬇️ Goal Sheet 1 — XLSX",
+        data=gs1_bytes,
+        file_name=f"Goal_Sheet_1_{ts}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_gs1_xlsx",
+    )
+
         
         st.subheader("Preview — FULL Export (first 200)")
         st.dataframe(st.session_state["full_export_df"].head(200), use_container_width=True)
