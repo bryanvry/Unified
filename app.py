@@ -6,7 +6,7 @@ from io import BytesIO
 from datetime import datetime
 
 # ===== vendor parsers =====
-from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser
+from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, CostcoParser
 
 st.set_page_config(page_title="Unified — Multi-Vendor Invoice Processor", page_icon="🧾", layout="wide")
 # --- NEW: Force Sidebar to be smaller ---
@@ -306,23 +306,7 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
 
 def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     """
-    Breakthru variant:
-
-    - invoice_df comes from BreakthruParser and has columns:
-        UPC, Item Name, Cost, Cases, Item Number (optional)
-      Where:
-        * UPC is from "UPC Number(Each)" (may be blank)
-        * Item Number is the Breakthru item code
-
-    - Matching logic:
-        * If UPC is present → use UPC (normalized to 12 digits) as the key.
-        * If UPC is blank but Item Number is present → use Item Number (normalized) as the key.
-          You manually copy this Item Number into Master['Invoice UPC'] for those rows.
-
-    - Master:
-        * 'Invoice UPC' holds either invoice UPC or Item Number (for blank UPC invoices).
-        * 'Full Barcode' holds the canonical UPC.
-      We still keep a second pass that can match on Full Barcode if needed.
+    Breakthru variant
     """
     if invoice_df is None or invoice_df.empty:
         return (None, None, None, None, None)
@@ -702,6 +686,11 @@ for k in [
     if k not in st.session_state:
         st.session_state[k] = None
 
+# New session state for Costco
+for k in ["costco_parsed_df", "costco_changed_df", "costco_not_found_df", "costco_master_updated", "costco_ts"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
 # ---------------- UI ----------------
 
 # --- HELPER: Define the missing function ---
@@ -726,7 +715,8 @@ with st.sidebar:
         "Southern Glazer's", 
         "Nevada Beverage", 
         "Breakthru", 
-        "JC Sales"
+        "JC Sales",
+        "Costco"  # <--- Added
     ])
     st.divider()
 
@@ -820,13 +810,11 @@ if selected_vendor == "Southern Glazer's":
             if invoice_items_df.empty:
                 st.error("Could not parse any SG items (no UPC/Item Name/Cost/Cases). Please check the file.")
             else:
-                # Logic Fix: Reverted to using your existing _update_master helper
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
-                    # Logic Fix: Pass the FILE OBJECT (pricebook_csv), not a loaded dataframe
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
@@ -862,7 +850,6 @@ if selected_vendor == "Southern Glazer's":
         if st.session_state["sg_updated_master"] is not None:
             st.dataframe(st.session_state["sg_updated_master"].head(100), use_container_width=True)
 
-    # Convert single sheet to XLSX bytes using existing helper
             updated_master_bytes = dfs_to_xlsx_bytes({
                 "UpdatedMaster": st.session_state["sg_updated_master"]
             })
@@ -875,7 +862,6 @@ if selected_vendor == "Southern Glazer's":
                 key="sg_dl_mst_xlsx"
             )
 
-        
         st.subheader("POS Update (preview)")
         if st.session_state["sg_pos_update"] is not None and not st.session_state["sg_pos_update"].empty:
             st.dataframe(st.session_state["sg_pos_update"], use_container_width=True)
@@ -935,13 +921,11 @@ if selected_vendor == "Nevada Beverage":
             if invoice_items_df.empty:
                 st.error("Could not parse any Nevada items (no UPC/Item Name/Cost/Cases). Please check the file.")
             else:
-                # Logic Fix: Reverted to using your existing _update_master helper
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice(master_xlsx, invoice_items_df)
                 
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
-                    # Logic Fix: Pass the FILE OBJECT, not a loaded df
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
@@ -1043,7 +1027,6 @@ if selected_vendor == "Breakthru":
                 if not df.empty:
                     parts.append(df)
 
-            # Use the raw parser output so we KEEP Item Number and rows with blank UPC
             invoice_items_raw = (
                 pd.concat(parts, ignore_index=True)
                 if parts
@@ -1052,33 +1035,23 @@ if selected_vendor == "Breakthru":
             if invoice_items_raw.empty:
                 st.error("Could not parse any Breakthru items. Check the file.")
             else:
-                # Breakthru-specific master updater:
-                # - Uses UPC when present
-                # - Falls back to Item Number (you manually put Item Number into Master['Invoice UPC'] for those rows)
                 updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice_bt(
                     master_xlsx,
                     invoice_items_raw,
                 )
 
-                # Build a display/download copy:
-                # For rows with missing UPC Number(Each), use Item Number to look up
-                # Full Barcode from Master['Invoice UPC'] and display that as UPC.
                 inv_display = invoice_items_raw.copy()
 
                 if updated_master is not None and not updated_master.empty:
                     mast = updated_master.copy()
-
-                    # Resolve column names on the master
                     inv_upc_col = _resolve_col(mast, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
                     fb_col      = _resolve_col(mast, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
 
-                    # Normalize master Invoice UPC and Full Barcode
                     mast["__inv_norm"] = mast[inv_upc_col].astype(str).map(_norm_upc_12)
                     mast["__fb_norm"]  = mast[fb_col].astype(str).map(_norm_upc_12)
 
                     key_to_fb = dict(zip(mast["__inv_norm"], mast["__fb_norm"]))
 
-                    # Compute normalized keys on the invoice side
                     inv_display["__upc_norm"] = inv_display["UPC"].astype(str).map(
                         lambda x: _norm_upc_12(x) if str(x).strip() else ""
                     )
@@ -1098,48 +1071,37 @@ if selected_vendor == "Breakthru":
                     )
                     mask_blank_upc = upc_str.eq("") & item_str.ne("")
 
-                    # Lookup key: use UPC when present, else Item Number
                     inv_display["__lookup"] = inv_display["__upc_norm"]
                     inv_display.loc[mask_blank_upc, "__lookup"] = inv_display.loc[mask_blank_upc, "__item_norm"]
-
-                    # Map to Full Barcode from master
                     inv_display["__fb_from_master"] = inv_display["__lookup"].map(key_to_fb)
 
-                    # Use Full Barcode from master for rows that originally had blank UPC
                     mask_use_fb = mask_blank_upc & inv_display["__fb_from_master"].astype(str).str.strip().ne("")
                     inv_display.loc[mask_use_fb, "UPC"] = inv_display.loc[mask_use_fb, "__fb_from_master"]
 
-                    # If still blank but Item Number exists and master had no Full Barcode,
-                    # fall back to showing Item Number as UPC
                     if "Item Number" in inv_display.columns:
                         upc_after = inv_display["UPC"].astype(str).str.strip()
                         mask_still_blank = upc_after.eq("") & inv_display["Item Number"].astype(str).str.strip().ne("")
                         inv_display.loc[mask_still_blank, "UPC"] = inv_display.loc[mask_still_blank, "Item Number"]
 
-                    # Drop helper columns
                     inv_display = inv_display.drop(
                         columns=["__upc_norm","__item_norm","__lookup","__fb_from_master"],
                         errors="ignore",
                     )
                 else:
-                    # Fallback: if we couldn't load master, fall back to old behavior:
-                    # show Item Number where UPC is blank
                     if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
                         upc_str = inv_display["UPC"].astype(str).str.strip()
                         item_str = inv_display["Item Number"].astype(str).str.strip()
                         mask_blank_upc = upc_str.eq("") & item_str.ne("")
                         inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
 
-                # POS update from master (optional)
                 pos_update = None
                 pb_missing = None
                 if pricebook_csv is not None and updated_master is not None:
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
 
-                # Save into session
-                st.session_state["bt_invoice_items_df"] = inv_display          # for preview + download (UPC may show Item Number)
-                st.session_state["bt_invoice_items_dl_df"] = invoice_items_raw # raw parsed
+                st.session_state["bt_invoice_items_df"] = inv_display
+                st.session_state["bt_invoice_items_dl_df"] = invoice_items_raw
                 st.session_state["bt_updated_master"]   = updated_master
                 st.session_state["bt_cost_changes"]     = cost_changes
                 st.session_state["bt_not_in_master"]    = not_in_master
@@ -1233,16 +1195,12 @@ if selected_vendor == "JC Sales":
         if not inv_text or not pricebook_csv or not master_xlsx:
             st.error("Please paste the invoice text and upload pricebook/master files.")
         else:
-            from parsers import JCSalesParser
             parser = JCSalesParser()
-
-            # 1) Parse TEXT → ITEM/DESCRIPTION/PACK/COST/UNIT
             rows, _ = parser.parse(inv_text)
             
             if (rows is None) or (not isinstance(rows, pd.DataFrame)) or rows.empty:
                 st.error("Could not parse any JC Sales lines from the text.")
             else:
-                # 2) Load Master & Pricebook
                 try:
                     master = pd.read_excel(master_xlsx, dtype=str).fillna("")
                 except Exception as e:
@@ -1258,7 +1216,6 @@ if selected_vendor == "JC Sales":
                 if master.empty or pb.empty:
                     st.error("Master or Pricebook is empty/unreadable.")
                 else:
-                    # column picks + normalization
                     def pick(df, names, default):
                         for n in names:
                             if n in df.columns:
@@ -1279,14 +1236,12 @@ if selected_vendor == "JC Sales":
                     pb = pb.copy()
                     pb["__pb_upc_norm"] = pb[pb_upc].astype(str).map(_norm_upc_12)
 
-                    # Build ITEM → (UPC1_norm, UPC2_norm)
                     m = master.copy()
                     m["__UPC1_norm"] = m[m_upc1].astype(str).map(_norm_upc_12)
                     m["__UPC2_norm"] = m[m_upc2].astype(str).map(_norm_upc_12)
                     item_to_upcs = dict(zip(m[m_item].astype(str), zip(m["__UPC1_norm"], m["__UPC2_norm"])))
                     pb_set = set(pb["__pb_upc_norm"])
 
-                    # Compute UPC by trying UPC1 then UPC2 against PB (after zero-drop normalize)
                     parsed = rows.copy()
                     parsed["ITEM"] = parsed["ITEM"].astype(str)
                     parsed["PACK"] = pd.to_numeric(parsed["PACK"], errors="coerce").fillna(0).astype(int)
@@ -1302,16 +1257,12 @@ if selected_vendor == "JC Sales":
                         return f"No Match {item}"
 
                     parsed["UPC"] = parsed["ITEM"].map(resolve_upc)
-
-                    # RETAIL = UNIT * 2
                     parsed["RETAIL"] = parsed["UNIT"] * 2
 
-                    # NOW = pricebook.cents / 100 (join by UPC)
                     pb_now_map = dict(zip(pb["__pb_upc_norm"], pd.to_numeric(pb.get(pb_cents, 0), errors="coerce").fillna(0) / 100.0))
                     parsed["NOW"] = parsed["UPC"].map(pb_now_map)
                     parsed.loc[parsed["UPC"]=="No Match", "NOW"] = np.nan
 
-                    # DELTA = UNIT - ((cost_cents/100) / cost_qty)
                     pb_cc = pd.to_numeric(pb.get(pb_cost_cents, 0), errors="coerce").fillna(0.0)
                     pb_cq = pd.to_numeric(pb.get(pb_cost_qty, 0), errors="coerce").fillna(0.0)
                     pb_unit_map = {}
@@ -1319,17 +1270,14 @@ if selected_vendor == "JC Sales":
                         pb_unit_map[u] = (cc/100.0)/cq if cq and cq>0 else np.nan
                     parsed["DELTA"] = parsed["UNIT"] - parsed["UPC"].map(pb_unit_map)
 
-                    # Order & select final columns
                     parsed_out = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA"]].copy()
 
-                    # Build POS_update: keep pricebook cols, only invoice items with UPC != "No Match"
                     matched = parsed_out[~parsed_out["UPC"].astype(str).str.startswith("No Match")].copy()
                     if not matched.empty:
                         matched = matched.rename(columns={"UPC": "__norm"})
                         pb2 = pb.copy()
                         pb2 = pb2.rename(columns={"__pb_upc_norm": "__norm"})
                         join = pb2.merge(matched[["__norm","PACK","COST"]], on="__norm", how="inner")
-                        # update cost fields
                         join["cost_qty"] = pd.to_numeric(join["PACK"], errors="coerce").fillna(0).astype(int)
                         join["cost_cents"] = (pd.to_numeric(join["COST"], errors="coerce").fillna(0.0) * 100).round().astype(int)
                         out_cols = list(pb.columns)
@@ -1339,11 +1287,9 @@ if selected_vendor == "JC Sales":
                     else:
                         pos_update = pd.DataFrame()
 
-                    # Name: jcsales_parsed_YYYY-MM-DD.xlsx
                     current_date = datetime.now().strftime("%Y-%m-%d")
                     parsed_xlsx_name = f"jcsales_parsed_{current_date}.xlsx"
 
-                    # Save to session
                     st.session_state["jc_parsed_df"] = parsed_out
                     st.session_state["jc_pos_update_df"] = pos_update
                     st.session_state["jc_parsed_name"] = parsed_xlsx_name
@@ -1353,7 +1299,7 @@ if selected_vendor == "JC Sales":
                     m1.metric("Rows Parsed", len(parsed_out))
                     m2.metric("POS Updates", len(pos_update))
                     m3.metric("Unmatched Items", len(parsed_out) - len(pos_update) if pos_update is not None else 0)
-    # downloads + previews
+
     if st.session_state.get("jc_parsed_df") is not None:
         parsed_out = st.session_state["jc_parsed_df"]
         pos_update = st.session_state.get("jc_pos_update_df")
@@ -1385,4 +1331,182 @@ if selected_vendor == "JC Sales":
         if pos_update is not None and not pos_update.empty:
             with st.expander("Preview POS Updates", expanded=False):
                 st.dataframe(pos_update.head(100), use_container_width=True)
-# ==== /JC SALES ==============================================================
+
+# ==== COSTCO =================================================================
+if selected_vendor == "Costco":
+    st.title("Costco Processor")
+    st.markdown("""
+    **Step 1:** Upload your Master List and paste the receipt text.
+    **Step 2:** Click 'Parse Receipt' to identify items.
+    **Step 3:** Enter quantities for each item in the table below.
+    **Step 4:** Click 'Calculate & Update' to generate reports.
+    """)
+
+    costco_master_file = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
+    costco_receipt_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
+
+    # Step 1: Parse
+    if st.button("Step 1: Parse Receipt", type="primary"):
+        if not costco_master_file or not costco_receipt_text:
+            st.error("Please upload the Master List and paste receipt text.")
+        else:
+            parser = CostcoParser()
+            parsed_df = parser.parse(costco_receipt_text)
+            
+            if parsed_df.empty:
+                st.error("No items found in receipt text. Please check format.")
+            else:
+                st.session_state["costco_parsed_df"] = parsed_df
+                st.session_state["costco_changed_df"] = None
+                st.session_state["costco_not_found_df"] = None
+                st.session_state["costco_master_updated"] = None
+                st.success(f"Found {len(parsed_df)} items! Please enter quantities below.")
+
+    # Step 2 & 3: Quantity Input & Process
+    if st.session_state["costco_parsed_df"] is not None:
+        st.subheader("Step 2: Enter Quantities Purchased")
+        
+        # Data Editor allows editing the 'Quantity' column directly
+        edited_df = st.data_editor(
+            st.session_state["costco_parsed_df"],
+            column_config={
+                "Quantity": st.column_config.NumberColumn(
+                    "Qty Purchased",
+                    help="How many packs/boxes did you buy?",
+                    min_value=1,
+                    step=1,
+                    format="%d"
+                ),
+                "Receipt Price": st.column_config.NumberColumn(
+                    "Receipt Price",
+                    format="$%.2f",
+                    disabled=True
+                )
+            },
+            disabled=["Item Number", "Item Name", "Receipt Price"],
+            use_container_width=True,
+            key="costco_editor"
+        )
+
+        if st.button("Step 3: Calculate & Update", type="primary"):
+            # Load Master
+            try:
+                # Seek to 0 just in case
+                costco_master_file.seek(0)
+                master_df = pd.read_excel(costco_master_file, dtype=str)
+            except Exception as e:
+                st.error(f"Error reading Master file: {e}")
+                st.stop()
+            
+            # Helper to find cols
+            def pick_col(df, candidates, default):
+                for c in candidates:
+                    if c in df.columns: return c
+                return default
+
+            # Resolve Master Columns
+            m_item_num = pick_col(master_df, ["Item Number", "Item #"], "Item Number")
+            m_pack = pick_col(master_df, ["Pack"], "Pack")
+            m_cost = pick_col(master_df, ["Cost"], "Cost")
+            m_msrp = pick_col(master_df, ["MSRP"], "MSRP")
+            m_upc = pick_col(master_df, ["UPC"], "UPC")
+            m_now = pick_col(master_df, ["Now"], "Now")
+            
+            # Convert Master numeric cols
+            master_df[m_pack] = pd.to_numeric(master_df[m_pack], errors="coerce").fillna(1)
+            master_df[m_cost] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
+            
+            # Prepare Master Lookup: Item Number -> Index
+            master_df["__item_str"] = master_df[m_item_num].astype(str).str.strip()
+            item_map = {row["__item_str"]: idx for idx, row in master_df.iterrows()}
+            
+            changed_items = []
+            not_found_items = []
+            
+            # Iterate through edited receipt rows
+            updated_master = master_df.copy()
+            
+            for _, row in edited_df.iterrows():
+                r_item = str(row["Item Number"]).strip()
+                r_qty = float(row["Quantity"])
+                r_price = float(row["Receipt Price"])
+                
+                if r_qty <= 0: r_qty = 1.0
+                new_unit_cost = r_price / r_qty
+                
+                if r_item in item_map:
+                    idx = item_map[r_item]
+                    old_cost = float(updated_master.at[idx, m_cost])
+                    pack_size = float(updated_master.at[idx, m_pack])
+                    
+                    # Update Cost
+                    updated_master.at[idx, m_cost] = new_unit_cost
+                    
+                    # Update MSRP: (Cost / Pack) / 0.6
+                    if pack_size > 0:
+                        new_msrp = round((new_unit_cost / pack_size) / 0.6, 2)
+                        updated_master.at[idx, m_msrp] = new_msrp
+                    
+                    # Check for change (tolerance 0.009)
+                    if abs(new_unit_cost - old_cost) > 0.009:
+                        changed_items.append({
+                            "UPC": updated_master.at[idx, m_upc],
+                            "Old Cost": old_cost,
+                            "New Cost": new_unit_cost,
+                            "Now": updated_master.at[idx, m_now],
+                            "MSRP": updated_master.at[idx, m_msrp]
+                        })
+                else:
+                    not_found_items.append({
+                        "Item Number": r_item,
+                        "Item Name": row["Item Name"]
+                    })
+            
+            # Drop helper
+            updated_master.drop(columns=["__item_str"], inplace=True)
+            
+            # Save to session
+            st.session_state["costco_master_updated"] = updated_master
+            st.session_state["costco_changed_df"] = pd.DataFrame(changed_items)
+            st.session_state["costco_not_found_df"] = pd.DataFrame(not_found_items)
+            st.session_state["costco_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            st.success("Calculations Complete!")
+
+    # Step 4: Results
+    if st.session_state["costco_master_updated"] is not None:
+        ts = st.session_state["costco_ts"]
+        
+        # Download Updated Master
+        st.subheader("1. Updated Master File")
+        master_bytes = dfs_to_xlsx_bytes({"Sheet1": st.session_state["costco_master_updated"]})
+        st.download_button(
+            "⬇️ Download Updated Master (XLSX)",
+            data=master_bytes,
+            file_name=f"Costco_Updated_Master_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_costco_master"
+        )
+        
+        # Display Changed Items
+        st.subheader("2. Changed Items")
+        changed_df = st.session_state["costco_changed_df"]
+        if not changed_df.empty:
+            st.dataframe(
+                changed_df.style.format({
+                    "Old Cost": "${:.2f}",
+                    "New Cost": "${:.2f}",
+                    "MSRP": "${:.2f}"
+                }), 
+                use_container_width=True
+            )
+        else:
+            st.info("No cost changes detected.")
+            
+        # Display Not Found Items
+        st.subheader("3. Items Not Found in Master")
+        not_found_df = st.session_state["costco_not_found_df"]
+        if not not_found_df.empty:
+            st.dataframe(not_found_df, use_container_width=True)
+        else:
+            st.success("All receipt items were found in the Master list!")
