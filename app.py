@@ -1339,7 +1339,7 @@ if selected_vendor == "Costco":
     **Step 1:** Upload your Master List and paste the receipt text.
     **Step 2:** Click 'Parse Receipt'.
     **Step 3:** Verify or adjust quantities in the list below.
-    **Step 4:** Click 'Calculate & Update'.
+    **Step 4:** Click 'Calculate & Update' to generate reports.
     """)
 
     costco_master_file = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
@@ -1425,7 +1425,7 @@ if selected_vendor == "Costco":
                     if qty_key not in st.session_state:
                         st.session_state[qty_key] = 1
 
-                    # Layout (Removed the 4th column and button)
+                    # Layout
                     c1, c2, c3 = st.columns([3, 1.5, 1.5])
                     
                     with c1:
@@ -1454,11 +1454,7 @@ if selected_vendor == "Costco":
                 st.warning("No receipt items matched the Master List.")
                 input_data = []
 
-            # --- RENDER NOT FOUND ITEMS ---
-            if not not_found_df.empty:
-                st.write("---")
-                st.subheader("Items Not Found (Read-Only)")
-                st.dataframe(not_found_df, use_container_width=True)
+            # --- (REMOVED READ-ONLY NOT FOUND TABLE HERE) ---
             
             st.divider()
 
