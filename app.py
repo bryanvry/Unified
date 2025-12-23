@@ -1338,7 +1338,7 @@ if selected_vendor == "Costco":
     st.markdown("""
     **Step 1:** Upload your Master List and paste the receipt text.
     **Step 2:** Click 'Parse Receipt'.
-    **Step 3:** Adjust quantities using the input box or the **'+'** button.
+    **Step 3:** Verify or adjust quantities in the list below.
     **Step 4:** Click 'Calculate & Update'.
     """)
 
@@ -1405,11 +1405,10 @@ if selected_vendor == "Costco":
             # --- RENDER ROW-BY-ROW INPUTS FOR FOUND ITEMS ---
             if not found_df.empty:
                 # Header row
-                h1, h2, h3, h4 = st.columns([3, 1.5, 1.5, 0.5])
+                h1, h2, h3 = st.columns([3, 1.5, 1.5])
                 h1.caption("**Item**")
                 h2.caption("**Receipt Price**")
                 h3.caption("**Qty Purchased**")
-                h4.caption("")
 
                 # Input Rows
                 input_data = [] # To store (Item Number, Final Qty, Price, Name) for calculation
@@ -1426,15 +1425,15 @@ if selected_vendor == "Costco":
                     if qty_key not in st.session_state:
                         st.session_state[qty_key] = 1
 
-                    # Layout
-                    c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 0.5])
+                    # Layout (Removed the 4th column and button)
+                    c1, c2, c3 = st.columns([3, 1.5, 1.5])
                     
                     with c1:
                         st.text(f"{item_num}\n{item_name}")
                     with c2:
                         st.text(f"${price:.2f}")
                     with c3:
-                        # The number input is linked to session_state[qty_key]
+                        # The number input provides its own +/- buttons
                         st.number_input(
                             "Qty", 
                             min_value=1, 
@@ -1442,11 +1441,6 @@ if selected_vendor == "Costco":
                             key=qty_key, 
                             label_visibility="collapsed"
                         )
-                    with c4:
-                        # Button to increment
-                        if st.button("➕", key=f"btn_{item_num}", help="Add 1"):
-                            st.session_state[qty_key] += 1
-                            st.rerun()
 
                     # Collect current value for Step 3
                     current_qty = st.session_state[qty_key]
@@ -1515,7 +1509,7 @@ if selected_vendor == "Costco":
                         if abs(new_unit_cost - old_cost) > 0.009:
                             changed_items.append({
                                 "UPC": updated_master.at[idx, m_upc],
-                                "Item Name": updated_master.at[idx, m_name], # Added Name
+                                "Item Name": updated_master.at[idx, m_name],
                                 "Old Cost": old_cost,
                                 "New Cost": new_unit_cost,
                                 "Now": updated_master.at[idx, m_now],
