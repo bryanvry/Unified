@@ -1,11 +1,13 @@
 from .southern_glazers import SouthernGlazersParser
 from .nevada_beverage import NevadaBeverageParser
 from .breakthru import BreakthruParser
-from .jcsales import JCSalesParser  # ← add this
+from .jcsales import JCSalesParser
+from .costco import CostcoParser  # <--- Added
 
 __all__ = [
     "SouthernGlazersParser",
     "NevadaBeverageParser",
     "BreakthruParser",
-    "JCSalesParser",  # ← and this
+    "JCSalesParser",
+    "CostcoParser",  # <--- Added
 ]
