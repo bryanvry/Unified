@@ -1,4 +1,3 @@
-# parsers/costco.py
 import re
 import pandas as pd
 import numpy as np
@@ -25,7 +24,6 @@ class CostcoParser:
         # Price (number.decimals)
         # Flag (N or Y) at end
         # Example: E  428051  WHOLE WHEAT  17.97 N
-        # Example: 1988113  FABULOSO  32.97 Y
         line_pattern = re.compile(
             r"^\s*(?:E\s+)?(?P<item>\d+)\s+(?P<desc>.+?)\s+(?P<price>\d+\.\d{2})\s+[NY]\s*$",
             re.IGNORECASE
@@ -54,6 +52,6 @@ class CostcoParser:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
-        # Initialize Quantity to 1 (User will edit this later)
+        # Initialize Quantity to 1 (User will edit this later in the UI)
         df["Quantity"] = 1
         return df
