@@ -1439,6 +1439,7 @@ if selected_vendor == "Costco":
                 m_msrp = pick_col(master_df, ["MSRP"], "MSRP")
                 m_upc  = pick_col(master_df, ["UPC"], "UPC")
                 m_now  = pick_col(master_df, ["Now"], "Now")
+                m_name = pick_col(master_df, ["Item Name", "Description", "Name"], "Item Name")
 
                 # Numeric conversions
                 master_df[m_pack] = pd.to_numeric(master_df[m_pack], errors="coerce").fillna(1)
@@ -1478,6 +1479,7 @@ if selected_vendor == "Costco":
                             if abs(new_unit_cost - old_cost) > 0.009:
                                 changed_items.append({
                                     "UPC": updated_master.at[idx, m_upc],
+                                    "Item Name": updated_master.at[idx, m_name],
                                     "Old Cost": old_cost,
                                     "New Cost": new_unit_cost,
                                     "Now": updated_master.at[idx, m_now],
@@ -1488,7 +1490,6 @@ if selected_vendor == "Costco":
                 
                 st.session_state["costco_master_updated"] = updated_master
                 st.session_state["costco_changed_df"] = pd.DataFrame(changed_items)
-                # Store not_found_df for persistent display
                 st.session_state["costco_not_found_df"] = not_found_df
                 st.session_state["costco_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
@@ -1527,7 +1528,6 @@ if selected_vendor == "Costco":
             st.info("No cost changes detected.")
             
         # 3. Display Not Found Items
-        # (These are persisted from the calculation step or the parse step)
         st.subheader("3. Items Not Found in Master")
         not_found_df = st.session_state["costco_not_found_df"]
         if not_found_df is not None and not not_found_df.empty:
