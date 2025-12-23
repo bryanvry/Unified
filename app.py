@@ -1337,15 +1337,15 @@ if selected_vendor == "Costco":
     st.title("Costco Processor")
     st.markdown("""
     **Step 1:** Upload your Master List and paste the receipt text.
-    **Step 2:** Click 'Parse Receipt' to identify items.
-    **Step 3:** Enter quantities for found items in the table below.
-    **Step 4:** Click 'Calculate & Update' to generate reports.
+    **Step 2:** Click 'Parse Receipt'.
+    **Step 3:** Adjust quantities using the input box or the **'+'** button.
+    **Step 4:** Click 'Calculate & Update'.
     """)
 
     costco_master_file = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
     costco_receipt_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
 
-    # Step 1: Parse
+    # --- Step 1: Parse ---
     if st.button("Step 1: Parse Receipt", type="primary"):
         if not costco_master_file or not costco_receipt_text:
             st.error("Please upload the Master List and paste receipt text.")
@@ -1361,79 +1361,116 @@ if selected_vendor == "Costco":
                 st.session_state["costco_changed_df"] = None
                 st.session_state["costco_not_found_df"] = None
                 st.session_state["costco_master_updated"] = None
+                
+                # Clear old quantity states to prevent carry-over from previous receipts
+                keys_to_clear = [k for k in st.session_state.keys() if k.startswith("qty_")]
+                for k in keys_to_clear:
+                    del st.session_state[k]
+
                 st.success(f"Found {len(parsed_df)} items from receipt.")
 
-    # Step 2 & 3: Quantity Input & Process
+    # --- Step 2 & 3: Quantity Input & Process ---
     if st.session_state["costco_parsed_df"] is not None:
         
-        # We need the master file now to split Found vs Not Found
         if costco_master_file:
             try:
+                # 1. Prepare Master Data
                 costco_master_file.seek(0)
                 master_df = pd.read_excel(costco_master_file, dtype=str)
                 
-                # Helper to find cols
                 def pick_col(df, candidates, default):
                     for c in candidates:
                         if c in df.columns: return c
                     return default
 
                 m_item_num = pick_col(master_df, ["Item Number", "Item #"], "Item Number")
-                
-                # Create a set of valid item numbers for fast lookup
-                # Normalize to string and strip
                 valid_items = set(master_df[m_item_num].astype(str).str.strip())
                 
-                # Prepare the parsed dataframe
+                # 2. Prepare Parsed Data
                 full_df = st.session_state["costco_parsed_df"].copy()
                 full_df["Item Number"] = full_df["Item Number"].astype(str).str.strip()
                 
-                # Split into Found (Editable) and Not Found (Read Only)
+                # Split Found vs Not Found
                 is_found = full_df["Item Number"].isin(valid_items)
                 found_df = full_df[is_found].copy()
                 not_found_df = full_df[~is_found].copy()
                 
             except Exception as e:
-                st.error(f"Error reading Master file for validation: {e}")
+                st.error(f"Error reading Master file: {e}")
                 st.stop()
                 
-            st.subheader("Step 2: Enter Quantities Purchased")
-            st.caption("Only items found in the Master List are editable.")
-
-            # 2A. Editable Table for FOUND items
+            st.divider()
+            st.subheader("Step 2: Enter Quantities")
+            
+            # --- RENDER ROW-BY-ROW INPUTS FOR FOUND ITEMS ---
             if not found_df.empty:
-                edited_found_df = st.data_editor(
-                    found_df,
-                    column_config={
-                        "Quantity": st.column_config.NumberColumn(
-                            "Qty Purchased",
-                            help="How many packs/boxes did you buy?",
-                            min_value=1,
-                            step=1,
-                            format="%d"
-                        ),
-                        "Receipt Price": st.column_config.NumberColumn(
-                            "Receipt Price",
-                            format="$%.2f",
-                            disabled=True
-                        )
-                    },
-                    disabled=["Item Number", "Item Name", "Receipt Price"],
-                    use_container_width=True,
-                    key="costco_editor_found"
-                )
-            else:
-                st.warning("None of the receipt items matched the Master List.")
-                edited_found_df = pd.DataFrame()
+                # Header row
+                h1, h2, h3, h4 = st.columns([3, 1.5, 1.5, 0.5])
+                h1.caption("**Item**")
+                h2.caption("**Receipt Price**")
+                h3.caption("**Qty Purchased**")
+                h4.caption("")
 
-            # 2B. Read-only Table for NOT FOUND items
+                # Input Rows
+                input_data = [] # To store (Item Number, Final Qty, Price, Name) for calculation
+                
+                for _, row in found_df.iterrows():
+                    item_num = str(row["Item Number"])
+                    item_name = str(row["Item Name"])
+                    price = float(row["Receipt Price"])
+                    
+                    # Create a unique key for this item's quantity
+                    qty_key = f"qty_{item_num}"
+                    
+                    # Initialize session state if not exists
+                    if qty_key not in st.session_state:
+                        st.session_state[qty_key] = 1
+
+                    # Layout
+                    c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 0.5])
+                    
+                    with c1:
+                        st.text(f"{item_num}\n{item_name}")
+                    with c2:
+                        st.text(f"${price:.2f}")
+                    with c3:
+                        # The number input is linked to session_state[qty_key]
+                        st.number_input(
+                            "Qty", 
+                            min_value=1, 
+                            step=1, 
+                            key=qty_key, 
+                            label_visibility="collapsed"
+                        )
+                    with c4:
+                        # Button to increment
+                        if st.button("➕", key=f"btn_{item_num}", help="Add 1"):
+                            st.session_state[qty_key] += 1
+                            st.rerun()
+
+                    # Collect current value for Step 3
+                    current_qty = st.session_state[qty_key]
+                    input_data.append({
+                        "Item Number": item_num, 
+                        "Item Name": item_name,
+                        "Receipt Price": price,
+                        "Quantity": current_qty
+                    })
+            else:
+                st.warning("No receipt items matched the Master List.")
+                input_data = []
+
+            # --- RENDER NOT FOUND ITEMS ---
             if not not_found_df.empty:
-                st.subheader("Items Not Found in Master (Read-Only)")
+                st.write("---")
+                st.subheader("Items Not Found (Read-Only)")
                 st.dataframe(not_found_df, use_container_width=True)
             
-            # Step 3: Calculate
+            st.divider()
+
+            # --- Step 3: Calculate ---
             if st.button("Step 3: Calculate & Update", type="primary"):
-                # Re-map master columns for calculation
+                # Re-map master columns
                 m_pack = pick_col(master_df, ["Pack"], "Pack")
                 m_cost = pick_col(master_df, ["Cost"], "Cost")
                 m_msrp = pick_col(master_df, ["MSRP"], "MSRP")
@@ -1441,50 +1478,49 @@ if selected_vendor == "Costco":
                 m_now  = pick_col(master_df, ["Now"], "Now")
                 m_name = pick_col(master_df, ["Item Name", "Description", "Name"], "Item Name")
 
-                # Numeric conversions
+                # Conversions
                 master_df[m_pack] = pd.to_numeric(master_df[m_pack], errors="coerce").fillna(1)
                 master_df[m_cost] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
 
-                # Map Item Number -> Index
+                # Index Map
                 master_df["__item_str"] = master_df[m_item_num].astype(str).str.strip()
                 item_map = {row["__item_str"]: idx for idx, row in master_df.iterrows()}
                 
                 changed_items = []
                 updated_master = master_df.copy()
                 
-                # Iterate ONLY over the edited FOUND items
-                if not edited_found_df.empty:
-                    for _, row in edited_found_df.iterrows():
-                        r_item = str(row["Item Number"]).strip()
-                        r_qty = float(row["Quantity"])
-                        r_price = float(row["Receipt Price"])
+                # Process gathered input data
+                for row_data in input_data:
+                    r_item = row_data["Item Number"]
+                    r_qty = float(row_data["Quantity"])
+                    r_price = float(row_data["Receipt Price"])
+                    
+                    if r_qty <= 0: r_qty = 1.0
+                    new_unit_cost = r_price / r_qty
+                    
+                    if r_item in item_map:
+                        idx = item_map[r_item]
+                        old_cost = float(updated_master.at[idx, m_cost])
+                        pack_size = float(updated_master.at[idx, m_pack])
                         
-                        if r_qty <= 0: r_qty = 1.0
-                        new_unit_cost = r_price / r_qty
+                        # Update Cost
+                        updated_master.at[idx, m_cost] = new_unit_cost
                         
-                        if r_item in item_map:
-                            idx = item_map[r_item]
-                            old_cost = float(updated_master.at[idx, m_cost])
-                            pack_size = float(updated_master.at[idx, m_pack])
+                        # Update MSRP
+                        if pack_size > 0:
+                            new_msrp = round((new_unit_cost / pack_size) / 0.6, 2)
+                            updated_master.at[idx, m_msrp] = new_msrp
                             
-                            # Update Cost
-                            updated_master.at[idx, m_cost] = new_unit_cost
-                            
-                            # Update MSRP
-                            if pack_size > 0:
-                                new_msrp = round((new_unit_cost / pack_size) / 0.6, 2)
-                                updated_master.at[idx, m_msrp] = new_msrp
-                                
-                            # Check change
-                            if abs(new_unit_cost - old_cost) > 0.009:
-                                changed_items.append({
-                                    "UPC": updated_master.at[idx, m_upc],
-                                    "Item Name": updated_master.at[idx, m_name],
-                                    "Old Cost": old_cost,
-                                    "New Cost": new_unit_cost,
-                                    "Now": updated_master.at[idx, m_now],
-                                    "MSRP": updated_master.at[idx, m_msrp]
-                                })
+                        # Check change (tolerance 0.009)
+                        if abs(new_unit_cost - old_cost) > 0.009:
+                            changed_items.append({
+                                "UPC": updated_master.at[idx, m_upc],
+                                "Item Name": updated_master.at[idx, m_name], # Added Name
+                                "Old Cost": old_cost,
+                                "New Cost": new_unit_cost,
+                                "Now": updated_master.at[idx, m_now],
+                                "MSRP": updated_master.at[idx, m_msrp]
+                            })
 
                 updated_master.drop(columns=["__item_str"], inplace=True)
                 
@@ -1497,11 +1533,10 @@ if selected_vendor == "Costco":
         else:
              st.warning("Please upload the Master List to match items.")
 
-    # Step 4: Results
+    # --- Step 4: Results ---
     if st.session_state["costco_master_updated"] is not None:
         ts = st.session_state["costco_ts"]
         
-        # 1. Download Updated Master
         st.subheader("1. Updated Master File")
         master_bytes = dfs_to_xlsx_bytes({"Sheet1": st.session_state["costco_master_updated"]})
         st.download_button(
@@ -1512,7 +1547,6 @@ if selected_vendor == "Costco":
             key="dl_costco_master"
         )
         
-        # 2. Display Changed Items
         st.subheader("2. Changed Items")
         changed_df = st.session_state["costco_changed_df"]
         if not changed_df.empty:
@@ -1527,7 +1561,6 @@ if selected_vendor == "Costco":
         else:
             st.info("No cost changes detected.")
             
-        # 3. Display Not Found Items
         st.subheader("3. Items Not Found in Master")
         not_found_df = st.session_state["costco_not_found_df"]
         if not_found_df is not None and not not_found_df.empty:
