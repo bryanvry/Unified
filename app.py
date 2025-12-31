@@ -1360,9 +1360,10 @@ if selected_vendor == "Costco":
                 # Reset downstream states
                 st.session_state["costco_changed_df"] = None
                 st.session_state["costco_not_found_df"] = None
+                st.session_state["costco_new_items_df"] = None  # <--- New State
                 st.session_state["costco_master_updated"] = None
                 
-                # Clear old quantity states to prevent carry-over from previous receipts
+                # Clear old quantity states
                 keys_to_clear = [k for k in st.session_state.keys() if k.startswith("qty_")]
                 for k in keys_to_clear:
                     del st.session_state[k]
@@ -1411,38 +1412,23 @@ if selected_vendor == "Costco":
                 h3.caption("**Qty Purchased**")
 
                 # Input Rows
-                input_data = [] # To store (Item Number, Final Qty, Price, Name) for calculation
+                input_data = [] 
                 
                 for _, row in found_df.iterrows():
                     item_num = str(row["Item Number"])
                     item_name = str(row["Item Name"])
                     price = float(row["Receipt Price"])
                     
-                    # Create a unique key for this item's quantity
                     qty_key = f"qty_{item_num}"
-                    
-                    # Initialize session state if not exists
                     if qty_key not in st.session_state:
                         st.session_state[qty_key] = 1
 
-                    # Layout
                     c1, c2, c3 = st.columns([3, 1.5, 1.5])
-                    
-                    with c1:
-                        st.text(f"{item_num}\n{item_name}")
-                    with c2:
-                        st.text(f"${price:.2f}")
+                    with c1: st.text(f"{item_num}\n{item_name}")
+                    with c2: st.text(f"${price:.2f}")
                     with c3:
-                        # The number input provides its own +/- buttons
-                        st.number_input(
-                            "Qty", 
-                            min_value=1, 
-                            step=1, 
-                            key=qty_key, 
-                            label_visibility="collapsed"
-                        )
+                        st.number_input("Qty", min_value=1, step=1, key=qty_key, label_visibility="collapsed")
 
-                    # Collect current value for Step 3
                     current_qty = st.session_state[qty_key]
                     input_data.append({
                         "Item Number": item_num, 
@@ -1453,8 +1439,6 @@ if selected_vendor == "Costco":
             else:
                 st.warning("No receipt items matched the Master List.")
                 input_data = []
-
-            # --- (REMOVED READ-ONLY NOT FOUND TABLE HERE) ---
             
             st.divider()
 
@@ -1479,7 +1463,7 @@ if selected_vendor == "Costco":
                 changed_items = []
                 updated_master = master_df.copy()
                 
-                # Process gathered input data
+                # 1. Process Found Items
                 for row_data in input_data:
                     r_item = row_data["Item Number"]
                     r_qty = float(row_data["Quantity"])
@@ -1493,15 +1477,12 @@ if selected_vendor == "Costco":
                         old_cost = float(updated_master.at[idx, m_cost])
                         pack_size = float(updated_master.at[idx, m_pack])
                         
-                        # Update Cost
                         updated_master.at[idx, m_cost] = new_unit_cost
                         
-                        # Update MSRP
                         if pack_size > 0:
                             new_msrp = round((new_unit_cost / pack_size) / 0.6, 2)
                             updated_master.at[idx, m_msrp] = new_msrp
                             
-                        # Check change (tolerance 0.009)
                         if abs(new_unit_cost - old_cost) > 0.009:
                             changed_items.append({
                                 "UPC": updated_master.at[idx, m_upc],
@@ -1511,12 +1492,33 @@ if selected_vendor == "Costco":
                                 "Now": updated_master.at[idx, m_now],
                                 "MSRP": updated_master.at[idx, m_msrp]
                             })
-
-                updated_master.drop(columns=["__item_str"], inplace=True)
                 
+                updated_master.drop(columns=["__item_str"], inplace=True)
+
+                # 2. Process Not Found Items (Create "New Items" Sheet)
+                if not not_found_df.empty:
+                    # Create list of dicts mapped to master columns
+                    new_rows = []
+                    for _, row in not_found_df.iterrows():
+                        new_row = {}
+                        # Map known receipt fields to master fields
+                        new_row[m_item_num] = row["Item Number"]
+                        new_row[m_name] = row["Item Name"]
+                        new_row[m_cost] = row["Receipt Price"] # Defaulting to receipt price as cost
+                        new_rows.append(new_row)
+                    
+                    # Create DataFrame with Master's structure
+                    new_items_df = pd.DataFrame(new_rows)
+                    # Reindex to ensure all master columns exist (filling missing with NaN/Empty)
+                    new_items_df = new_items_df.reindex(columns=master_df.columns, fill_value="")
+                else:
+                    new_items_df = pd.DataFrame()
+
+                # Save to State
                 st.session_state["costco_master_updated"] = updated_master
                 st.session_state["costco_changed_df"] = pd.DataFrame(changed_items)
                 st.session_state["costco_not_found_df"] = not_found_df
+                st.session_state["costco_new_items_df"] = new_items_df # <--- Save new sheet
                 st.session_state["costco_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
                 st.success("Calculations Complete!")
@@ -1552,6 +1554,19 @@ if selected_vendor == "Costco":
             st.info("No cost changes detected.")
             
         st.subheader("3. Items Not Found in Master")
+        
+        # New Download Button for Not Found Items (Mapped to Master Structure)
+        new_items_df = st.session_state.get("costco_new_items_df")
+        if new_items_df is not None and not new_items_df.empty:
+            new_items_bytes = dfs_to_xlsx_bytes({"NewItems": new_items_df})
+            st.download_button(
+                "⬇️ Download New Items to Add (XLSX)",
+                data=new_items_bytes,
+                file_name=f"Costco_New_Items_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_costco_new_items"
+            )
+
         not_found_df = st.session_state["costco_not_found_df"]
         if not_found_df is not None and not not_found_df.empty:
             st.dataframe(not_found_df, use_container_width=True)
