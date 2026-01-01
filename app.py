@@ -1338,8 +1338,8 @@ if selected_vendor == "Costco":
     st.markdown("""
     **Step 1:** Upload your Master List and paste the receipt text.
     **Step 2:** Click 'Parse Receipt'.
-    **Step 3:** Verify or adjust quantities in the list below.
-    **Step 4:** Click 'Calculate & Update' to generate reports.
+    **Step 3:** Enter quantities for items where the price didn't match the master list.
+    **Step 4:** Click 'Calculate & Update'.
     """)
 
     costco_master_file = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
@@ -1360,7 +1360,7 @@ if selected_vendor == "Costco":
                 # Reset downstream states
                 st.session_state["costco_changed_df"] = None
                 st.session_state["costco_not_found_df"] = None
-                st.session_state["costco_new_items_df"] = None  # <--- New State
+                st.session_state["costco_new_items_df"] = None
                 st.session_state["costco_master_updated"] = None
                 
                 # Clear old quantity states
@@ -1385,7 +1385,15 @@ if selected_vendor == "Costco":
                     return default
 
                 m_item_num = pick_col(master_df, ["Item Number", "Item #"], "Item Number")
-                valid_items = set(master_df[m_item_num].astype(str).str.strip())
+                m_cost     = pick_col(master_df, ["Cost"], "Cost")
+                
+                # Clean master columns for lookup
+                master_df["__item_str"] = master_df[m_item_num].astype(str).str.strip()
+                master_df["__cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
+                
+                # Map Item -> Cost
+                item_cost_map = dict(zip(master_df["__item_str"], master_df["__cost_float"]))
+                valid_items = set(master_df["__item_str"])
                 
                 # 2. Prepare Parsed Data
                 full_df = st.session_state["costco_parsed_df"].copy()
@@ -1396,6 +1404,41 @@ if selected_vendor == "Costco":
                 found_df = full_df[is_found].copy()
                 not_found_df = full_df[~is_found].copy()
                 
+                # 3. Intelligent Split: Auto-Calc vs Manual Input
+                auto_processed = []
+                manual_input_rows = []
+
+                for _, row in found_df.iterrows():
+                    item_num = str(row["Item Number"])
+                    receipt_price = float(row["Receipt Price"])
+                    
+                    master_cost = item_cost_map.get(item_num, 0.0)
+                    
+                    # Logic: If divisible, auto-calc. 
+                    # Use a small tolerance for floating point math
+                    is_divisible = False
+                    calc_qty = 1
+                    
+                    if master_cost > 0:
+                        ratio = receipt_price / master_cost
+                        rounded_ratio = round(ratio)
+                        if abs(ratio - rounded_ratio) < 0.02: # 2% tolerance for float drift
+                            is_divisible = True
+                            calc_qty = int(rounded_ratio)
+                            if calc_qty == 0: calc_qty = 1 # Safety
+                    
+                    if is_divisible:
+                        auto_processed.append({
+                            "Item Number": item_num,
+                            "Item Name": row["Item Name"],
+                            "Receipt Price": receipt_price,
+                            "Quantity": calc_qty
+                        })
+                    else:
+                        manual_input_rows.append(row)
+                
+                manual_df = pd.DataFrame(manual_input_rows) if manual_input_rows else pd.DataFrame()
+
             except Exception as e:
                 st.error(f"Error reading Master file: {e}")
                 st.stop()
@@ -1403,18 +1446,24 @@ if selected_vendor == "Costco":
             st.divider()
             st.subheader("Step 2: Enter Quantities")
             
-            # --- RENDER ROW-BY-ROW INPUTS FOR FOUND ITEMS ---
-            if not found_df.empty:
-                # Header row
+            # --- INFO MESSAGE ---
+            if auto_processed:
+                st.info(f"✨ **{len(auto_processed)} items** matched the master cost perfectly. Their quantities were auto-calculated and hidden.")
+                with st.expander("View Auto-Processed Items"):
+                    st.dataframe(pd.DataFrame(auto_processed)[["Item Number", "Item Name", "Receipt Price", "Quantity"]])
+
+            # --- RENDER ROW-BY-ROW INPUTS FOR MANUAL ITEMS ---
+            input_data_manual = [] 
+
+            if not manual_df.empty:
+                st.caption("Please enter quantities for these items (Cost changed or new multiple):")
+                # Header
                 h1, h2, h3 = st.columns([3, 1.5, 1.5])
                 h1.caption("**Item**")
                 h2.caption("**Receipt Price**")
                 h3.caption("**Qty Purchased**")
 
-                # Input Rows
-                input_data = [] 
-                
-                for _, row in found_df.iterrows():
+                for _, row in manual_df.iterrows():
                     item_num = str(row["Item Number"])
                     item_name = str(row["Item Name"])
                     price = float(row["Receipt Price"])
@@ -1430,15 +1479,16 @@ if selected_vendor == "Costco":
                         st.number_input("Qty", min_value=1, step=1, key=qty_key, label_visibility="collapsed")
 
                     current_qty = st.session_state[qty_key]
-                    input_data.append({
+                    input_data_manual.append({
                         "Item Number": item_num, 
                         "Item Name": item_name,
                         "Receipt Price": price,
                         "Quantity": current_qty
                     })
-            else:
+            elif not auto_processed:
                 st.warning("No receipt items matched the Master List.")
-                input_data = []
+            else:
+                st.success("All found items were auto-matched! Click 'Calculate' to proceed.")
             
             st.divider()
 
@@ -1446,25 +1496,26 @@ if selected_vendor == "Costco":
             if st.button("Step 3: Calculate & Update", type="primary"):
                 # Re-map master columns
                 m_pack = pick_col(master_df, ["Pack"], "Pack")
-                m_cost = pick_col(master_df, ["Cost"], "Cost")
                 m_msrp = pick_col(master_df, ["MSRP"], "MSRP")
                 m_upc  = pick_col(master_df, ["UPC"], "UPC")
                 m_now  = pick_col(master_df, ["Now"], "Now")
                 m_name = pick_col(master_df, ["Item Name", "Description", "Name"], "Item Name")
 
-                # Conversions
+                # Conversions (m_cost already converted to __cost_float but we need to update the original DF)
                 master_df[m_pack] = pd.to_numeric(master_df[m_pack], errors="coerce").fillna(1)
                 master_df[m_cost] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
 
                 # Index Map
-                master_df["__item_str"] = master_df[m_item_num].astype(str).str.strip()
                 item_map = {row["__item_str"]: idx for idx, row in master_df.iterrows()}
                 
                 changed_items = []
                 updated_master = master_df.copy()
                 
-                # 1. Process Found Items
-                for row_data in input_data:
+                # Combine Auto and Manual lists
+                all_inputs = auto_processed + input_data_manual
+
+                # 1. Process All Items
+                for row_data in all_inputs:
                     r_item = row_data["Item Number"]
                     r_qty = float(row_data["Quantity"])
                     r_price = float(row_data["Receipt Price"])
@@ -1483,6 +1534,7 @@ if selected_vendor == "Costco":
                             new_msrp = round((new_unit_cost / pack_size) / 0.6, 2)
                             updated_master.at[idx, m_msrp] = new_msrp
                             
+                        # Tolerance check (approx 1 cent)
                         if abs(new_unit_cost - old_cost) > 0.009:
                             changed_items.append({
                                 "UPC": updated_master.at[idx, m_upc],
@@ -1493,24 +1545,23 @@ if selected_vendor == "Costco":
                                 "MSRP": updated_master.at[idx, m_msrp]
                             })
                 
-                updated_master.drop(columns=["__item_str"], inplace=True)
+                # Drop temp columns
+                updated_master.drop(columns=["__item_str", "__cost_float"], inplace=True, errors="ignore")
 
-                # 2. Process Not Found Items (Create "New Items" Sheet)
+                # 2. Process Not Found Items (New Items Sheet)
                 if not not_found_df.empty:
-                    # Create list of dicts mapped to master columns
                     new_rows = []
                     for _, row in not_found_df.iterrows():
                         new_row = {}
-                        # Map known receipt fields to master fields
                         new_row[m_item_num] = row["Item Number"]
                         new_row[m_name] = row["Item Name"]
-                        new_row[m_cost] = row["Receipt Price"] # Defaulting to receipt price as cost
+                        new_row[m_cost] = row["Receipt Price"] 
                         new_rows.append(new_row)
                     
-                    # Create DataFrame with Master's structure
                     new_items_df = pd.DataFrame(new_rows)
-                    # Reindex to ensure all master columns exist (filling missing with NaN/Empty)
                     new_items_df = new_items_df.reindex(columns=master_df.columns, fill_value="")
+                    # Clean up temp cols from reindex if master had them (unlikely but safe)
+                    new_items_df.drop(columns=["__item_str", "__cost_float"], inplace=True, errors="ignore")
                 else:
                     new_items_df = pd.DataFrame()
 
@@ -1518,7 +1569,7 @@ if selected_vendor == "Costco":
                 st.session_state["costco_master_updated"] = updated_master
                 st.session_state["costco_changed_df"] = pd.DataFrame(changed_items)
                 st.session_state["costco_not_found_df"] = not_found_df
-                st.session_state["costco_new_items_df"] = new_items_df # <--- Save new sheet
+                st.session_state["costco_new_items_df"] = new_items_df
                 st.session_state["costco_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
                 st.success("Calculations Complete!")
@@ -1555,7 +1606,6 @@ if selected_vendor == "Costco":
             
         st.subheader("3. Items Not Found in Master")
         
-        # New Download Button for Not Found Items (Mapped to Master Structure)
         new_items_df = st.session_state.get("costco_new_items_df")
         if new_items_df is not None and not new_items_df.empty:
             new_items_bytes = dfs_to_xlsx_bytes({"NewItems": new_items_df})
