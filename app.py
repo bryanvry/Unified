@@ -1028,59 +1028,14 @@ if selected_vendor == "Breakthru":
                     invoice_items_raw,
                 )
 
+                # -- Display Logic: Fill blank UPCs with Item Number for the downloadable file --
                 inv_display = invoice_items_raw.copy()
 
-                if updated_master is not None and not updated_master.empty:
-                    mast = updated_master.copy()
-                    inv_upc_col = _resolve_col(mast, ["Invoice UPC","InvoiceUPC","INV UPC","Invoice upc"], "Invoice UPC")
-                    fb_col      = _resolve_col(mast, ["Full Barcode","FullBarcode","FULL BARCODE"], "Full Barcode")
-
-                    mast["__inv_norm"] = mast[inv_upc_col].astype(str).map(_norm_upc_12)
-                    mast["__fb_norm"]  = mast[fb_col].astype(str).map(_norm_upc_12)
-
-                    key_to_fb = dict(zip(mast["__inv_norm"], mast["__fb_norm"]))
-
-                    inv_display["__upc_norm"] = inv_display["UPC"].astype(str).map(
-                        lambda x: _norm_upc_12(x) if str(x).strip() else ""
-                    )
-
-                    if "Item Number" in inv_display.columns:
-                        inv_display["__item_norm"] = inv_display["Item Number"].astype(str).map(
-                            lambda x: _norm_upc_12(x) if str(x).strip() else ""
-                        )
-                    else:
-                        inv_display["__item_norm"] = ""
-
+                if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
                     upc_str = inv_display["UPC"].astype(str).str.strip()
-                    item_str = (
-                        inv_display["Item Number"].astype(str).str.strip()
-                        if "Item Number" in inv_display.columns
-                        else ""
-                    )
+                    item_str = inv_display["Item Number"].astype(str).str.strip()
                     mask_blank_upc = upc_str.eq("") & item_str.ne("")
-
-                    inv_display["__lookup"] = inv_display["__upc_norm"]
-                    inv_display.loc[mask_blank_upc, "__lookup"] = inv_display.loc[mask_blank_upc, "__item_norm"]
-                    inv_display["__fb_from_master"] = inv_display["__lookup"].map(key_to_fb)
-
-                    mask_use_fb = mask_blank_upc & inv_display["__fb_from_master"].astype(str).str.strip().ne("")
-                    inv_display.loc[mask_use_fb, "UPC"] = inv_display.loc[mask_use_fb, "__fb_from_master"]
-
-                    if "Item Number" in inv_display.columns:
-                        upc_after = inv_display["UPC"].astype(str).str.strip()
-                        mask_still_blank = upc_after.eq("") & inv_display["Item Number"].astype(str).str.strip().ne("")
-                        inv_display.loc[mask_still_blank, "UPC"] = inv_display.loc[mask_still_blank, "Item Number"]
-
-                    inv_display = inv_display.drop(
-                        columns=["__upc_norm","__item_norm","__lookup","__fb_from_master"],
-                        errors="ignore",
-                    )
-                else:
-                    if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
-                        upc_str = inv_display["UPC"].astype(str).str.strip()
-                        item_str = inv_display["Item Number"].astype(str).str.strip()
-                        mask_blank_upc = upc_str.eq("") & item_str.ne("")
-                        inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
+                    inv_display.loc[mask_blank_upc, "UPC"] = inv_display.loc[mask_blank_upc, "Item Number"]
 
                 pos_update = None
                 pb_missing = None
@@ -1160,8 +1115,6 @@ if selected_vendor == "Breakthru":
                 file_name=f"pricebook_missing_bthru_{bt_ts}.csv",
                 key="bt_dl_pb_missing",
             )
-
-
 # ==== JC SALES ===============================================================
 if selected_vendor == "JC Sales":
     st.title("JC Sales Processor (Text Paste)")
