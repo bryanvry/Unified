@@ -1053,8 +1053,12 @@ if selected_vendor == "Breakthru":
                         pos_update["__norm"] = pos_update[pu_col].astype(str).map(_norm_upc_12)
                         pos_update["__rank"] = pos_update["__norm"].map(fb_rank)
                         
-                        # Sort by rank. Unmatched items (shouldn't exist if Total>0) go to end.
-                        pos_update = pos_update.sort_values("__rank").drop(columns=["__norm", "__rank"])
+                        # Sort by rank, then drop helpers, then RESET INDEX so numbers are 0,1,2...
+                        pos_update = (
+                            pos_update.sort_values("__rank")
+                            .drop(columns=["__norm", "__rank"])
+                            .reset_index(drop=True)
+                        )
 
                 st.session_state["bt_invoice_items_df"] = inv_display
                 st.session_state["bt_invoice_items_dl_df"] = invoice_items_raw
