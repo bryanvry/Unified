@@ -308,15 +308,12 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     """
     Breakthru variant:
     - Normalizes both UPC and Item Number from the invoice.
-    - Groups by (UPC, Item Number).
-    - Matching priority against Master['Invoice UPC']:
-        1. Invoice UPC -> Master Invoice UPC
-        2. Invoice Item Number -> Master Invoice UPC
-    - Matching priority against Master['Full Barcode']:
-        3. Invoice UPC -> Master Full Barcode
+    - Groups by (UPC, Item Number), preserving first-appearance order.
+    - Matches against Master to update costs/cases.
+    - Returns an extra value: 'ordered_fbs', a list of matched Master Full Barcodes in invoice order.
     """
     if invoice_df is None or invoice_df.empty:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, [])
 
     df = invoice_df.copy()
 
@@ -337,7 +334,7 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     itemnum_col  = _pick_col(["Item Number", "ItemNumber", "Item No", "Item #", "Item"], "Item Number")
 
     if not upc_col or not name_col_inv or not cost_col or not cases_col:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, [])
 
     # ---- Normalize invoice numeric fields ----
     df[upc_col] = df[upc_col].astype(str).fillna("")
@@ -350,11 +347,9 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     df[cases_col] = pd.to_numeric(df[cases_col], errors="coerce").fillna(0).astype(int)
 
     # ---- Prepare Keys for Lookup ----
-    # 1. Normalized UPC
     df["__inv_upc_norm"] = df[upc_col].astype(str).map(
         lambda x: _norm_upc_12(x) if str(x).strip() else ""
     )
-    # 2. Normalized Item Number (if present)
     if itemnum_col:
         df["__itemnorm"] = df[itemnum_col].astype(str).map(
             lambda x: _norm_upc_12(x) if str(x).strip() else ""
@@ -362,7 +357,6 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     else:
         df["__itemnorm"] = ""
 
-    # Keep only rows with valid data (Cost and Cases) and at least one potential key
     df_valid = df[
         ((df["__inv_upc_norm"].ne("")) | (df["__itemnorm"].ne("")))
         & df[cost_col].notna()
@@ -370,10 +364,13 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     ].copy()
 
     if df_valid.empty:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, [])
 
-    # ---- Aggregate by BOTH keys ----
-    # We group by both so we can iterate and try UPC first, then Item Number.
+    # ---- Aggregate by BOTH keys, preserving Order ----
+    # 1. Add an index to track original appearance
+    df_valid["_sort_idx"] = range(len(df_valid))
+
+    # 2. Group and take min(_sort_idx) to find first appearance
     invoice_unique = (
         df_valid
         .groupby(["__inv_upc_norm", "__itemnorm"], as_index=False)
@@ -381,7 +378,9 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
             name_col_inv: "last",
             cost_col: "last",
             cases_col: "sum",
+            "_sort_idx": "min" 
         })
+        .sort_values("_sort_idx") # Restore invoice order
         .rename(columns={
             name_col_inv: "Item Name",
             cost_col: "Cost",
@@ -389,7 +388,6 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
         })
     )
 
-    # Convert to list of records for iteration
     inv_records = invoice_unique.to_dict(orient="records")
 
     # ---- Load and normalize Master ----
@@ -410,7 +408,6 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     master[cost_dollar_col] = master[cost_dollar_col].apply(_to_float_safe)
     master[cost_cent_col]   = master[cost_cent_col].apply(_to_int_safe)
 
-    # Build normalized maps for Invoice UPC and Full Barcode
     master["__inv_norm"] = master[inv_upc_col].map(_norm_upc_12)
     master["__fb_norm"]  = master[full_barcode_col].map(_norm_upc_12)
 
@@ -425,14 +422,13 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     changed_cost_rows = []
     not_in_master_rows = []
     pack_missing_on_added_rows = []
+    ordered_fbs = [] # To store matched Full Barcodes in invoice order
 
     updated = master.copy()
 
     for rec in inv_records:
         u_upc   = rec["__inv_upc_norm"]
         u_item  = rec["__itemnorm"]
-        
-        # New cost/cases from invoice
         new_cost  = float(rec["Cost"])
         new_cases = int(rec["Cases"])
         item_name = rec["Item Name"]
@@ -444,17 +440,14 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
             matched_indices = by_inv[u_upc]
         
         # PRIORITY 2: Match Invoice Item Number -> Master Invoice UPC
-        # (Only if Priority 1 failed and we have an Item Number)
         if not matched_indices and u_item and u_item in by_inv:
             matched_indices = by_inv[u_item]
         
         # PRIORITY 3: Match Invoice UPC -> Master Full Barcode
-        # (Fallback for "Full Barcode" matching if Invoice UPC exists)
         if not matched_indices and u_upc and u_upc in by_fb:
             matched_indices = by_fb[u_upc]
 
         if matched_indices:
-            # Update all matched master rows
             for idx in matched_indices:
                 old_cost  = float(updated.at[idx, cost_dollar_col])
                 pack_val  = int(updated.at[idx, pack_col])
@@ -463,6 +456,10 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
                 updated.at[idx, total_col]       = float(pack_val * new_cases)
                 updated.at[idx, cost_dollar_col] = new_cost
                 updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
+                
+                # Capture the Full Barcode for sorting POS update later
+                fb_val = str(updated.at[idx, full_barcode_col])
+                ordered_fbs.append(_norm_upc_12(fb_val))
 
                 if abs(old_cost - new_cost) > 1e-6:
                     changed_cost_rows.append({
@@ -479,8 +476,6 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
                         "Pack":      pack_val,
                     })
         else:
-            # Not found in Master
-            # Display Key: Use UPC if available, else Item Number
             display_key = u_upc if u_upc else u_item
             not_in_master_rows.append({
                 "Lookup UPC": display_key,
@@ -495,6 +490,7 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
         pd.DataFrame(not_in_master_rows),
         pd.DataFrame(pack_missing_on_added_rows),
         invoice_unique,
+        ordered_fbs 
     )
 # ---------------- Unified functions ----------------
 def parse_unified(uploaded_file) -> pd.DataFrame:
@@ -1023,14 +1019,13 @@ if selected_vendor == "Breakthru":
             if invoice_items_raw.empty:
                 st.error("Could not parse any Breakthru items. Check the file.")
             else:
-                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique = _update_master_from_invoice_bt(
+                # Capture the ordered_fbs (Full Barcodes in invoice order)
+                updated_master, cost_changes, not_in_master, pack_missing, invoice_unique, ordered_fbs = _update_master_from_invoice_bt(
                     master_xlsx,
                     invoice_items_raw,
                 )
 
-                # -- Display Logic: Fill blank UPCs with Item Number for the downloadable file --
                 inv_display = invoice_items_raw.copy()
-
                 if "UPC" in inv_display.columns and "Item Number" in inv_display.columns:
                     upc_str = inv_display["UPC"].astype(str).str.strip()
                     item_str = inv_display["Item Number"].astype(str).str.strip()
@@ -1042,6 +1037,24 @@ if selected_vendor == "Breakthru":
                 if pricebook_csv is not None and updated_master is not None:
                     pricebook_csv.seek(0)
                     pos_update, pb_missing = _build_pricebook_update(pricebook_csv, updated_master)
+                    
+                    # --- NEW: Re-sort POS Update to match Invoice Order ---
+                    if pos_update is not None and not pos_update.empty and ordered_fbs:
+                        # 1. Identify Pricebook UPC column
+                        pu_col = "Upc" if "Upc" in pos_update.columns else ("UPC" if "UPC" in pos_update.columns else pos_update.columns[0])
+                        
+                        # 2. Create a rank map from the ordered barcodes (first appearance gets lower rank)
+                        fb_rank = {}
+                        for i, fb in enumerate(ordered_fbs):
+                            if fb not in fb_rank:
+                                fb_rank[fb] = i
+                        
+                        # 3. Apply rank and sort
+                        pos_update["__norm"] = pos_update[pu_col].astype(str).map(_norm_upc_12)
+                        pos_update["__rank"] = pos_update["__norm"].map(fb_rank)
+                        
+                        # Sort by rank. Unmatched items (shouldn't exist if Total>0) go to end.
+                        pos_update = pos_update.sort_values("__rank").drop(columns=["__norm", "__rank"])
 
                 st.session_state["bt_invoice_items_df"] = inv_display
                 st.session_state["bt_invoice_items_dl_df"] = invoice_items_raw
@@ -1083,7 +1096,7 @@ if selected_vendor == "Breakthru":
                 key="bt_dl_master_xlsx",
             )
 
-        st.subheader("POS Update (preview)")
+        st.subheader("POS Update (preview - Invoice Order)")
         if st.session_state["bt_pos_update"] is not None and not st.session_state["bt_pos_update"].empty:
             st.dataframe(st.session_state["bt_pos_update"], use_container_width=True)
             st.download_button(
