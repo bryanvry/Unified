@@ -306,7 +306,14 @@ def _update_master_from_invoice(master_xlsx, invoice_df: pd.DataFrame):
 
 def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     """
-    Breakthru variant
+    Breakthru variant:
+    - Normalizes both UPC and Item Number from the invoice.
+    - Groups by (UPC, Item Number).
+    - Matching priority against Master['Invoice UPC']:
+        1. Invoice UPC -> Master Invoice UPC
+        2. Invoice Item Number -> Master Invoice UPC
+    - Matching priority against Master['Full Barcode']:
+        3. Invoice UPC -> Master Full Barcode
     """
     if invoice_df is None or invoice_df.empty:
         return (None, None, None, None, None)
@@ -342,10 +349,12 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     df[cost_col] = pd.to_numeric(df[cost_col], errors="coerce")
     df[cases_col] = pd.to_numeric(df[cases_col], errors="coerce").fillna(0).astype(int)
 
-    # ---- Build lookup key: prefer UPC, else Item Number ----
+    # ---- Prepare Keys for Lookup ----
+    # 1. Normalized UPC
     df["__inv_upc_norm"] = df[upc_col].astype(str).map(
         lambda x: _norm_upc_12(x) if str(x).strip() else ""
     )
+    # 2. Normalized Item Number (if present)
     if itemnum_col:
         df["__itemnorm"] = df[itemnum_col].astype(str).map(
             lambda x: _norm_upc_12(x) if str(x).strip() else ""
@@ -353,13 +362,9 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     else:
         df["__itemnorm"] = ""
 
-    df["__lookup"] = df["__inv_upc_norm"]
-    mask_blank = df["__lookup"].eq("") & df["__itemnorm"].ne("")
-    df.loc[mask_blank, "__lookup"] = df.loc[mask_blank, "__itemnorm"]
-
-    # Keep only rows with a usable key, non-null cost, and Cases > 0
+    # Keep only rows with valid data (Cost and Cases) and at least one potential key
     df_valid = df[
-        df["__lookup"].ne("")
+        ((df["__inv_upc_norm"].ne("")) | (df["__itemnorm"].ne("")))
         & df[cost_col].notna()
         & df[cases_col].gt(0)
     ].copy()
@@ -367,24 +372,25 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     if df_valid.empty:
         return (None, None, None, None, None)
 
-    # ---- Aggregate by lookup key ----
+    # ---- Aggregate by BOTH keys ----
+    # We group by both so we can iterate and try UPC first, then Item Number.
     invoice_unique = (
         df_valid
-        .groupby("__lookup", as_index=False)
+        .groupby(["__inv_upc_norm", "__itemnorm"], as_index=False)
         .agg({
             name_col_inv: "last",
             cost_col: "last",
             cases_col: "sum",
         })
         .rename(columns={
-            "__lookup": "Lookup UPC",
             name_col_inv: "Item Name",
             cost_col: "Cost",
             cases_col: "Cases",
         })
     )
 
-    inv_map = invoice_unique.set_index("Lookup UPC")[["Item Name", "Cost", "Cases"]].to_dict(orient="index")
+    # Convert to list of records for iteration
+    inv_records = invoice_unique.to_dict(orient="records")
 
     # ---- Load and normalize Master ----
     master = pd.read_excel(master_xlsx, dtype=str).fillna("")
@@ -421,18 +427,36 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
     pack_missing_on_added_rows = []
 
     updated = master.copy()
-    matched_upcs = set()
 
-    # ---- Pass 1: match on Invoice UPC (including Item Number-based Invoice UPC) ----
-    for key, rec in inv_map.items():
-        u = _norm_upc_12(key)
-        idxs = by_inv.get(u, [])
-        if idxs:
-            matched_upcs.add(u)
-            for idx in idxs:
+    for rec in inv_records:
+        u_upc   = rec["__inv_upc_norm"]
+        u_item  = rec["__itemnorm"]
+        
+        # New cost/cases from invoice
+        new_cost  = float(rec["Cost"])
+        new_cases = int(rec["Cases"])
+        item_name = rec["Item Name"]
+
+        matched_indices = []
+
+        # PRIORITY 1: Match Invoice UPC -> Master Invoice UPC
+        if u_upc and u_upc in by_inv:
+            matched_indices = by_inv[u_upc]
+        
+        # PRIORITY 2: Match Invoice Item Number -> Master Invoice UPC
+        # (Only if Priority 1 failed and we have an Item Number)
+        if not matched_indices and u_item and u_item in by_inv:
+            matched_indices = by_inv[u_item]
+        
+        # PRIORITY 3: Match Invoice UPC -> Master Full Barcode
+        # (Fallback for "Full Barcode" matching if Invoice UPC exists)
+        if not matched_indices and u_upc and u_upc in by_fb:
+            matched_indices = by_fb[u_upc]
+
+        if matched_indices:
+            # Update all matched master rows
+            for idx in matched_indices:
                 old_cost  = float(updated.at[idx, cost_dollar_col])
-                new_cost  = float(rec["Cost"])
-                new_cases = int(rec["Cases"])
                 pack_val  = int(updated.at[idx, pack_col])
 
                 updated.at[idx, cases_col_m]     = new_cases
@@ -454,50 +478,15 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
                         "Cases":     new_cases,
                         "Pack":      pack_val,
                     })
-
-    # ---- Pass 2: match on Full Barcode for any remaining keys ----
-    for key, rec in inv_map.items():
-        u = _norm_upc_12(key)
-        if u in matched_upcs:
-            continue
-        idxs = by_fb.get(u, [])
-        if idxs:
-            matched_upcs.add(u)
-            for idx in idxs:
-                old_cost  = float(updated.at[idx, cost_dollar_col])
-                new_cost  = float(rec["Cost"])
-                new_cases = int(rec["Cases"])
-                pack_val  = int(updated.at[idx, pack_col])
-
-                updated.at[idx, cases_col_m]     = new_cases
-                updated.at[idx, total_col]       = float(pack_val * new_cases)
-                updated.at[idx, cost_dollar_col] = new_cost
-                updated.at[idx, cost_cent_col]   = int(round(new_cost * 100))
-
-                if abs(old_cost - new_cost) > 1e-6:
-                    changed_cost_rows.append({
-                        inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col:    updated.at[idx, name_col],
-                        "Old Cost $": old_cost,
-                        "New Cost $": new_cost,
-                    })
-                if new_cases > 0 and pack_val == 0:
-                    pack_missing_on_added_rows.append({
-                        inv_upc_col: updated.at[idx, inv_upc_col],
-                        name_col:    updated.at[idx, name_col],
-                        "Cases":     new_cases,
-                        "Pack":      pack_val,
-                    })
-
-    # ---- Anything still unmatched → "not in master" ----
-    for key, rec in inv_map.items():
-        u = _norm_upc_12(key)
-        if u not in matched_upcs:
+        else:
+            # Not found in Master
+            # Display Key: Use UPC if available, else Item Number
+            display_key = u_upc if u_upc else u_item
             not_in_master_rows.append({
-                "Lookup UPC": u,
-                "Item Name":  rec.get("Item Name", ""),
-                "Cost":       rec.get("Cost", ""),
-                "Cases":      rec.get("Cases", ""),
+                "Lookup UPC": display_key,
+                "Item Name":  item_name,
+                "Cost":       new_cost,
+                "Cases":      new_cases,
             })
 
     return (
@@ -507,7 +496,6 @@ def _update_master_from_invoice_bt(master_xlsx, invoice_df: pd.DataFrame):
         pd.DataFrame(pack_missing_on_added_rows),
         invoice_unique,
     )
-
 # ---------------- Unified functions ----------------
 def parse_unified(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
