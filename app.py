@@ -1219,7 +1219,8 @@ if selected_vendor == "JC Sales":
 
                     pb_now_map = dict(zip(pb["__pb_upc_norm"], pd.to_numeric(pb.get(pb_cents, 0), errors="coerce").fillna(0) / 100.0))
                     parsed["NOW"] = parsed["UPC"].map(pb_now_map)
-                    parsed.loc[parsed["UPC"]=="No Match", "NOW"] = np.nan
+                    # Fix: Use startswith to catch "No Match 12345"
+                    parsed.loc[parsed["UPC"].astype(str).str.startswith("No Match"), "NOW"] = np.nan
 
                     pb_cc = pd.to_numeric(pb.get(pb_cost_cents, 0), errors="coerce").fillna(0.0)
                     pb_cq = pd.to_numeric(pb.get(pb_cost_qty, 0), errors="coerce").fillna(0.0)
@@ -1229,6 +1230,33 @@ if selected_vendor == "JC Sales":
                     parsed["DELTA"] = parsed["UNIT"] - parsed["UPC"].map(pb_unit_map)
 
                     parsed_out = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA"]].copy()
+
+                    # --- NEW LOGIC: 1. "No Match" / Item # View Table ---
+                    # Includes everything in parsed workbook, but uses Item # instead of UPC
+                    # Adds '*' to Item # if not found in JCSales Master
+                    def format_item_with_star(val):
+                        s_val = str(val).strip()
+                        if s_val not in item_to_upcs: # Check against Master map keys
+                            return f"{s_val}*"
+                        return s_val
+
+                    jc_nomatch = parsed.copy()
+                    jc_nomatch["Item Number"] = jc_nomatch["ITEM"].apply(format_item_with_star)
+                    
+                    # Columns requested: "Item Number" + [everything else in parsed table]
+                    # Parsed table has: DESCRIPTION, PACK, COST, UNIT, RETAIL, NOW, DELTA
+                    jc_nomatch_cols = ["Item Number", "DESCRIPTION", "PACK", "COST", "UNIT", "RETAIL", "NOW", "DELTA"]
+                    jc_no_pos_match_df = jc_nomatch[jc_nomatch_cols].copy()
+
+                    # --- NEW LOGIC: 2. "Not in Master" Table (Copy/Paste) ---
+                    # Filter: Only items NOT in Master (referencing ITEM column)
+                    mask_not_in_master = ~parsed["ITEM"].isin(item_to_upcs.keys())
+                    jc_not_in_master = parsed[mask_not_in_master].copy()
+                    
+                    # Columns requested: ITEM, UPC1(blank), UPC2(blank), DESCRIPTION, PACK, COST
+                    jc_not_in_master["UPC1"] = ""
+                    jc_not_in_master["UPC2"] = ""
+                    jc_not_in_master_final = jc_not_in_master[["ITEM", "UPC1", "UPC2", "DESCRIPTION", "PACK", "COST"]].copy()
 
                     matched = parsed_out[~parsed_out["UPC"].astype(str).str.startswith("No Match")].copy()
                     if not matched.empty:
@@ -1250,6 +1278,9 @@ if selected_vendor == "JC Sales":
 
                     st.session_state["jc_parsed_df"] = parsed_out
                     st.session_state["jc_pos_update_df"] = pos_update
+                    # Save the new tables to session state
+                    st.session_state["jc_no_pos_match_df"] = jc_no_pos_match_df
+                    st.session_state["jc_not_in_master_df"] = jc_not_in_master_final
                     st.session_state["jc_parsed_name"] = parsed_xlsx_name
 
                     st.success(f"Processing Complete! File: {parsed_xlsx_name}")
@@ -1263,6 +1294,7 @@ if selected_vendor == "JC Sales":
         pos_update = st.session_state.get("jc_pos_update_df")
         parsed_name = st.session_state.get("jc_parsed_name") or "jcsales_parsed.xlsx"
 
+        # 1. Parsed Workbook (Standard)
         parsed_bytes = dfs_to_xlsx_bytes({"parsed": parsed_out})
         st.download_button(
             "⬇️ Download parsed workbook (XLSX)",
@@ -1272,6 +1304,7 @@ if selected_vendor == "JC Sales":
             key="jc_dl_parsed_xlsx",
         )
 
+        # 2. POS Update
         if pos_update is not None and not pos_update.empty:
             st.download_button(
                 "⬇️ Download POS_update (CSV)",
@@ -1283,13 +1316,38 @@ if selected_vendor == "JC Sales":
         else:
             st.info("No POS updates generated (no matches).")
 
+        # 3. No Match / Item # View (New Request 1)
+        jc_nomatch_df = st.session_state.get("jc_no_pos_match_df")
+        if jc_nomatch_df is not None and not jc_nomatch_df.empty:
+            st.download_button(
+                "⬇️ Download Item # View / No Match List (XLSX)",
+                data=dfs_to_xlsx_bytes({"ItemView": jc_nomatch_df}),
+                file_name=f"JCSales_ItemNumberList_{parsed_name.replace('jcsales_parsed_', '').replace('.xlsx', '')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="jc_dl_nomatch_xlsx",
+            )
+            
+        # 4. Not In Master Copy/Paste (New Request 2)
+        jc_missing_df = st.session_state.get("jc_not_in_master_df")
+        if jc_missing_df is not None and not jc_missing_df.empty:
+            st.download_button(
+                "⬇️ Download Missing from Master (Copy-Paste) (XLSX)",
+                data=dfs_to_xlsx_bytes({"NotInMaster": jc_missing_df}),
+                file_name=f"JCSales_MissingFromMaster_{parsed_name.replace('jcsales_parsed_', '').replace('.xlsx', '')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="jc_dl_missing_xlsx",
+            )
+
         with st.expander("Preview Parsed Data (First 100 Rows)", expanded=True):
             st.dataframe(parsed_out.head(100), use_container_width=True)
 
         if pos_update is not None and not pos_update.empty:
             with st.expander("Preview POS Updates", expanded=False):
                 st.dataframe(pos_update.head(100), use_container_width=True)
-
+                
+        if jc_missing_df is not None and not jc_missing_df.empty:
+            with st.expander("Preview Items Missing from Master", expanded=False):
+                st.dataframe(jc_missing_df.head(100), use_container_width=True)
 # ==== COSTCO =================================================================
 if selected_vendor == "Costco":
     st.title("Costco Processor")
