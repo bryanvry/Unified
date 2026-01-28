@@ -1344,6 +1344,11 @@ if selected_vendor == "JC Sales":
         if pos_update is not None and not pos_update.empty:
             with st.expander("Preview POS Updates", expanded=False):
                 st.dataframe(pos_update.head(100), use_container_width=True)
+
+        # --- ADDED PREVIEW HERE ---
+        if jc_nomatch_df is not None and not jc_nomatch_df.empty:
+            with st.expander("Preview Item # View / No Match List", expanded=False):
+                st.dataframe(jc_nomatch_df.head(100), use_container_width=True)
                 
         if jc_missing_df is not None and not jc_missing_df.empty:
             with st.expander("Preview Items Missing from Master", expanded=False):
