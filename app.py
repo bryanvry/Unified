@@ -1231,20 +1231,21 @@ if selected_vendor == "JC Sales":
 
                     parsed_out = parsed[["UPC","DESCRIPTION","PACK","COST","UNIT","RETAIL","NOW","DELTA"]].copy()
 
-                    # --- NEW LOGIC: 1. "No Match" / Item # View Table ---
-                    # Includes everything in parsed workbook, but uses Item # instead of UPC
-                    # Adds '*' to Item # if not found in JCSales Master
+                    # --- NEW LOGIC: 1. "No Match" List (Filtered) ---
+                    # Filter: ONLY items where the UPC is "No Match..."
+                    mask_no_match = parsed["UPC"].astype(str).str.startswith("No Match")
+                    jc_nomatch = parsed[mask_no_match].copy()
+
                     def format_item_with_star(val):
                         s_val = str(val).strip()
                         if s_val not in item_to_upcs: # Check against Master map keys
                             return f"{s_val}*"
                         return s_val
 
-                    jc_nomatch = parsed.copy()
+                    # Create "Item Number" column with * if missing from Master
                     jc_nomatch["Item Number"] = jc_nomatch["ITEM"].apply(format_item_with_star)
                     
-                    # Columns requested: "Item Number" + [everything else in parsed table]
-                    # Parsed table has: DESCRIPTION, PACK, COST, UNIT, RETAIL, NOW, DELTA
+                    # Columns requested: "Item Number" + [everything else in parsed table except UPC]
                     jc_nomatch_cols = ["Item Number", "DESCRIPTION", "PACK", "COST", "UNIT", "RETAIL", "NOW", "DELTA"]
                     jc_no_pos_match_df = jc_nomatch[jc_nomatch_cols].copy()
 
@@ -1282,7 +1283,7 @@ if selected_vendor == "JC Sales":
                     st.session_state["jc_no_pos_match_df"] = jc_no_pos_match_df
                     st.session_state["jc_not_in_master_df"] = jc_not_in_master_final
                     st.session_state["jc_parsed_name"] = parsed_xlsx_name
-
+                    
                     st.success(f"Processing Complete! File: {parsed_xlsx_name}")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Rows Parsed", len(parsed_out))
