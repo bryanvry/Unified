@@ -524,7 +524,10 @@ with tab_invoice:
                 pos_out = pd.DataFrame()
                 
                 # EXPLICIT: Use Full Barcode from the Map/DB, never the Invoice UPC
-                pos_out["Upc"] = final_check["Full Barcode"]
+                # FORMAT CHANGE: Add ="..." wrapper to force Excel string format
+                raw_upc = final_check["Full Barcode"].astype(str)
+                pos_out["Upc"] = raw_upc.apply(lambda x: f'="{x}"')
+                
                 pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
                 pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
                 
