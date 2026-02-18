@@ -7,23 +7,10 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 
 # ===== vendor parsers =====
-# Assuming these files exist in your parsers/ folder as before
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="LFM Process — Database Edition", page_icon="🧾", layout="wide")
-
-# Force Sidebar width
-st.markdown(
-    """
-    <style>
-        section[data-testid="stSidebar"] {
-            width: 250px !important;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 # --- GLOBAL HELPERS ---
 def _norm_upc_12(u: str) -> str:
@@ -80,8 +67,8 @@ def load_vendor_map():
 
 # --- SIDEBAR: STORE SELECTION ---
 with st.sidebar:
-    st.title("Store Selector")
-    selected_store = st.radio("Active Store", ["Twain", "Rancho"], index=0)
+    # Removed large Title and fixed width CSS for a more compact look
+    selected_store = st.radio("Select Store", ["Twain", "Rancho"], index=0, horizontal=True)
     
     # Map selection to Table Names
     if selected_store == "Twain":
@@ -92,7 +79,7 @@ with st.sidebar:
         SALES_TABLE = "salesrancho1"
 
     st.divider()
-    st.caption(f"Connected to: **{PRICEBOOK_TABLE}**")
+    st.caption(f"DB: **{PRICEBOOK_TABLE}**")
 
 # --- MAIN APP TABS ---
 tab_order, tab_invoice, tab_admin = st.tabs(["📋 Order Management", "🧾 Invoice Processing", "⚙️ Admin / Uploads"])
@@ -114,9 +101,6 @@ with tab_order:
         if sales_file and st.button("Save Sales to DB", type="primary"):
             try:
                 sales_df = pd.read_csv(sales_file, dtype=str)
-                # Normalize Columns
-                # Expected: UPC, Item, # of Items, Sales $
-                
                 # Check required columns
                 req_cols = {"UPC", "Item", "# of Items", "Sales $"}
                 if not req_cols.issubset(sales_df.columns):
@@ -145,8 +129,6 @@ with tab_order:
             try:
                 # 1. Load Template
                 template_df = pd.read_csv(template_file) if template_file.name.endswith('.csv') else pd.read_excel(template_file)
-                # Expecting 'Full Barcode' or 'Full UPC' column in template to match Pricebook
-                # Clean column names
                 template_df.columns = [c.strip() for c in template_df.columns]
                 
                 # Find the Key Column (UPC)
@@ -159,10 +141,8 @@ with tab_order:
                 if not key_col:
                     st.error("Could not find a UPC column in template (Full Barcode, Full UPC, UPC).")
                 else:
-                    # 2. Load Current Data (Pricebook)
+                    # 2. Load Current Data
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    
-                    # 3. Load Recent Sales (Last 8 weeks)
                     conn = get_db_connection()
                     start_date = datetime.today() - timedelta(weeks=8)
                     sales_query = f"""
@@ -172,14 +152,10 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    # 4. Merge Data
-                    # Normalize keys
+                    # 3. Merge Data
                     template_df["_key_norm"] = template_df[key_col].astype(str).apply(_norm_upc_12)
-                    
-                    # Join Stock & Cost/Price
                     merged = template_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
-                    # Pivot Sales Data (Columns by Date)
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
                         sales_pivot = sales_hist.pivot_table(
@@ -188,20 +164,15 @@ with tab_order:
                             values="qty_sold", 
                             aggfunc="sum"
                         ).fillna(0)
-                        
-                        # Join Sales to Merged
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    # 5. Format Output
-                    # Update 'Stock' column in template if exists, else create
+                    # 4. Format Output
                     if "Stock" in merged.columns:
                         merged["Stock"] = merged["setstock"]
                     
-                    # Add Cost/Price for reference
                     merged["Current Cost"] = merged["cost_cents"] / 100.0
                     merged["Current Price"] = merged["cents"] / 100.0
                     
-                    # Clean up
                     drop_cols = ["_key_norm", "_norm_upc", "setstock", "cost_cents", "cents", "cost_qty"]
                     final_df = merged.drop(columns=[c for c in drop_cols if c in merged.columns], errors='ignore')
                     
@@ -211,7 +182,7 @@ with tab_order:
                         file_name=f"Filled_{template_file.name}",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
-                    st.success("Order Sheet Generated with Live Stock & Sales Data!")
+                    st.success("Order Sheet Generated!")
                     
             except Exception as e:
                 st.error(f"Error generating sheet: {e}")
@@ -220,93 +191,84 @@ with tab_order:
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
 with tab_invoice:
-    vendor = st.selectbox("Select Vendor", ["Unified / JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"])
+    # Updated Vendor List with Split Options
+    vendor = st.selectbox("Select Vendor", ["Unified", "JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"])
     
-    # --- A. Unified / JC Sales (Pricebook Direct Match) ---
-    if vendor == "Unified / JC Sales":
+    # --- A. Unified OR JC Sales (Pricebook Direct Match) ---
+    if vendor in ["Unified", "JC Sales"]:
         st.info(f"Processing against **{PRICEBOOK_TABLE}**")
         
-        up_file = st.file_uploader("Upload Unified Invoice(s)", accept_multiple_files=True, key="un_files")
-        jc_text = st.text_area("Or Paste JC Sales Text", height=150)
-        
-        if st.button("Process Invoice"):
-            pb_df = load_pricebook(PRICEBOOK_TABLE)
-            if pb_df.empty:
-                st.error("Pricebook is empty. Please upload one in Admin tab.")
-                st.stop()
+        # Dynamic Input based on selection
+        inv_dfs = []
+        should_process = False
 
-            # 1. Parse Inputs
-            inv_dfs = []
-            
-            # Unified
-            if up_file:
-                for f in up_file:
+        if vendor == "Unified":
+            up_files = st.file_uploader("Upload Unified Invoice(s)", accept_multiple_files=True, key="un_files")
+            if up_files and st.button("Process Unified"):
+                for f in up_files:
                     try:
                         f.seek(0)
                         df = UnifiedParser().parse(f)
                         inv_dfs.append(df)
                     except Exception as e:
                         st.error(f"Error parsing {f.name}: {e}")
-            
-            # JC Sales
-            if jc_text:
+                should_process = True
+        
+        elif vendor == "JC Sales":
+            jc_text = st.text_area("Paste JC Sales Text", height=200)
+            if jc_text and st.button("Process JC Sales"):
                 jc_df, _ = JCSalesParser().parse(jc_text)
                 if not jc_df.empty:
-                    # Rename JC cols to match Unified standard for processing
-                    # JC: ITEM, DESCRIPTION, PACK, COST, UNIT
-                    # Unified Std: UPC, Description, Pack, +Cost
+                    # Rename JC cols to match Unified standard
                     jc_df = jc_df.rename(columns={"ITEM": "inv_upc_raw", "DESCRIPTION": "Description", "PACK": "Pack", "UNIT": "+Cost"})
-                    jc_df["UPC"] = jc_df["inv_upc_raw"] # Start with raw
+                    jc_df["UPC"] = jc_df["inv_upc_raw"]
                     inv_dfs.append(jc_df)
+                should_process = True
+
+        # Common Processing Logic
+        if should_process:
+            pb_df = load_pricebook(PRICEBOOK_TABLE)
+            if pb_df.empty:
+                st.error("Pricebook is empty. Please upload one in Admin tab.")
+                st.stop()
             
             if not inv_dfs:
-                st.warning("No data parsed.")
+                st.warning("No valid data parsed.")
                 st.stop()
 
-            # 2. Merge all invoice rows
+            # Merge invoice rows
             full_inv = pd.concat(inv_dfs, ignore_index=True)
             full_inv["_norm_upc"] = full_inv["UPC"].astype(str).apply(_norm_upc_12)
             
-            # 3. Match against Pricebook
-            # PB has: _norm_upc, Upc, cents, cost_cents, setstock, cost_qty
+            # Match against Pricebook
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
-            # 4. Determine Updates
-            # Logic: If invoice cost != PB cost OR Pack != PB cost_qty -> Update
+            # Determine Updates
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
             merged["New_Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(1).astype(int)
             
-            # Filter matched items
             matched = merged[merged["Upc"].notna()].copy()
-            
-            # Identify Changes
-            # Cost change > 1 cent diff?
             matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
             matched["Pack_Changed"] = matched["New_Pack"] != matched["cost_qty"]
             
             updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
             
-            # 5. Output POS Update File
             if not updates.empty:
-                # Format for POS Import (preserving original Pricebook columns logic)
-                # We need "Upc", "addstock" (from Total), "cost_cents", "cost_qty"
                 pos_out = pd.DataFrame()
                 pos_out["Upc"] = updates["Upc"]
                 pos_out["cost_cents"] = updates["New_Cost_Cents"]
                 pos_out["cost_qty"] = updates["New_Pack"]
-                # For unified, we usually add stock based on 'Case Qty' * 'Pack'. 
-                # If 'Case Qty' exists in invoice (Unified does, JC might not)
+                
                 if "Case Qty" in updates.columns:
                      pos_out["addstock"] = pd.to_numeric(updates["Case Qty"], errors='coerce').fillna(0) * updates["New_Pack"]
                 else:
-                     pos_out["addstock"] = 0 # Safety
+                     pos_out["addstock"] = 0
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
                 st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
             else:
                 st.info("No cost or pack changes detected against current Pricebook.")
             
-            # 6. Unmatched Report
             unmatched = merged[merged["Upc"].isna()].copy()
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
@@ -319,7 +281,6 @@ with tab_invoice:
         inv_files = st.file_uploader(f"Upload {vendor} Invoice(s)", accept_multiple_files=True)
         
         if st.button("Analyze Invoice"):
-            # 1. Load Data
             map_df = load_vendor_map()
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
@@ -327,7 +288,6 @@ with tab_invoice:
                 st.error("Vendor Map is empty. Go to Admin.")
                 st.stop()
             
-            # 2. Parse Invoice
             rows = []
             for f in inv_files:
                 f.seek(0)
@@ -341,15 +301,12 @@ with tab_invoice:
             if not rows: st.stop()
             
             inv_df = pd.concat(rows, ignore_index=True)
-            # Ensure standard cols: UPC, Item Name, Cost, Cases
-            # Normalize Invoice UPC
             inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
-            # 3. Map Invoice UPC -> System UPC (Full Barcode)
-            # Join with Map
+            # Map Invoice UPC -> System UPC
             mapped = inv_df.merge(map_df, on="_inv_upc_norm", how="left")
             
-            # 4. Handle "Not in Master" (Interactive Add)
+            # "Not in Master" Handling
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
@@ -357,11 +314,10 @@ with tab_invoice:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
                 st.caption("Edit below and click 'Save to Map' to add them.")
                 
-                # Prepare Editor DF
                 edit_df = pd.DataFrame({
                     "Invoice UPC": missing["UPC"],
                     "Name": missing["Item Name"],
-                    "Full Barcode": "", # User must fill
+                    "Full Barcode": "",
                     "PACK": 1,
                     "Company": vendor,
                     "0": ""
@@ -370,53 +326,99 @@ with tab_invoice:
                 edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
                 
                 if st.button("Save New Items to Map"):
-                    # Filter for rows where user actually added a Barcode
                     to_insert = edited_rows[edited_rows["Full Barcode"].str.len() > 3].copy()
                     if not to_insert.empty:
                         conn = get_db_connection()
-                        # Clean up for DB
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
-                        st.success("Items added to Map! Please click 'Analyze Invoice' again to process them.")
+                        st.success("Items added to Map! Please click 'Analyze Invoice' again.")
                         st.rerun()
 
-            # 5. Compare Costs against Pricebook
+            # Compare Costs
             if not valid.empty:
-                # Normalize System UPC from Map
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
-                
-                # Join with Pricebook
-                # PB has cost_cents. Invoice has Cost (dollars).
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
-                # Calculate diffs
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
                 final_check["PB_Cost_Cents"] = final_check["cost_cents"].fillna(0).astype(int)
-                
-                # Logic: Diff > 1 cent
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
+                
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     st.dataframe(changes[["Full Barcode", "Name_x", "Cost", "cost_cents", "Diff"]])
-                    
-                    st.download_button(
-                        "⬇️ Download Cost Changes",
-                        to_csv_bytes(changes),
-                        f"Cost_Changes_{vendor}.csv",
-                        "text/csv"
-                    )
+                    st.download_button("⬇️ Download Cost Changes", to_csv_bytes(changes), f"Cost_Changes_{vendor}.csv", "text/csv")
                 else:
                     st.success("All mapped items match Pricebook costs.")
+
+    # --- C. Costco (Original File-Based Logic for now) ---
+    elif vendor == "Costco":
+        st.header("Costco Processor")
+        st.markdown("**Note:** Upload your Costco Master List manually.")
+        
+        costco_master = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
+        costco_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
+
+        if st.button("Process Costco Receipt"):
+            if not costco_master or not costco_text:
+                st.error("Please provide both Master file and Receipt text.")
+            else:
+                # 1. Parse Receipt
+                parsed_df = CostcoParser().parse(costco_text)
+                if parsed_df.empty:
+                    st.error("No items found in receipt.")
+                else:
+                    # 2. Match with Master
+                    try:
+                        master_df = pd.read_excel(costco_master, dtype=str)
+                        # Clean Master
+                        m_item_num = next((c for c in ["Item Number", "Item #"] if c in master_df.columns), "Item Number")
+                        m_cost = next((c for c in ["Cost"] if c in master_df.columns), "Cost")
+                        
+                        master_df["_item_str"] = master_df[m_item_num].astype(str).str.strip()
+                        master_df["_cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
+                        item_cost_map = dict(zip(master_df["_item_str"], master_df["_cost_float"]))
+                        
+                        # 3. Auto-Match Logic
+                        parsed_df["Item Number"] = parsed_df["Item Number"].astype(str).str.strip()
+                        
+                        results = []
+                        for _, row in parsed_df.iterrows():
+                            item = row["Item Number"]
+                            price = float(row["Receipt Price"])
+                            known_cost = item_cost_map.get(item, 0.0)
+                            
+                            qty = 1
+                            if known_cost > 0:
+                                # Simple division check
+                                ratio = price / known_cost
+                                if abs(ratio - round(ratio)) < 0.05:
+                                    qty = int(round(ratio))
+                                    if qty == 0: qty = 1
+                            
+                            results.append({
+                                "Item Number": item,
+                                "Description": row["Item Name"],
+                                "Receipt Price": price,
+                                "Calc Qty": qty,
+                                "Unit Cost": price / qty
+                            })
+                        
+                        res_df = pd.DataFrame(results)
+                        st.success(f"Processed {len(res_df)} items.")
+                        st.dataframe(res_df)
+                        st.download_button("⬇️ Download Costco Report", to_xlsx_bytes({"Costco": res_df}), "Costco_Report.xlsx")
+                        
+                    except Exception as e:
+                        st.error(f"Error processing master file: {e}")
 
 # ==============================================================================
 # TAB 3: ADMIN / UPLOADS
 # ==============================================================================
 with tab_admin:
     st.header("Database Administration")
-    
     col_pb, col_map = st.columns(2)
     
     # --- A. Pricebook Initialization ---
@@ -428,30 +430,20 @@ with tab_admin:
         if pb_upload and st.button("Replace Pricebook in DB", type="primary"):
             try:
                 df = pd.read_csv(pb_upload, dtype=str)
-                # Cleanup keys
                 df.columns = [c.strip() for c in df.columns]
                 
-                # Ensure primary key 'Upc' exists
                 upc_col = next((c for c in df.columns if c.lower() == 'upc'), None)
                 if not upc_col:
                     st.error("CSV must have a 'Upc' column.")
                 else:
                     df = df.rename(columns={upc_col: "Upc"})
-                    
-                    # Connection
                     conn = get_db_connection()
                     
-                    # 1. Truncate (Clear) old data for this store
-                    # Using text() for raw SQL
                     with conn.session as session:
                         session.execute(text(f'TRUNCATE TABLE "{PRICEBOOK_TABLE}";'))
                         session.commit()
                     
-                    # 2. Insert New
-                    # We only insert columns that match the DB schema to avoid errors
-                    # DB Cols: Upc, Department, qty, cents, setstock, cost_qty, cost_cents
                     valid_cols = ["Upc", "Department", "qty", "cents", "setstock", "cost_qty", "cost_cents", "Name"]
-                    # Filter df to valid cols only (if they exist in csv)
                     cols_to_use = [c for c in valid_cols if c in df.columns]
                     
                     df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
@@ -468,21 +460,13 @@ with tab_admin:
         if map_upload and st.button("Append/Update Map"):
             try:
                 df = pd.read_excel(map_upload, dtype=str)
-                # Cols: Full Barcode, Invoice UPC, 0, Name, Size, PACK, Company
-                
-                # Check required
                 if "Full Barcode" not in df.columns or "Invoice UPC" not in df.columns:
                     st.error("File missing 'Full Barcode' or 'Invoice UPC'.")
                 else:
                     conn = get_db_connection()
-                    # Filter standard cols
                     target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company"]
                     cols_to_load = [c for c in target_cols if c in df.columns]
                     
-                    # Simple Append strategy for now (or Replace if this is a master re-load)
-                    # Use Append to keep history if user prefers, or Replace to reset.
-                    # Given the user context ("Not in master... add on"), Append is safer, but duplication is a risk.
-                    # Let's do a Replace for the "Master Upload" action to ensure clean state.
                     with conn.session as session:
                         session.execute(text('TRUNCATE TABLE "BeerandLiquorKey";'))
                         session.commit()
