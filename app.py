@@ -105,7 +105,6 @@ with tab_order:
         if sales_file and st.button("Save Sales to DB", type="primary"):
             try:
                 sales_df = pd.read_csv(sales_file, dtype=str)
-                # Check for required columns based on your file: "# of Items", "Sales $"
                 req_cols = {"UPC", "Item", "# of Items", "Sales $"}
                 if not req_cols.issubset(sales_df.columns):
                     st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
@@ -127,17 +126,26 @@ with tab_order:
     with col_gen:
         st.subheader("2. Generate Order Sheet")
         
-        # 1. Select Company to Generate For
-        target_company = st.selectbox("Select Company", ["Breakthru", "Southern Glazer's", "Nevada Beverage"])
-        
-        if st.button(f"Generate {target_company} Sheet"):
-            try:
-                conn = get_db_connection()
-                
-                # SQL FIX: Escape the single quote for names like "Southern Glazer's"
+        try:
+            conn = get_db_connection()
+            
+            # 1. DYNAMIC COMPANY LIST
+            # Pulls what is ACTUALLY in the DB so we don't have spelling mismatches
+            companies_df = conn.query('SELECT DISTINCT "Company" FROM "BeerandLiquorKey"', ttl=0)
+            
+            if not companies_df.empty:
+                # Clean and sort the list
+                company_options = sorted(companies_df["Company"].dropna().astype(str).unique().tolist())
+            else:
+                company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"] # Fallback
+            
+            target_company = st.selectbox("Select Company", company_options)
+            
+            if st.button(f"Generate {target_company} Sheet"):
+                # SQL Escape for names with apostrophes
                 safe_company = target_company.replace("'", "''")
                 
-                # 1. Fetch Vendor Map (Added Invoice UPC and "0" column as requested)
+                # 2. Fetch Vendor Map
                 map_query = f"""
                     SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
                     FROM "BeerandLiquorKey" 
@@ -150,10 +158,10 @@ with tab_order:
                 else:
                     vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
                     
-                    # 2. Fetch Current Stock/Price (Pricebook)
+                    # 3. Fetch Pricebook
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
                     
-                    # 3. Fetch Recent Sales (Last 8 Weeks)
+                    # 4. Fetch Sales History (Last 8 Weeks)
                     start_date = datetime.today() - timedelta(weeks=8)
                     sales_query = f"""
                         SELECT "UPC", "week_date", "qty_sold" 
@@ -162,15 +170,13 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    # 4. Merge: Vendor Map + Pricebook (To get Stock)
+                    # 5. Merge Map + Pricebook
                     merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
-                    # 5. Pivot & Merge Sales
+                    # 6. Pivot Sales Data
                     sales_cols = []
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
-                        
-                        # Pivot date columns
                         sales_pivot = sales_hist.pivot_table(
                             index="_upc_norm", 
                             columns="week_date", 
@@ -178,33 +184,28 @@ with tab_order:
                             aggfunc="sum"
                         ).fillna(0)
                         
-                        # Sort columns so most recent date is first
-                        # Convert column names to dates for sorting, then back to strings
+                        # Sort by date descending (Newest first)
                         sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=True)
                         sales_pivot = sales_pivot[sorted_dates]
                         
-                        # KEEP ONLY TOP 4
+                        # Keep top 4 weeks
                         sales_cols = sorted_dates[:4]
                         sales_pivot = sales_pivot[sales_cols]
                         
-                        # Join Sales to the Master List
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    # 6. Formatting Columns
+                    # 7. Safe Calculations (CRITICAL FIX)
+                    # Force numeric conversion to prevent 'str / float' crashes
                     if "setstock" in merged.columns:
-                        merged["Current Stock"] = merged["setstock"].fillna(0)
+                        merged["Current Stock"] = pd.to_numeric(merged["setstock"], errors='coerce').fillna(0)
                     else:
                         merged["Current Stock"] = 0
 
+                    merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0)
                     merged["Cost"] = merged["cost_cents"] / 100.0
                     
-                    # Define Final Column Order
-                    # Requested: Full Barcode, Invoice UPC, 0, Name, Size, PACK, Sales1...4
-                    # Added: Current Stock, Cost (Useful for ordering)
-                    
+                    # 8. Final Column Assembly
                     base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Current Stock", "Cost"]
-                    
-                    # Add the dynamic sales date columns
                     final_cols = base_cols + [c for c in sales_cols if c in merged.columns]
                     
                     final_df = merged[final_cols].copy()
@@ -217,8 +218,8 @@ with tab_order:
                     )
                     st.success(f"Generated sheet with {len(final_df)} items.")
                     
-            except Exception as e:
-                st.error(f"Error generating sheet: {e}")
+        except Exception as e:
+            st.error(f"Error generating sheet: {e}")
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
