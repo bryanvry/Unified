@@ -293,8 +293,10 @@ with tab_invoice:
         inv_dfs = []
         should_process = False
 
+        # Unified UI
         if vendor == "Unified":
-            up_files = st.file_uploader("Upload Unified Invoice(s)", accept_multiple_files=True, key="un_files")
+            # UPDATED: Added 'xls' to supported types
+            up_files = st.file_uploader("Upload Unified Invoice(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="un_files")
             if up_files and st.button("Process Unified"):
                 for f in up_files:
                     try:
@@ -305,20 +307,23 @@ with tab_invoice:
                         st.error(f"Error parsing {f.name}: {e}")
                 should_process = True
         
+        # JC Sales UI
         elif vendor == "JC Sales":
             jc_text = st.text_area("Paste JC Sales Text", height=200)
             if jc_text and st.button("Process JC Sales"):
                 jc_df, _ = JCSalesParser().parse(jc_text)
                 if not jc_df.empty:
+                    # Rename JC cols to match Unified standard
                     jc_df = jc_df.rename(columns={"ITEM": "inv_upc_raw", "DESCRIPTION": "Description", "PACK": "Pack", "UNIT": "+Cost"})
                     jc_df["UPC"] = jc_df["inv_upc_raw"]
                     inv_dfs.append(jc_df)
                 should_process = True
 
+        # Shared Processing Logic
         if should_process:
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             if pb_df.empty:
-                st.error("Pricebook is empty.")
+                st.error("Pricebook is empty. Please upload one in Admin tab.")
                 st.stop()
             
             if not inv_dfs:
@@ -328,40 +333,47 @@ with tab_invoice:
             full_inv = pd.concat(inv_dfs, ignore_index=True)
             full_inv["_norm_upc"] = full_inv["UPC"].astype(str).apply(_norm_upc_12)
             
+            # Match against Pricebook
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
+            # Determine Updates
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
             merged["New_Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(1).astype(int)
             
             matched = merged[merged["Upc"].notna()].copy()
+            
+            # --- FIX: Ensure database cost is numeric before subtraction ---
+            matched["cost_cents"] = pd.to_numeric(matched["cost_cents"], errors='coerce').fillna(0).astype(int)
+            matched["cost_qty"] = pd.to_numeric(matched["cost_qty"], errors='coerce').fillna(1).astype(int)
+            
+            # Logic: Update if Cost OR Pack size changes
             matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
             matched["Pack_Changed"] = matched["New_Pack"] != matched["cost_qty"]
             
             updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
             
             if not updates.empty:
-                update_map = updates.set_index("_norm_upc")[["New_Cost_Cents", "New_Pack"]].to_dict(orient="index")
+                pos_out = pd.DataFrame()
+                pos_out["Upc"] = updates["Upc"]
+                pos_out["cost_cents"] = updates["New_Cost_Cents"]
+                pos_out["cost_qty"] = updates["New_Pack"]
                 
-                pos_out = pb_df.copy()
-                pos_out["_key"] = pos_out["_norm_upc"]
-                
-                mask = pos_out["_key"].isin(update_map.keys())
-                pos_out.loc[mask, "cost_cents"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Cost_Cents"])
-                pos_out.loc[mask, "cost_qty"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Pack"])
-                
-                pos_final = pos_out[mask].copy().drop(columns=["_key"])
-                pos_final = pos_final[pb_df.columns] # Ensure original columns
+                # Logic: Calculate addstock if Case Qty exists
+                if "Case Qty" in updates.columns:
+                     # AddStock = Cases Bought * New Pack Size
+                     pos_out["addstock"] = pd.to_numeric(updates["Case Qty"], errors='coerce').fillna(0) * updates["New_Pack"]
+                else:
+                     pos_out["addstock"] = 0
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
-                st.download_button("⬇️ Download POS Update", to_csv_bytes(pos_final), f"POS_Update_{selected_store}.csv", "text/csv")
+                st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
             else:
-                st.info("No cost/pack changes detected.")
+                st.info("No cost or pack changes detected against current Pricebook.")
             
             unmatched = merged[merged["Upc"].isna()].copy()
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
                 st.dataframe(unmatched[["UPC", "Description", "+Cost"]])
-
    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
