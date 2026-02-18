@@ -343,6 +343,7 @@ with tab_invoice:
                 pos_out.loc[mask, "cost_cents"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Cost_Cents"])
                 pos_out.loc[mask, "cost_qty"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Pack"])
                 
+                # Filter to changed rows
                 pos_final = pos_out[mask].copy().drop(columns=["_key"])
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
@@ -370,7 +371,10 @@ with tab_invoice:
                 st.stop()
             
             # 1. Normalize DB Keys
-            map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
+            # Invoice UPC in Key is the link to Item Number (e.g., 9098459)
+            # Full Barcode in Key is the link to Pricebook (e.g., 070897...)
+            map_df["_map_key_inv"] = map_df["Invoice UPC"].astype(str).str.strip()
+            map_df["_map_key_upc"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
             for f in inv_files:
@@ -385,21 +389,19 @@ with tab_invoice:
             if not rows: st.stop()
             inv_df = pd.concat(rows, ignore_index=True)
             
-            # --- DOUBLE-MATCH LOGIC ---
-            inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
-            if "Item Number" in inv_df.columns:
-                 inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
-            else:
-                 inv_df["_key_item"] = "000000000000"
-
-            # Match 1: Item Number -> DB
-            match_1 = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key_norm", how="left")
-            # Match 2: UPC -> DB
-            match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
+            # --- ROBUST MATCHING LOGIC ---
+            # 1. Match on Item Number (Primary)
+            inv_df["_key_item"] = inv_df["Item Number"].astype(str).str.strip()
+            match_1 = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key_inv", how="left", suffixes=("_inv", ""))
             
-            # Combine
+            # 2. Match on UPC (Secondary)
+            inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
+            match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_upc", how="left", suffixes=("_inv", ""))
+            
+            # 3. Combine: Prioritize Item Number match, fall back to UPC match
             mapped = match_1.combine_first(match_2)
             
+            # Separate Found vs Missing
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
@@ -444,11 +446,10 @@ with tab_invoice:
 
             # --- VALID ITEMS PROCESSING ---
             if not valid.empty:
+                # Link to Pricebook via Full Barcode
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 
-                # --- MERGE WITH PRICEBOOK (Fixed for Column Preservation) ---
-                # suffixes=("_inv", "") means Pricebook columns keep their original names (e.g., "Name", "Size")
-                # Invoice columns get renamed (e.g., "Name_inv", "Size_inv")
+                # Merge with Pricebook (Keep Pricebook columns pure by suffixing invoice cols)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left", suffixes=("_inv", ""))
                 
                 # --- CALCULATIONS ---
@@ -472,10 +473,10 @@ with tab_invoice:
                 view_df["Old Cost"] = view_df["PB_Cost_Cents"] / 100.0
                 view_df["New Cost"] = view_df["Inv_Cost_Cents"] / 100.0
                 
-                # Pick best name column (Invoice Name first, then Pricebook Name)
+                # Pick name (Invoice name preferred, then Pricebook name)
                 if "Item Name" in view_df.columns: name_col = "Item Name"
-                elif "Name_inv" in view_df.columns: name_col = "Name_inv"
                 elif "Name" in view_df.columns: name_col = "Name"
+                elif "Name_inv" in view_df.columns: name_col = "Name_inv"
                 else: name_col = "Full Barcode"
 
                 st.dataframe(view_df[["Full Barcode", name_col, "Invoice_Cases", "PACK_DB", "Calculated_AddStock", "Old Cost", "New Cost"]])
@@ -489,7 +490,7 @@ with tab_invoice:
                     st.success("No Cost Changes Detected.")
 
                 # --- GENERATE COMPLETE POS UPDATE FILE ---
-                # 1. Map Updates (Key = Normalized Full Barcode from DB)
+                # 1. Map Updates (Key = Normalized Full Barcode)
                 updates_map = final_check.set_index("_sys_upc_norm")[["Calculated_AddStock", "Inv_Cost_Cents", "PACK_DB"]].to_dict(orient="index")
                 
                 # 2. Start with FULL Pricebook
@@ -499,7 +500,7 @@ with tab_invoice:
                 pb_upc_col = "Upc" if "Upc" in pos_export.columns else ("UPC" if "UPC" in pos_export.columns else pos_export.columns[0])
                 pos_export["_key"] = pos_export[pb_upc_col].astype(str).apply(_norm_upc_12)
                 
-                # 4. Apply Updates
+                # 4. Apply Updates Row-by-Row
                 def apply_updates(row):
                     k = row["_key"]
                     if k in updates_map:
@@ -516,9 +517,9 @@ with tab_invoice:
                 # 5. Filter: Keep ONLY items that matched (AddStock > 0)
                 pos_final = pos_export[pos_export["addstock"] > 0].copy()
                 
-                # 6. Drop Helper Column and Ensure Original Columns Only
+                # 6. Clean and Sort columns
                 pos_final = pos_final.drop(columns=["_key"])
-                pos_final = pos_final[pb_df.columns] # Ensure strict column order
+                pos_final = pos_final[pb_df.columns] # Strict original order
                 
                 if not pos_final.empty:
                     st.download_button(
