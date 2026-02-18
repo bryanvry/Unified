@@ -546,36 +546,23 @@ with tab_invoice:
             
             inv_df = pd.concat(rows, ignore_index=True)
 
-            # --- CRITICAL FIX: Ensure 'Item Number' exists (for parsers that don't find it) ---
+            # --- CRITICAL FIX: Ensure 'Item Number' exists ---
             if "Item Number" not in inv_df.columns:
                 inv_df["Item Number"] = ""
             
             # ==============================================================================
             # PRIORITY MATCHING LOGIC
-            # Goal: Match Invoice Item -> Database Key
-            # Priority 1: Invoice "Item Number" matches DB "Invoice UPC"
-            # Priority 2: Invoice "UPC" matches DB "Invoice UPC"
             # ==============================================================================
-
-            # 1. Normalize Keys for matching
-            # Database Key (The Source of Truth)
             map_df["_map_key"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
-            
-            # Invoice Candidate 1: Item Number
             inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
-            
-            # Invoice Candidate 2: UPC
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
-            # 2. Execute Priority 1 (Item Number)
+            # Priority 1: Item Number
             merged_item = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key", how="left", suffixes=("", "_map"))
-            
-            # Check matches
             mask_matched = merged_item["Full Barcode"].notna()
             
-            # 3. Execute Priority 2 (UPC) for UNMATCHED rows only
+            # Priority 2: UPC (for unmatched)
             unmatched_df = inv_df[~inv_df.index.isin(merged_item[mask_matched].index)].copy()
-            
             if not unmatched_df.empty:
                 merged_upc = unmatched_df.merge(map_df, left_on="_key_upc", right_on="_map_key", how="left", suffixes=("", "_map"))
                 mapped = pd.concat([merged_item[mask_matched], merged_upc], ignore_index=True)
@@ -584,11 +571,16 @@ with tab_invoice:
 
             # --------------------------------------------
             
-            # 1. Handle "Not in Master"
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
+            
+            # --- LOG ACTIVITY ---
+            # We count changes later, but for now we log items found
+            # We'll need to calculate changes first to log accurately, 
+            # so we defer the log call until after valid items processing below.
+            changes_count = 0 
+            # --------------------
 
-            # --- STATUS SUMMARY ---
             st.markdown(f"""
             ### 📊 Status Report
             * **Items Found on Invoice:** {len(inv_df)}
@@ -596,16 +588,13 @@ with tab_invoice:
             * **Missing from Map:** {len(missing)}
             """)
 
-            # --- RESTORED: DISPLAY FOUND ITEMS TABLE ---
             st.subheader("Invoice Items Found")
-            # Show the raw invoice data so you can verify what was scanned
             st.dataframe(inv_df, use_container_width=True)
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items are not in your Database Map.")
                 st.caption("Please add the Full Barcode below and click 'Save to Map'.")
                 
-                # Show the ID we FAILED on (Item Number preferred, else UPC)
                 missing["_display_id"] = missing["Item Number"]
                 missing.loc[missing["_display_id"] == "", "_display_id"] = missing["UPC"]
                 
@@ -642,13 +631,16 @@ with tab_invoice:
                 
                 # --- A. DETECT COST CHANGES ---
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
+                changes_count = len(changes)
+                
+                # NOW WE LOG
+                log_activity(selected_store, vendor, len(inv_df), changes_count)
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     
                     display_changes = pd.DataFrame()
                     display_changes["Barcode"] = changes["Full Barcode"]
-                    # Fix Name Collision: Priority Name_y (Pricebook) > Name_x (Vendor) > Name
                     if "Name_y" in changes.columns:
                         display_changes["Item"] = changes["Name_y"]
                     elif "Name_x" in changes.columns:
@@ -682,10 +674,9 @@ with tab_invoice:
                 
                 pos_out = pd.DataFrame()
                 
-                # EXPLICIT: Use Full Barcode from the Map/DB, never the Invoice UPC
-                # FORMAT CHANGE: Add ="..." wrapper to force Excel string format
+                # Clean & Format UPC
                 raw_upc = final_check["Full Barcode"].astype(str)
-                pos_out["Upc"] = raw_upc.apply(lambda x: f'="{x}"')
+                pos_out["Upc"] = raw_upc.apply(lambda x: f'="{x.replace("=", "").replace('"', "").strip()}"')
                 
                 pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
                 pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
