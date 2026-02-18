@@ -333,18 +333,17 @@ with tab_invoice:
             
             if not updates.empty:
                 # --- FULL POS UPDATE ---
-                # Map updates to Normalized UPC
                 update_map = updates.set_index("_norm_upc")[["New_Cost_Cents", "New_Pack"]].to_dict(orient="index")
                 
                 pos_out = pb_df.copy()
                 pos_out["_key"] = pos_out["_norm_upc"]
                 
-                # Apply updates strictly to matched rows
+                # Apply updates
                 mask = pos_out["_key"].isin(update_map.keys())
                 pos_out.loc[mask, "cost_cents"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Cost_Cents"])
                 pos_out.loc[mask, "cost_qty"] = pos_out.loc[mask, "_key"].map(lambda x: update_map[x]["New_Pack"])
                 
-                # Filter to only changed rows
+                # Filter to changed rows and original columns
                 pos_final = pos_out[mask].copy().drop(columns=["_key"])
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
@@ -387,7 +386,7 @@ with tab_invoice:
             if not rows: st.stop()
             inv_df = pd.concat(rows, ignore_index=True)
             
-            # --- DOUBLE-MATCH LOGIC ---
+            # --- DOUBLE-MATCH LOGIC (Priority: Item Number -> UPC) ---
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             if "Item Number" in inv_df.columns:
                  inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
@@ -399,7 +398,7 @@ with tab_invoice:
             # Match 2: UPC -> DB
             match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
             
-            # Combine
+            # Combine: Prefer match_1 (Item Number), fill gaps with match_2 (UPC)
             mapped = match_1.combine_first(match_2)
             
             missing = mapped[mapped["Full Barcode"].isna()].copy()
@@ -408,10 +407,11 @@ with tab_invoice:
             # --- MISSING ITEMS EDITOR ---
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Items matched against both 'Item Number' and 'UPC'.")
+                st.caption("These items were not found via Item Number OR UPC.")
                 
                 prefill_upc = missing["UPC"]
                 if "Item Number" in missing.columns:
+                     # Prefill with Item Number if valid, else UPC
                      prefill_upc = np.where(missing["Item Number"].fillna("") != "", missing["Item Number"], missing["UPC"])
 
                 missing_edit = pd.DataFrame({
@@ -446,42 +446,38 @@ with tab_invoice:
 
             # --- VALID ITEMS PROCESSING ---
             if not valid.empty:
+                # Use Full Barcode to match Pricebook
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
-                # Merge with Pricebook
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
                 # --- CALCULATIONS ---
-                # 1. Costs (Convert invoice $ to cents)
+                # Costs
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
                 final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors='coerce').fillna(0).astype(int)
                 
-                # 2. Stock (Invoice Cases * Pricebook Pack)
+                # Stock (Invoice Cases * Pricebook Pack)
                 final_check["PACK_DB"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
                 final_check["Invoice_Cases"] = pd.to_numeric(final_check["Cases"], errors='coerce').fillna(0).astype(int)
                 final_check["Calculated_AddStock"] = final_check["Invoice_Cases"] * final_check["PACK_DB"]
                 
-                # 3. Diff check
+                # Diff check
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
                 
-                # --- DISPLAY: ALL FOUND ITEMS ---
+                # --- DISPLAY: ALL FOUND ITEMS (Requested View) ---
                 st.divider()
                 st.subheader(f"✅ Found {len(final_check)} Items on Invoice")
                 
-                # Create friendly display columns
                 view_df = final_check.copy()
                 view_df["Old Cost"] = view_df["PB_Cost_Cents"] / 100.0
                 view_df["New Cost"] = view_df["Inv_Cost_Cents"] / 100.0
                 
-                # Smart Name Column (Invoice name preferred, else DB name)
-                if "Item Name" in view_df.columns:
-                    name_col = "Item Name"
-                elif "Name" in view_df.columns:
-                    name_col = "Name"
-                elif "Name_x" in view_df.columns:
-                    name_col = "Name_x"
-                else:
-                    name_col = "Full Barcode"
+                # Pick best name column
+                if "Item Name" in view_df.columns: name_col = "Item Name"
+                elif "Name" in view_df.columns: name_col = "Name"
+                elif "Name_x" in view_df.columns: name_col = "Name_x"
+                else: name_col = "Full Barcode"
 
+                # Show Full Barcode, Invoice Item Info, Stock Arrived, and Cost
                 st.dataframe(view_df[["Full Barcode", name_col, "Invoice_Cases", "PACK_DB", "Calculated_AddStock", "Old Cost", "New Cost"]])
 
                 # --- DISPLAY: COST CHANGES ---
@@ -493,35 +489,33 @@ with tab_invoice:
                     st.success("No Cost Changes Detected.")
 
                 # --- GENERATE ROBUST POS UPDATE FILE ---
-                # 1. Map Updates (Key = Normalized UPC)
-                # We need to map: AddStock, Cost, Cost Qty
+                # 1. Map Updates (Key = Normalized Full Barcode from DB)
                 updates_map = final_check.set_index("_sys_upc_norm")[["Calculated_AddStock", "Inv_Cost_Cents", "PACK_DB"]].to_dict(orient="index")
                 
-                # 2. Start with FULL Pricebook (to keep all columns)
+                # 2. Start with FULL Pricebook
                 pos_export = pb_df.copy()
                 
-                # 3. Identify Pricebook's UPC column dynamically
-                # (Usually "Upc" or "UPC", load_pricebook handles this but let's be safe)
+                # 3. Match Keys
                 pb_upc_col = "Upc" if "Upc" in pos_export.columns else ("UPC" if "UPC" in pos_export.columns else pos_export.columns[0])
-                
-                # 4. Create Match Key
                 pos_export["_key"] = pos_export[pb_upc_col].astype(str).apply(_norm_upc_12)
                 
-                # 5. Apply Updates Vectorized
-                # mask = rows in PB that are on the invoice
-                mask = pos_export["_key"].isin(updates_map.keys())
+                # 4. Apply Updates
+                # Helper function to update row if matched, else zero out addstock
+                def apply_updates(row):
+                    k = row["_key"]
+                    if k in updates_map:
+                        u = updates_map[k]
+                        row["addstock"] = u["Calculated_AddStock"]
+                        row["cost_cents"] = u["Inv_Cost_Cents"]
+                        row["cost_qty"] = u["PACK_DB"]
+                    else:
+                        row["addstock"] = 0
+                    return row
+
+                pos_export = pos_export.apply(apply_updates, axis=1)
                 
-                # Update AddStock: matched get calculated value, unmatched get 0
-                pos_export["addstock"] = pos_export["_key"].map(lambda x: updates_map[x]["Calculated_AddStock"] if x in updates_map else 0)
-                
-                # Update Cost/Pack: matched get new values, unmatched stay same
-                pos_export.loc[mask, "cost_cents"] = pos_export.loc[mask, "_key"].map(lambda x: updates_map[x]["Inv_Cost_Cents"])
-                pos_export.loc[mask, "cost_qty"] = pos_export.loc[mask, "_key"].map(lambda x: updates_map[x]["PACK_DB"])
-                
-                # 6. Filter: Keep only items that arrived (addstock > 0)
+                # 5. Filter: Only items that arrived (AddStock > 0)
                 pos_final = pos_export[pos_export["addstock"] > 0].copy()
-                
-                # 7. Clean up helper column
                 pos_final = pos_final.drop(columns=["_key"])
                 
                 if not pos_final.empty:
