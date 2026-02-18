@@ -1,16 +1,27 @@
 # parsers/breakthru.py
+# Breakthru CSV parser → outputs columns: [UPC, Item Name, Cost, Cases, Item Number]
+# - UPC: "UPC Number(Each)" (may miss leading zeros → normalize to 12 digits)
+# - Item Name: "Item Description"
+# - Cases: "Quantity" (integer)
+# - Cost: per-case = "Net Value at Header Level" / "Quantity"
+# - Item Number: from "Item Number" (kept to allow UPC fallback in the app layer)
+#
+# Keeps invoice order. Skips rows with qty <= 0 or missing UPC/cost.
+# NOTE: The app will create a *download-only* version of invoice items where rows with
+# blank UPC will have "Item Number" substituted into the UPC column for manual fixing.
+
 from __future__ import annotations
 import io
 import pandas as pd
 import numpy as np
 
-# We now look for Item Number first
 REQ_BASE = [
     "UPC Number(Each)",
     "Item Description",
     "Net Value at Header Level",
     "Quantity",
 ]
+# Item Number can sometimes be missing; treat as optional but prefer to include.
 OPT_ITEMNUM = ["Item Number", "ItemNumber", "Item No", "Item #", "Item"]
 
 def _digits(s: str) -> str:
@@ -37,7 +48,7 @@ def _find_col(cols, candidates):
 
 class BreakthruParser:
     name = "Breakthru"
-    tokens = REQ_BASE[:]
+    tokens = REQ_BASE[:]  # for any upstream token sniffing
 
     def parse(self, uploaded_file) -> pd.DataFrame:
         raw = uploaded_file.read()
@@ -56,7 +67,6 @@ class BreakthruParser:
         if not all([c_upc, c_name, c_net, c_qty]):
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
-        # Calculations
         qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
         net = (
             df[c_net].astype(str)
@@ -64,41 +74,34 @@ class BreakthruParser:
             .pipe(pd.to_numeric, errors="coerce")
             .fillna(0.0)
         )
+        # cost per case; NaN when qty == 0 (filtered later)
         cost = net / qty.replace(0, np.nan)
 
-        # LOGIC CHANGE: Prioritize Item Number over UPC
-        # Because your Key File uses Item Number in the 'Invoice UPC' column.
-        if c_itemn:
-            # We use the Item Number as the "UPC" for matching
-            # We strip whitespace but leave it raw (app will normalize/pad it)
-            upc_col = df[c_itemn].astype(str).str.strip()
-            # If Item Number is missing for a row, fallback to the real UPC
-            real_upc = df[c_upc].astype(str).map(_norm12)
-            upc_col = np.where(upc_col == "", real_upc, upc_col)
-            item_num_col = df[c_itemn].astype(str).str.strip()
-        else:
-            upc_col = df[c_upc].astype(str).map(_norm12)
-            item_num_col = ""
-
         out = pd.DataFrame({
-            "UPC": upc_col,
+            "UPC": df[c_upc].astype(str).map(_norm12),
             "Item Name": df[c_name].astype(str).str.strip(),
             "Cost": pd.to_numeric(cost, errors="coerce"),
             "Cases": qty,
-            "Item Number": item_num_col,
             "_order": range(len(df)),
         })
 
-        # Filter out bad rows (Service Fees, zero qty)
+        # Optional Item Number
+        if c_itemn:
+            out["Item Number"] = df[c_itemn].astype(str).str.strip()
+        else:
+            out["Item Number"] = ""
+
+        # Filter invalid rows for processing
         out = out[
-            out["Cases"].gt(0) & 
-            out["Cost"].ge(0.01) & 
-            (out["UPC"] != "") & 
-            (out["UPC"] != "000000000000")
+            out["Cases"].gt(0) & out["Cost"].ge(0.01)
         ].copy()
 
         if out.empty:
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
+        # Preserve invoice order; ensure UPC textual for downloads
         out = out.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+        out["UPC"] = out["UPC"].astype(str)
+
+        # Return with Item Number so the app can do the UPC fallback for the download only
         return out[["UPC", "Item Name", "Cost", "Cases", "Item Number"]]
