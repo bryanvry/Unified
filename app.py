@@ -362,7 +362,7 @@ with tab_invoice:
                 st.error("Vendor Map is empty.")
                 st.stop()
             
-            # 1. Normalize DB Keys for better matching
+            # 1. Normalize DB Keys
             map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
@@ -376,25 +376,44 @@ with tab_invoice:
                     rows.append(BreakthruParser().parse(f))
             
             if not rows: st.stop()
-            
             inv_df = pd.concat(rows, ignore_index=True)
             
-            # 2. Normalize Invoice Keys
-            inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
+            # --- THE DOUBLE-MATCH LOGIC ---
             
-            # 3. Match
-            mapped = inv_df.merge(map_df, left_on="_inv_upc_norm", right_on="_map_key_norm", how="left")
+            # A. Prepare Keys
+            inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
+            if "Item Number" in inv_df.columns:
+                 inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
+            else:
+                 inv_df["_key_item"] = "000000000000"
+
+            # B. Match 1: Try Item Number -> Invoice UPC
+            match_1 = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key_norm", how="left")
+            
+            # C. Match 2: Try UPC -> Invoice UPC
+            match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
+            
+            # D. Combine: Take Match 1, if failed, take Match 2
+            # We use combine_first which fills NULLs in match_1 with values from match_2
+            mapped = match_1.combine_first(match_2)
+            
+            # --- END DOUBLE MATCH ---
             
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Add these to the Map to link them.")
+                st.caption("Items matched against both 'Item Number' and 'UPC'. Please add remaining items to map.")
                 
-                # Prefill 'Invoice UPC' for easy adding
+                # Logic: Prefill with Item Number if available, else UPC
+                prefill_upc = missing["UPC"]
+                if "Item Number" in missing.columns:
+                     # Use Item Number if valid, otherwise UPC
+                     prefill_upc = np.where(missing["Item Number"].fillna("") != "", missing["Item Number"], missing["UPC"])
+
                 missing_edit = pd.DataFrame({
-                    "Invoice UPC": missing["UPC"],
+                    "Invoice UPC": prefill_upc,
                     "Name": missing["Item Name"],
                     "Full Barcode": "",
                     "PACK": 1,
@@ -411,7 +430,6 @@ with tab_invoice:
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
                         
-                        # Only insert known columns
                         db_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company"]
                         final_insert = pd.DataFrame()
                         for c in db_cols:
@@ -428,7 +446,7 @@ with tab_invoice:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
-                # --- FIXED: No Renaming. Uses 'Item Name' from Invoice ---
+                # Logic: Uses Invoice 'Item Name' (safe from crash)
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
                 final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors='coerce').fillna(0).astype(int)
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
@@ -438,21 +456,13 @@ with tab_invoice:
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     
-                    # Display using 'Item Name' (Invoice Name) which is guaranteed to be unique now
-                    # (Or 'Name_x' if pandas created suffixes)
+                    # Safe Display
                     display_cols = ["Full Barcode", "Cost", "cost_cents", "Diff"]
-                    
-                    # Smart Column Selection for Name
                     if "Item Name" in changes.columns:
                         display_cols.insert(1, "Item Name")
-                    elif "Name" in changes.columns:
-                        display_cols.insert(1, "Name")
-                    elif "Name_x" in changes.columns:
-                        display_cols.insert(1, "Name_x")
-
+                    
                     st.dataframe(changes[display_cols])
                     
-                    # POS Update Download
                     pos_update = pd.DataFrame({
                         "Upc": changes["Upc"],
                         "cost_cents": changes["Inv_Cost_Cents"],
@@ -461,6 +471,62 @@ with tab_invoice:
                     st.download_button("⬇️ Download Cost Updates", to_csv_bytes(pos_update), f"Cost_Update_{vendor}.csv", "text/csv")
                 else:
                     st.success("All mapped items match Pricebook costs.")
+
+    # --- COSTCO ---
+    elif vendor == "Costco":
+        st.header("Costco Processor")
+        st.markdown("**Note:** Upload your Costco Master List manually.")
+        
+        costco_master = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
+        costco_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
+
+        if st.button("Process Costco Receipt"):
+            if not costco_master or not costco_text:
+                st.error("Please provide both Master file and Receipt text.")
+            else:
+                try:
+                    parsed_df = CostcoParser().parse(costco_text)
+                    if parsed_df.empty:
+                        st.error("No items found in receipt.")
+                    else:
+                        master_df = pd.read_excel(costco_master, dtype=str)
+                        m_item_num = next((c for c in ["Item Number", "Item #"] if c in master_df.columns), "Item Number")
+                        m_cost = next((c for c in ["Cost"] if c in master_df.columns), "Cost")
+                        
+                        master_df["_item_str"] = master_df[m_item_num].astype(str).str.strip()
+                        master_df["_cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
+                        item_cost_map = dict(zip(master_df["_item_str"], master_df["_cost_float"]))
+                        
+                        parsed_df["Item Number"] = parsed_df["Item Number"].astype(str).str.strip()
+                        
+                        results = []
+                        for _, row in parsed_df.iterrows():
+                            item = row["Item Number"]
+                            price = float(row["Receipt Price"])
+                            known_cost = item_cost_map.get(item, 0.0)
+                            
+                            qty = 1
+                            if known_cost > 0:
+                                ratio = price / known_cost
+                                if abs(ratio - round(ratio)) < 0.05:
+                                    qty = int(round(ratio))
+                                    if qty == 0: qty = 1
+                            
+                            results.append({
+                                "Item Number": item,
+                                "Description": row["Item Name"],
+                                "Receipt Price": price,
+                                "Calc Qty": qty,
+                                "Unit Cost": price / qty
+                            })
+                        
+                        res_df = pd.DataFrame(results)
+                        st.success(f"Processed {len(res_df)} items.")
+                        st.dataframe(res_df)
+                        st.download_button("⬇️ Download Costco Report", to_xlsx_bytes({"Costco": res_df}), "Costco_Report.xlsx")
+                        
+                except Exception as e:
+                    st.error(f"Error processing master/receipt: {e}")
 # ==============================================================================
 # TAB 3: ADMIN / UPLOADS
 # ==============================================================================
