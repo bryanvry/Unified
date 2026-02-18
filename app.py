@@ -285,7 +285,6 @@ with tab_invoice:
         inv_dfs = []
         should_process = False
 
-        # Unified UI
         if vendor == "Unified":
             up_files = st.file_uploader("Upload Unified Invoice(s)", accept_multiple_files=True, key="un_files")
             if up_files and st.button("Process Unified"):
@@ -298,7 +297,6 @@ with tab_invoice:
                         st.error(f"Error parsing {f.name}: {e}")
                 should_process = True
         
-        # JC Sales UI
         elif vendor == "JC Sales":
             jc_text = st.text_area("Paste JC Sales Text", height=200)
             if jc_text and st.button("Process JC Sales"):
@@ -321,6 +319,7 @@ with tab_invoice:
 
             full_inv = pd.concat(inv_dfs, ignore_index=True)
             full_inv["_norm_upc"] = full_inv["UPC"].astype(str).apply(_norm_upc_12)
+            
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
@@ -337,14 +336,10 @@ with tab_invoice:
                 pos_out["Upc"] = updates["Upc"]
                 pos_out["cost_cents"] = updates["New_Cost_Cents"]
                 pos_out["cost_qty"] = updates["New_Pack"]
-                
-                if "Case Qty" in updates.columns:
-                     pos_out["addstock"] = pd.to_numeric(updates["Case Qty"], errors='coerce').fillna(0) * updates["New_Pack"]
-                else:
-                     pos_out["addstock"] = 0
+                pos_out["addstock"] = 0
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
-                st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
+                st.download_button("⬇️ Download POS Update", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
             else:
                 st.info("No cost/pack changes detected.")
             
@@ -355,7 +350,7 @@ with tab_invoice:
 
     # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
-        st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
+        st.info(f"Using **BeerandLiquorKey** + **{PRICEBOOK_TABLE}**")
         
         inv_files = st.file_uploader(f"Upload {vendor} Invoice(s)", accept_multiple_files=True)
         
@@ -366,6 +361,10 @@ with tab_invoice:
             if map_df.empty: 
                 st.error("Vendor Map is empty.")
                 st.stop()
+            
+            # --- CRITICAL FIX: Normalize DB 'Invoice UPC' to ensure matching works ---
+            # This makes sure '9098459' in DB matches '000009098459' from invoice
+            map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
             for f in inv_files:
@@ -380,18 +379,24 @@ with tab_invoice:
             if not rows: st.stop()
             
             inv_df = pd.concat(rows, ignore_index=True)
+            
+            # Normalize Invoice IDs
             inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
-            mapped = inv_df.merge(map_df, on="_inv_upc_norm", how="left")
+            
+            # Match on NORMALIZED keys
+            mapped = inv_df.merge(map_df, left_on="_inv_upc_norm", right_on="_map_key_norm", how="left")
             
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Edit below and click 'Save to Map'.")
+                st.caption("Add these to the Map to link them.")
                 
-                edit_df = pd.DataFrame({
-                    "Invoice UPC": missing["UPC"],
+                # Pre-fill 'Invoice UPC' with the Item Number if available, otherwise UPC
+                # For Breakthru, we specifically want the Item Number if that's what we used
+                missing_edit = pd.DataFrame({
+                    "Invoice UPC": missing["Item Number"].replace("", np.nan).fillna(missing["UPC"]),
                     "Name": missing["Item Name"],
                     "Full Barcode": "",
                     "PACK": 1,
@@ -399,7 +404,7 @@ with tab_invoice:
                     "0": ""
                 })
                 
-                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
+                edited_rows = st.data_editor(missing_edit, num_rows="dynamic", key="editor_missing")
                 
                 if st.button("Save New Items to Map"):
                     to_insert = edited_rows[edited_rows["Full Barcode"].str.len() > 3].copy()
@@ -415,16 +420,29 @@ with tab_invoice:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
+                # Handle Name Duplication
+                if "Name_x" in final_check.columns:
+                    final_check = final_check.rename(columns={"Name_x": "Item Name"})
+                elif "Name" in final_check.columns:
+                    final_check = final_check.rename(columns={"Name": "Item Name"})
+
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
-                final_check["PB_Cost_Cents"] = final_check["cost_cents"].fillna(0).astype(int)
+                final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors='coerce').fillna(0).astype(int)
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
                 
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
-                    st.dataframe(changes[["Full Barcode", "Name_x", "Cost", "cost_cents", "Diff"]])
-                    st.download_button("⬇️ Download Cost Changes", to_csv_bytes(changes), f"Cost_Changes_{vendor}.csv", "text/csv")
+                    st.dataframe(changes[["Full Barcode", "Item Name", "Cost", "cost_cents", "Diff"]])
+                    
+                    # POS Update Download
+                    pos_update = pd.DataFrame({
+                        "Upc": changes["Upc"],
+                        "cost_cents": changes["Inv_Cost_Cents"],
+                        "cost_qty": changes["PACK"] # Assuming Pack size in Map matches POS
+                    })
+                    st.download_button("⬇️ Download Cost Updates", to_csv_bytes(pos_update), f"Cost_Update_{vendor}.csv", "text/csv")
                 else:
                     st.success("All mapped items match Pricebook costs.")
 
@@ -440,13 +458,12 @@ with tab_invoice:
             if not costco_master or not costco_text:
                 st.error("Please provide both Master file and Receipt text.")
             else:
-                parsed_df = CostcoParser().parse(costco_text)
-                if parsed_df.empty:
-                    st.error("No items found in receipt.")
-                else:
-                    try:
+                try:
+                    parsed_df = CostcoParser().parse(costco_text)
+                    if parsed_df.empty:
+                        st.error("No items found in receipt.")
+                    else:
                         master_df = pd.read_excel(costco_master, dtype=str)
-                        # Clean Master
                         m_item_num = next((c for c in ["Item Number", "Item #"] if c in master_df.columns), "Item Number")
                         m_cost = next((c for c in ["Cost"] if c in master_df.columns), "Cost")
                         
@@ -454,7 +471,6 @@ with tab_invoice:
                         master_df["_cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
                         item_cost_map = dict(zip(master_df["_item_str"], master_df["_cost_float"]))
                         
-                        # Auto-Match
                         parsed_df["Item Number"] = parsed_df["Item Number"].astype(str).str.strip()
                         
                         results = []
@@ -483,9 +499,8 @@ with tab_invoice:
                         st.dataframe(res_df)
                         st.download_button("⬇️ Download Costco Report", to_xlsx_bytes({"Costco": res_df}), "Costco_Report.xlsx")
                         
-                    except Exception as e:
-                        st.error(f"Error processing master file: {e}")
-
+                except Exception as e:
+                    st.error(f"Error processing master/receipt: {e}")
 # ==============================================================================
 # TAB 3: ADMIN / UPLOADS
 # ==============================================================================
