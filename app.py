@@ -332,12 +332,12 @@ with tab_invoice:
             updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
             
             if not updates.empty:
-                # --- FULL POS UPDATE (Preserve all DB columns) ---
+                # --- FULL POS UPDATE ---
                 pos_out = updates.copy()
                 pos_out["cost_cents"] = pos_out["New_Cost_Cents"]
                 pos_out["cost_qty"] = pos_out["New_Pack"]
                 
-                # Keep only columns that exist in the Pricebook (drop invoice cols)
+                # Restore headers
                 db_cols = [c for c in pb_df.columns if c in pos_out.columns]
                 pos_out = pos_out[db_cols]
                 
@@ -382,7 +382,6 @@ with tab_invoice:
             inv_df = pd.concat(rows, ignore_index=True)
             
             # --- DOUBLE-MATCH LOGIC ---
-            
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             if "Item Number" in inv_df.columns:
                  inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
@@ -394,7 +393,7 @@ with tab_invoice:
             # Match 2: UPC -> DB
             match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
             
-            # Combine: Prefer Match 1, fill with Match 2
+            # Combine
             mapped = match_1.combine_first(match_2)
             
             missing = mapped[mapped["Full Barcode"].isna()].copy()
@@ -440,6 +439,7 @@ with tab_invoice:
 
             if not valid.empty:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
+                # Merge with Pricebook
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
                 # --- COST LOGIC ---
@@ -452,32 +452,40 @@ with tab_invoice:
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     
-                    # --- 1. Fix Display to show Dollars ---
+                    # 1. DISPLAY LOGIC (Dollars)
                     changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
                     changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
                     
                     display_cols = ["Full Barcode", "Old Cost", "New Cost", "Diff"]
-                    
-                    # Smart Name selection
+                    # Add Name if available (prioritize Invoice name, fallback to PB name)
                     if "Item Name" in changes.columns:
                         display_cols.insert(1, "Item Name")
                     elif "Name" in changes.columns:
                         display_cols.insert(1, "Name")
                     elif "Name_x" in changes.columns:
                          display_cols.insert(1, "Name_x")
-
+                    
                     st.dataframe(changes[display_cols])
                     
-                    # --- 2. Fix POS Update to include ALL columns ---
+                    # 2. FULL POS UPDATE LOGIC (Preserve DB Columns)
                     pos_out = changes.copy()
                     pos_out["cost_cents"] = pos_out["Inv_Cost_Cents"]
                     pos_out["cost_qty"] = pos_out["PACK"]
                     
-                    # Keep ALL columns that exist in the Pricebook (Departments, Taxes, etc.)
-                    db_cols = [c for c in pb_df.columns if c in pos_out.columns]
-                    pos_out = pos_out[db_cols]
+                    # Reconstruct the original Pricebook columns
+                    final_cols = []
+                    for col in pb_df.columns:
+                        if col in pos_out.columns:
+                            final_cols.append(col)
+                        # Handle the case where merge renamed DB columns (e.g. Name -> Name_y)
+                        elif f"{col}_y" in pos_out.columns:
+                            pos_out[col] = pos_out[f"{col}_y"]
+                            final_cols.append(col)
                     
-                    st.download_button("⬇️ Download Cost Updates", to_csv_bytes(pos_out), f"Cost_Update_{vendor}.csv", "text/csv")
+                    # Filter pos_out to match the Pricebook structure exactly
+                    pos_out = pos_out[final_cols]
+                    
+                    st.download_button("⬇️ Download POS Update", to_csv_bytes(pos_out), f"POS_Update_{vendor}.csv", "text/csv")
                 else:
                     st.success("All mapped items match Pricebook costs.")
 
