@@ -362,7 +362,7 @@ with tab_invoice:
                 st.error("Vendor Map is empty.")
                 st.stop()
             
-            # 1. Normalize DB Keys
+            # 1. Normalize DB Keys (Pads DB keys to 12 digits)
             map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
@@ -380,21 +380,21 @@ with tab_invoice:
             
             # --- THE DOUBLE-MATCH LOGIC ---
             
-            # A. Prepare Keys
+            # A. Prepare Keys from Invoice (Pad both UPC and Item Number)
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
+            
             if "Item Number" in inv_df.columns:
                  inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
             else:
                  inv_df["_key_item"] = "000000000000"
 
-            # B. Match 1: Try Item Number -> Invoice UPC
+            # B. Match 1: Try to match Item Number -> DB Key
             match_1 = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key_norm", how="left")
             
-            # C. Match 2: Try UPC -> Invoice UPC
+            # C. Match 2: Try to match UPC -> DB Key
             match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
             
-            # D. Combine: Take Match 1, if failed, take Match 2
-            # We use combine_first which fills NULLs in match_1 with values from match_2
+            # D. Combine: Prioritize Match 1 (Item Number), fill gaps with Match 2 (UPC)
             mapped = match_1.combine_first(match_2)
             
             # --- END DOUBLE MATCH ---
@@ -406,10 +406,10 @@ with tab_invoice:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
                 st.caption("Items matched against both 'Item Number' and 'UPC'. Please add remaining items to map.")
                 
-                # Logic: Prefill with Item Number if available, else UPC
+                # Prefill: Suggest Item Number first, then UPC
                 prefill_upc = missing["UPC"]
                 if "Item Number" in missing.columns:
-                     # Use Item Number if valid, otherwise UPC
+                     # If Item Number is valid, suggest it as the Invoice UPC
                      prefill_upc = np.where(missing["Item Number"].fillna("") != "", missing["Item Number"], missing["UPC"])
 
                 missing_edit = pd.DataFrame({
