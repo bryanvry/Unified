@@ -122,27 +122,35 @@ with tab_order:
             except Exception as e:
                 st.error(f"Failed to process sales file: {e}")
 
-    # --- B. Generate Order Sheet ---
+    # --- B. Generate Order Sheet (Database Driven) ---
     with col_gen:
         st.subheader("2. Generate Order Sheet")
-        template_file = st.file_uploader("Upload Order Template (Beer/Liquor xlsx)", type=["xlsx"], key="template_upload")
         
-        if template_file and st.button("Generate Filled Order Sheet"):
+        # 1. Select Company to Generate For
+        target_company = st.selectbox("Select Company", ["Breakthru", "Southern Glazer's", "Nevada Beverage"])
+        
+        if st.button(f"Generate {target_company} Sheet"):
             try:
-                template_df = pd.read_csv(template_file) if template_file.name.endswith('.csv') else pd.read_excel(template_file)
-                template_df.columns = [c.strip() for c in template_df.columns]
+                conn = get_db_connection()
                 
-                key_col = None
-                for c in ["Full Barcode", "Full UPC", "UPC", "Barcode"]:
-                    if c in template_df.columns:
-                        key_col = c
-                        break
+                # 1. Fetch Vendor Map for this Company
+                # We normalize the Full Barcode immediately for matching
+                map_query = f"""
+                    SELECT "Full Barcode", "Name", "Size", "PACK", "Company" 
+                    FROM "BeerandLiquorKey" 
+                    WHERE "Company" = '{target_company}'
+                """
+                vendor_df = conn.query(map_query, ttl=0)
                 
-                if not key_col:
-                    st.error("Could not find a UPC column in template (Full Barcode, Full UPC, UPC).")
+                if vendor_df.empty:
+                    st.warning(f"No items found for {target_company} in BeerandLiquorKey.")
                 else:
+                    vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
+                    
+                    # 2. Fetch Current Stock/Price (Pricebook)
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    conn = get_db_connection()
+                    
+                    # 3. Fetch Recent Sales (Last 8 Weeks)
                     start_date = datetime.today() - timedelta(weeks=8)
                     sales_query = f"""
                         SELECT "UPC", "week_date", "qty_sold" 
@@ -151,9 +159,10 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    template_df["_key_norm"] = template_df[key_col].astype(str).apply(_norm_upc_12)
-                    merged = template_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
+                    # 4. Merge: Vendor Map + Pricebook
+                    merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
+                    # 5. Pivot & Merge Sales
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
                         sales_pivot = sales_hist.pivot_table(
@@ -162,28 +171,40 @@ with tab_order:
                             values="qty_sold", 
                             aggfunc="sum"
                         ).fillna(0)
+                        # Join Sales to the Master List
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    if "Stock" in merged.columns:
-                        merged["Stock"] = merged["setstock"]
+                    # 6. Formatting for the User
+                    # Fill NaNs for cleaner looking sheet
+                    if "setstock" in merged.columns:
+                        merged["Current Stock"] = merged["setstock"].fillna(0)
+                    else:
+                        merged["Current Stock"] = 0
+
+                    merged["Cost"] = merged["cost_cents"] / 100.0
                     
-                    merged["Current Cost"] = merged["cost_cents"] / 100.0
-                    merged["Current Price"] = merged["cents"] / 100.0
+                    # Select & Rename Columns for the final Excel
+                    base_cols = ["Full Barcode", "Name", "Size", "PACK", "Current Stock", "Cost"]
                     
-                    drop_cols = ["_key_norm", "_norm_upc", "setstock", "cost_cents", "cents", "cost_qty"]
-                    final_df = merged.drop(columns=[c for c in drop_cols if c in merged.columns], errors='ignore')
+                    # Get dynamic date columns (the pivoted sales weeks)
+                    sales_cols = [c for c in merged.columns if isinstance(c, (str, datetime)) and c not in base_cols and c not in vendor_df.columns and c not in pb_df.columns]
+                    # Filter to ensure we only keep the valid date columns we just pivoted
+                    sales_cols = [c for c in sales_cols if str(c).startswith('20')]
+                    
+                    final_cols = base_cols + sorted(sales_cols, key=str, reverse=True) # Most recent dates first
+                    
+                    final_df = merged[final_cols].copy()
                     
                     st.download_button(
-                        "⬇️ Download Filled Order Sheet",
-                        data=to_xlsx_bytes({"OrderSheet": final_df}),
-                        file_name=f"Filled_{template_file.name}",
+                        f"⬇️ Download {target_company} Order Sheet",
+                        data=to_xlsx_bytes({target_company: final_df}),
+                        file_name=f"{target_company}_OrderSheet_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
-                    st.success("Order Sheet Generated!")
+                    st.success(f"Generated sheet with {len(final_df)} items.")
                     
             except Exception as e:
                 st.error(f"Error generating sheet: {e}")
-
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
