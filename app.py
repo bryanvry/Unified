@@ -214,60 +214,60 @@ with tab_order:
                     st.session_state['order_df'] = merged[final_cols].copy()
                     st.session_state['active_company'] = target_company
 
-            # 2. Render Interactive Table (If data exists)
-            if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
-                st.divider()
-                st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
-                
-                # Editable Dataframe
-                edited_df = st.data_editor(
-                    st.session_state['order_df'],
-                    use_container_width=True,
-                    height=600,
-                    column_config={
-                        "Order": st.column_config.NumberColumn(
-                            "Order Qty",
-                            help="Enter cases to order",
-                            min_value=0,
-                            step=1,
-                            required=True
-                        ),
-                        "Stock": st.column_config.NumberColumn(
-                            "Stock",
-                            disabled=True # Prevent editing stock
-                        )
-                    },
-                    hide_index=True
-                )
-                
-                # 3. Finish & Download
-                if st.button("Finish & Download Order"):
-                    # Filter: Order > 0
-                    final_order = edited_df[edited_df["Order"] > 0].copy()
-                    
-                    if final_order.empty:
-                        st.warning("No items ordered (Order Qty is 0 for all rows).")
-                    else:
-                        # Sort Alphabetically by Name
-                        final_order = final_order.sort_values(by="Name", ascending=True)
-                        
-                        # Select only requested columns
-                        output_cols = ["Name", "Size", "Order"]
-                        # Ensure columns exist before selecting
-                        valid_cols = [c for c in output_cols if c in final_order.columns]
-                        
-                        download_df = final_order[valid_cols]
-                        
-                        st.download_button(
-                            label=f"⬇️ Download {st.session_state['active_company']} Order",
-                            data=to_xlsx_bytes({st.session_state['active_company']: download_df}),
-                            file_name=f"ORDER_{st.session_state['active_company']}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                        st.success(f"Ready! Contains {len(download_df)} items.")
-
         except Exception as e:
             st.error(f"System Error: {e}")
+
+    # 2. Render Interactive Table (Moved OUTSIDE col_gen to use full width)
+    if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
+        st.divider()
+        st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
+        
+        # Editable Dataframe
+        edited_df = st.data_editor(
+            st.session_state['order_df'],
+            use_container_width=True,
+            height=600,
+            column_config={
+                "Order": st.column_config.NumberColumn(
+                    "Order Qty",
+                    help="Enter cases to order",
+                    min_value=0,
+                    step=1,
+                    required=True
+                ),
+                "Stock": st.column_config.NumberColumn(
+                    "Stock",
+                    disabled=True # Prevent editing stock
+                )
+            },
+            hide_index=True
+        )
+        
+        # 3. Finish & Download
+        if st.button("Finish & Download Order"):
+            # Filter: Order > 0
+            final_order = edited_df[edited_df["Order"] > 0].copy()
+            
+            if final_order.empty:
+                st.warning("No items ordered (Order Qty is 0 for all rows).")
+            else:
+                # Sort Alphabetically by Name
+                final_order = final_order.sort_values(by="Name", ascending=True)
+                
+                # Select only requested columns
+                output_cols = ["Name", "Size", "Order"]
+                # Ensure columns exist before selecting
+                valid_cols = [c for c in output_cols if c in final_order.columns]
+                
+                download_df = final_order[valid_cols]
+                
+                st.download_button(
+                    label=f"⬇️ Download {st.session_state['active_company']} Order",
+                    data=to_xlsx_bytes({st.session_state['active_company']: download_df}),
+                    file_name=f"ORDER_{st.session_state['active_company']}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.success(f"Ready! Contains {len(download_df)} items.")
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
