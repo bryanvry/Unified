@@ -4,6 +4,7 @@ import io
 import pandas as pd
 import numpy as np
 
+# We look for these columns
 REQ_BASE = [
     "UPC Number(Each)",
     "Item Description",
@@ -54,7 +55,7 @@ class BreakthruParser:
         if not all([c_upc, c_name, c_net, c_qty]):
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
-        # Calculations
+        # Calculations (Net / Qty = Case Cost)
         qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
         net = (
             df[c_net].astype(str)
@@ -64,8 +65,7 @@ class BreakthruParser:
         )
         cost = net / qty.replace(0, np.nan)
 
-        # Output raw columns
-        # We DO NOT normalize Item Number here; we leave it raw so it matches your DB exactly
+        # Extraction
         out = pd.DataFrame({
             "UPC": df[c_upc].astype(str).map(_norm12),
             "Item Name": df[c_name].astype(str).str.strip(),
@@ -79,17 +79,9 @@ class BreakthruParser:
         else:
             out["Item Number"] = ""
 
-        # --- FILTER LOGIC ---
-        # Keep row if it has (Valid UPC) OR (Valid Item Number)
-        # This fixes the issue where items without UPCs were disappearing
-        has_upc = (out["UPC"] != "") & (out["UPC"] != "000000000000")
-        has_item = (out["Item Number"] != "") & (out["Item Number"] != "000000000000")
-        
-        out = out[
-            out["Cases"].gt(0) & 
-            out["Cost"].ge(0.01) & 
-            (has_upc | has_item)
-        ].copy()
+        # FILTER: Keep row if it has VALID COST and (UPC OR Item Number)
+        has_id = (out["UPC"].str.len() > 0) | (out["Item Number"].str.len() > 0)
+        out = out[out["Cases"].gt(0) & out["Cost"].ge(0.01) & has_id].copy()
 
         if out.empty:
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
