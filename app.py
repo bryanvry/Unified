@@ -390,8 +390,7 @@ with tab_invoice:
             
             inv_df = pd.concat(rows, ignore_index=True)
 
-            # --- CRITICAL FIX: Ensure 'Item Number' exists ---
-            # Southern Glazer's parser doesn't output this column, so we fill it if missing.
+            # --- CRITICAL FIX: Ensure 'Item Number' exists (for parsers that don't find it) ---
             if "Item Number" not in inv_df.columns:
                 inv_df["Item Number"] = ""
             
@@ -413,20 +412,16 @@ with tab_invoice:
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
             # 2. Execute Priority 1 (Item Number)
-            # We assume this is the specific match (e.g. 3-pack specific ID)
             merged_item = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key", how="left", suffixes=("", "_map"))
             
-            # Check which rows successfully found a "Full Barcode" using Item Number
+            # Check matches
             mask_matched = merged_item["Full Barcode"].notna()
             
             # 3. Execute Priority 2 (UPC) for UNMATCHED rows only
-            # Slice out the rows that failed the first check
             unmatched_df = inv_df[~inv_df.index.isin(merged_item[mask_matched].index)].copy()
             
             if not unmatched_df.empty:
                 merged_upc = unmatched_df.merge(map_df, left_on="_key_upc", right_on="_map_key", how="left", suffixes=("", "_map"))
-                
-                # Combine: The successful Item# matches + The new UPC matches
                 mapped = pd.concat([merged_item[mask_matched], merged_upc], ignore_index=True)
             else:
                 mapped = merged_item
@@ -444,6 +439,11 @@ with tab_invoice:
             * **Successfully Mapped:** {len(valid)}
             * **Missing from Map:** {len(missing)}
             """)
+
+            # --- RESTORED: DISPLAY FOUND ITEMS TABLE ---
+            st.subheader("Invoice Items Found")
+            # Show the raw invoice data so you can verify what was scanned
+            st.dataframe(inv_df, use_container_width=True)
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items are not in your Database Map.")
