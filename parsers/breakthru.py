@@ -4,20 +4,15 @@ import io
 import pandas as pd
 import numpy as np
 
-# We look for these columns
-REQ_BASE = [
-    "UPC Number(Each)",
-    "Item Description",
-    "Net Value at Header Level",
-    "Quantity",
-]
+# Columns to look for
+REQ_BASE = ["UPC Number(Each)", "Item Description", "Net Value at Header Level", "Quantity"]
 OPT_ITEMNUM = ["Item Number", "ItemNumber", "Item No", "Item #", "Item"]
 
 def _digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
 def _norm12(x: str) -> str:
-    # Pads "123" -> "000000000123"
+    # Only for UPCs (Barcodes), not Item Numbers
     d = _digits(x)
     if not d: return ""
     if len(d) > 12: d = d[-12:]
@@ -44,8 +39,9 @@ class BreakthruParser:
             raw = raw.decode("utf-8", errors="ignore")
 
         df = pd.read_csv(io.StringIO(raw), dtype=str, keep_default_na=False)
-
         cols = list(df.columns)
+
+        # Locate Columns
         c_upc   = _find_col(cols, ["UPC Number(Each)", "UPC Number", "UPC"])
         c_name  = _find_col(cols, ["Item Description", "Description"])
         c_net   = _find_col(cols, ["Net Value at Header Level", "Net Value"])
@@ -55,7 +51,7 @@ class BreakthruParser:
         if not all([c_upc, c_name, c_net, c_qty]):
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
-        # Calculations (Net / Qty = Case Cost)
+        # Calculations
         qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
         net = (
             df[c_net].astype(str)
@@ -65,7 +61,9 @@ class BreakthruParser:
         )
         cost = net / qty.replace(0, np.nan)
 
-        # Extraction
+        # Extract Data
+        # UPC = Normalized to 12 digits
+        # Item Number = RAW (No normalization)
         out = pd.DataFrame({
             "UPC": df[c_upc].astype(str).map(_norm12),
             "Item Name": df[c_name].astype(str).str.strip(),
@@ -79,12 +77,9 @@ class BreakthruParser:
         else:
             out["Item Number"] = ""
 
-        # FILTER: Keep row if it has VALID COST and (UPC OR Item Number)
+        # Filter: Keep if Valid Cost AND (Has UPC OR Has Item Number)
         has_id = (out["UPC"].str.len() > 0) | (out["Item Number"].str.len() > 0)
         out = out[out["Cases"].gt(0) & out["Cost"].ge(0.01) & has_id].copy()
-
-        if out.empty:
-            return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
         out = out.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
         return out[["UPC", "Item Name", "Cost", "Cases", "Item Number"]]
