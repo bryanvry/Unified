@@ -362,8 +362,8 @@ with tab_invoice:
                 st.error("Vendor Map is empty.")
                 st.stop()
             
-            # --- CRITICAL FIX: Normalize DB 'Invoice UPC' to ensure matching works ---
-            # This makes sure '9098459' in DB matches '000009098459' from invoice
+            # --- CRITICAL MATCHING LOGIC ---
+            # 1. Normalize the DB Key so '9098459' matches '000009098459'
             map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
@@ -380,10 +380,10 @@ with tab_invoice:
             
             inv_df = pd.concat(rows, ignore_index=True)
             
-            # Normalize Invoice IDs
+            # 2. Normalize Invoice IDs
             inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
-            # Match on NORMALIZED keys
+            # 3. Match on NORMALIZED keys
             mapped = inv_df.merge(map_df, left_on="_inv_upc_norm", right_on="_map_key_norm", how="left")
             
             missing = mapped[mapped["Full Barcode"].isna()].copy()
@@ -393,10 +393,14 @@ with tab_invoice:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
                 st.caption("Add these to the Map to link them.")
                 
-                # Pre-fill 'Invoice UPC' with the Item Number if available, otherwise UPC
-                # For Breakthru, we specifically want the Item Number if that's what we used
+                # Logic: Prefill with Item Number if available (for Breakthru), else UPC
+                prefill_upc = missing["UPC"]
+                if "Item Number" in missing.columns:
+                     # If Item Number exists and is not blank, use it
+                     prefill_upc = np.where(missing["Item Number"] != "", missing["Item Number"], missing["UPC"])
+
                 missing_edit = pd.DataFrame({
-                    "Invoice UPC": missing["Item Number"].replace("", np.nan).fillna(missing["UPC"]),
+                    "Invoice UPC": prefill_upc,
                     "Name": missing["Item Name"],
                     "Full Barcode": "",
                     "PACK": 1,
@@ -420,11 +424,9 @@ with tab_invoice:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
-                # Handle Name Duplication
-                if "Name_x" in final_check.columns:
-                    final_check = final_check.rename(columns={"Name_x": "Item Name"})
-                elif "Name" in final_check.columns:
-                    final_check = final_check.rename(columns={"Name": "Item Name"})
+                # --- FIXED: REMOVED RENAMING LOGIC TO PREVENT CRASH ---
+                # We simply calculate costs. We don't rename 'Name_x' -> 'Item Name' 
+                # because 'Item Name' already exists from the invoice.
 
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
                 final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors='coerce').fillna(0).astype(int)
@@ -434,13 +436,15 @@ with tab_invoice:
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
+                    
+                    # Display using 'Item Name' (Invoice Name) which is guaranteed to be unique now
                     st.dataframe(changes[["Full Barcode", "Item Name", "Cost", "cost_cents", "Diff"]])
                     
                     # POS Update Download
                     pos_update = pd.DataFrame({
                         "Upc": changes["Upc"],
                         "cost_cents": changes["Inv_Cost_Cents"],
-                        "cost_qty": changes["PACK"] # Assuming Pack size in Map matches POS
+                        "cost_qty": changes["PACK"]
                     })
                     st.download_button("⬇️ Download Cost Updates", to_csv_bytes(pos_update), f"Cost_Update_{vendor}.csv", "text/csv")
                 else:
