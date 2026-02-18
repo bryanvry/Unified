@@ -332,11 +332,15 @@ with tab_invoice:
             updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
             
             if not updates.empty:
-                pos_out = pd.DataFrame()
-                pos_out["Upc"] = updates["Upc"]
-                pos_out["cost_cents"] = updates["New_Cost_Cents"]
-                pos_out["cost_qty"] = updates["New_Pack"]
-                pos_out["addstock"] = 0
+                # --- FULL POS UPDATE FILE GENERATION ---
+                pos_out = updates.copy()
+                # Apply updates in memory
+                pos_out["cost_cents"] = pos_out["New_Cost_Cents"]
+                pos_out["cost_qty"] = pos_out["New_Pack"]
+                
+                # Keep only columns that exist in the Pricebook (drop invoice cols)
+                db_cols = [c for c in pb_df.columns if c in pos_out.columns]
+                pos_out = pos_out[db_cols]
                 
                 st.success(f"Found {len(updates)} items requiring POS updates.")
                 st.download_button("⬇️ Download POS Update", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
@@ -350,7 +354,7 @@ with tab_invoice:
 
     # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
-        st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
+        st.info(f"Using **BeerandLiquorKey** + **{PRICEBOOK_TABLE}**")
         
         inv_files = st.file_uploader(f"Upload {vendor} Invoice(s)", accept_multiple_files=True)
         
@@ -359,8 +363,11 @@ with tab_invoice:
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
             if map_df.empty: 
-                st.error("Vendor Map is empty. Go to Admin.")
+                st.error("Vendor Map is empty.")
                 st.stop()
+            
+            # 1. Normalize DB Keys
+            map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             rows = []
             for f in inv_files:
@@ -373,23 +380,37 @@ with tab_invoice:
                     rows.append(BreakthruParser().parse(f))
             
             if not rows: st.stop()
-            
             inv_df = pd.concat(rows, ignore_index=True)
-            inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
-            # Map Invoice UPC -> System UPC
-            mapped = inv_df.merge(map_df, on="_inv_upc_norm", how="left")
+            # --- DOUBLE-MATCH LOGIC ---
             
-            # 1. Handle "Not in Master"
+            inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
+            if "Item Number" in inv_df.columns:
+                 inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
+            else:
+                 inv_df["_key_item"] = "000000000000"
+
+            # Match 1: Item Number -> DB
+            match_1 = inv_df.merge(map_df, left_on="_key_item", right_on="_map_key_norm", how="left")
+            # Match 2: UPC -> DB
+            match_2 = inv_df.merge(map_df, left_on="_key_upc", right_on="_map_key_norm", how="left")
+            
+            # Combine: Prefer Match 1, fill with Match 2
+            mapped = match_1.combine_first(match_2)
+            
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Edit below and click 'Save to Map'.")
+                st.caption("Items matched against both 'Item Number' and 'UPC'.")
                 
-                edit_df = pd.DataFrame({
-                    "Invoice UPC": missing["UPC"],
+                prefill_upc = missing["UPC"]
+                if "Item Number" in missing.columns:
+                     prefill_upc = np.where(missing["Item Number"].fillna("") != "", missing["Item Number"], missing["UPC"])
+
+                missing_edit = pd.DataFrame({
+                    "Invoice UPC": prefill_upc,
                     "Name": missing["Item Name"],
                     "Full Barcode": "",
                     "PACK": 1,
@@ -397,7 +418,7 @@ with tab_invoice:
                     "0": ""
                 })
                 
-                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
+                edited_rows = st.data_editor(missing_edit, num_rows="dynamic", key="editor_missing")
                 
                 if st.button("Save New Items to Map"):
                     to_insert = edited_rows[edited_rows["Full Barcode"].str.len() > 3].copy()
@@ -405,79 +426,58 @@ with tab_invoice:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
-                        to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
+                        
+                        db_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company"]
+                        final_insert = pd.DataFrame()
+                        for c in db_cols:
+                            if c in to_insert.columns:
+                                final_insert[c] = to_insert[c]
+                            else:
+                                final_insert[c] = None
+
+                        final_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
                         st.success("Items added! Click 'Analyze Invoice' again.")
                         st.rerun()
 
-            # 2. Process Valid Items (Cost Check + POS Update)
             if not valid.empty:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
-                # Calculate Costs (Cents for Logic, Dollars for Display)
+                # --- COST LOGIC ---
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
-                final_check["PB_Cost_Cents"] = final_check["cost_cents"].fillna(0).astype(int)
+                final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors='coerce').fillna(0).astype(int)
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
                 
-                # --- A. DETECT COST CHANGES ---
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     
-                    # Prepare Display Dataframe (Dollars)
-                    display_changes = pd.DataFrame()
-                    display_changes["Barcode"] = changes["Full Barcode"]
-                    # Handle Name collision (Name_x is Vendor Name, Name_y is Pricebook Name)
-                    display_changes["Item"] = changes["Name_x"] if "Name_x" in changes.columns else changes["Name"]
-                    display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
-                    display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
+                    # --- SAFE DISPLAY (No Rename Crash) ---
+                    display_cols = ["Full Barcode", "Cost", "cost_cents", "Diff"]
                     
-                    # Display with formatting
-                    st.dataframe(
-                        display_changes,
-                        column_config={
-                            "Old Cost": st.column_config.NumberColumn(format="$%.2f"),
-                            "New Cost": st.column_config.NumberColumn(format="$%.2f")
-                        },
-                        hide_index=True
-                    )
+                    # Smart Name selection
+                    if "Item Name" in changes.columns:
+                        display_cols.insert(1, "Item Name") # Invoice Name
+                    elif "Name" in changes.columns:
+                        display_cols.insert(1, "Name") # PB Name
+                    elif "Name_x" in changes.columns:
+                         display_cols.insert(1, "Name_x")
+
+                    st.dataframe(changes[display_cols])
+                    
+                    # --- FULL POS UPDATE FILE ---
+                    pos_out = changes.copy()
+                    pos_out["cost_cents"] = pos_out["Inv_Cost_Cents"]
+                    pos_out["cost_qty"] = pos_out["PACK"]
+                    
+                    # Filter to keep ONLY Pricebook columns (Drop invoice metadata)
+                    db_cols = [c for c in pb_df.columns if c in pos_out.columns]
+                    pos_out = pos_out[db_cols]
+                    
+                    st.download_button("⬇️ Download Cost Updates", to_csv_bytes(pos_out), f"Cost_Update_{vendor}.csv", "text/csv")
                 else:
                     st.success("All mapped items match Pricebook costs.")
-
-                # --- B. GENERATE POS UPDATE (Restored Feature) ---
-                st.divider()
-                st.subheader("POS Update File")
-                
-                # We generate updates for ALL valid items on the invoice, 
-                # because we need to add stock (addstock) even if cost didn't change.
-                
-                pos_out = pd.DataFrame()
-                pos_out["Upc"] = final_check["Full Barcode"]
-                pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
-                # Use PACK from the Map for cost_qty
-                pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
-                
-                # Calculate Add Stock: Cases (from Invoice) * PACK (from Map)
-                # Note: Parsers usually output "Cases" or "Qty". Normalize here if needed.
-                qty_col = "Cases" if "Cases" in final_check.columns else "Qty"
-                if qty_col in final_check.columns:
-                    cases = pd.to_numeric(final_check[qty_col], errors='coerce').fillna(0)
-                    pack = pos_out["cost_qty"]
-                    pos_out["addstock"] = (cases * pack).astype(int)
-                else:
-                    pos_out["addstock"] = 0
-                
-                # Show summary
-                total_cases = pos_out["addstock"].sum()
-                st.caption(f"Ready to update stock for {len(pos_out)} items (Total Units: {total_cases})")
-                
-                st.download_button(
-                    "⬇️ Download POS Update CSV", 
-                    to_csv_bytes(pos_out), 
-                    f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                    "text/csv"
-                )
 
     # --- COSTCO ---
     elif vendor == "Costco":
