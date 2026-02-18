@@ -315,8 +315,8 @@ with tab_invoice:
                     # Rename JC cols to match Unified standard
                     jc_df = jc_df.rename(columns={"ITEM": "inv_upc_raw", "DESCRIPTION": "Description", "PACK": "Pack", "UNIT": "+Cost"})
                     jc_df["UPC"] = jc_df["inv_upc_raw"]
-                    jc_df["Brand"] = "" # JC Sales might not have Brand
-                    jc_df["invoice_date"] = datetime.today() # Default for JC
+                    jc_df["Brand"] = "" 
+                    jc_df["invoice_date"] = datetime.today() 
                     inv_dfs.append(jc_df)
                 should_process = True
 
@@ -336,7 +336,6 @@ with tab_invoice:
             # --- 1. DEDUPLICATE (Keep Latest Date) ---
             if "invoice_date" in full_inv.columns:
                 full_inv["invoice_date"] = pd.to_datetime(full_inv["invoice_date"], errors='coerce')
-                # Sort by date ascending, then drop duplicates keeping the last (latest) one
                 full_inv = full_inv.sort_values("invoice_date", ascending=True)
                 full_inv = full_inv.drop_duplicates(subset=["UPC"], keep="last")
             
@@ -358,49 +357,59 @@ with tab_invoice:
             unmatched = merged[merged["Upc"].isna()].copy()
 
             if not matched.empty:
-                # --- A. NEW: RETAIL CALCULATOR TABLE ---
                 st.divider()
                 st.subheader("📊 Invoice Item Details & Retail Calculator")
                 
-                # Logic: Retail = (Cost / Pack) / 0.6 -> Round up to next .x9
-                def calc_retail(row):
-                    cost = row["+Cost"] if pd.notna(row["+Cost"]) else 0
-                    pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
-                    unit = cost / pack
-                    target = unit / 0.6
-                    # Round up to next 10 cents, minus 1 cent (e.g., 3.12 -> 3.20 -> 3.19)
-                    retail = np.ceil(target * 10) / 10.0 - 0.01
-                    return unit, retail
-
-                # Apply calculation
-                calc_results = matched.apply(calc_retail, axis=1, result_type='expand')
-                matched["Unit Cost"] = calc_results[0]
-                matched["Calc Retail"] = calc_results[1]
-                matched["Current DB Cost"] = matched["cost_cents"] / 100.0
+                # --- A. CALCULATE RETAIL & CHANGE FLAGS ---
+                matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
                 
-                # Show Table
-                retail_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Current DB Cost", "Calc Retail"]
-                # Rename for display
-                retail_display = matched[retail_cols].rename(columns={
+                def calc_row_metrics(row):
+                    # 1. Costs
+                    case_cost = row["+Cost"] if pd.notna(row["+Cost"]) else 0.0
+                    pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
+                    unit_cost = case_cost / pack
+                    
+                    # 2. Retail (Target 40% margin -> Cost / 0.6 -> Round to .x9)
+                    target_retail = unit_cost / 0.6
+                    # Round up to next 10 cents, minus 1 cent (3.12 -> 3.19)
+                    retail_val = np.ceil(target_retail * 10) / 10.0 - 0.01
+                    
+                    # 3. Formatting Retail (Add * if Cost Changed)
+                    retail_str = f"${retail_val:.2f}"
+                    if row["Cost_Changed"]:
+                        retail_str += " *"
+                        
+                    return unit_cost, retail_str
+
+                # Apply Metrics
+                metrics = matched.apply(calc_row_metrics, axis=1, result_type='expand')
+                matched["Unit Cost"] = metrics[0]
+                matched["Retail String"] = metrics[1]
+                matched["Now"] = matched["cost_cents"] / 100.0 # Pricebook Cost
+                
+                # --- B. DISPLAY MAIN TABLE ---
+                # Columns: UPC, Brand, Description, Case Cost, Unit, Now, Retail
+                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail String"]
+                
+                final_view = matched[display_cols].rename(columns={
                     "+Cost": "Case Cost",
-                    "Current DB Cost": "Now (DB Cost)",
-                    "Calc Retail": "Retail (.9)"
+                    "Unit Cost": "Unit",
+                    "Retail String": "Retail"
                 })
                 
                 st.dataframe(
-                    retail_display,
+                    final_view,
                     column_config={
                         "Case Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Now (DB Cost)": st.column_config.NumberColumn(format="$%.2f"),
-                        "Retail (.9)": st.column_config.NumberColumn(format="$%.2f"),
+                        "Unit": st.column_config.NumberColumn(format="$%.2f"),
+                        "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Cost"),
+                        "Retail": st.column_config.TextColumn(help="Calculated Retail (40% Margin). * indicates cost change.")
                     },
-                    use_container_width=True
+                    use_container_width=True,
+                    hide_index=True
                 )
 
-                # --- B. DETECT & DISPLAY PRICE CHANGES ---
-                matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
-                
+                # --- C. PRICE CHANGES TABLE ---
                 changes = matched[matched["Cost_Changed"]].copy()
                 
                 st.divider()
@@ -409,7 +418,7 @@ with tab_invoice:
                     
                     display_changes = pd.DataFrame()
                     display_changes["UPC"] = changes["Upc"]
-                    display_changes["Brand"] = changes["Brand"] # Added Brand
+                    display_changes["Brand"] = changes["Brand"] 
                     display_changes["Description"] = changes["Description"]
                     display_changes["Old Cost"] = changes["cost_cents"] / 100.0
                     display_changes["New Cost"] = changes["New_Cost_Cents"] / 100.0
@@ -425,7 +434,7 @@ with tab_invoice:
                 else:
                     st.success("No price changes detected.")
 
-                # --- C. GENERATE POS UPDATE (ALL ITEMS) ---
+                # --- D. POS UPDATE FILE ---
                 st.subheader("POS Update File")
                 
                 pos_cols = [
