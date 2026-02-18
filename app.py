@@ -39,6 +39,23 @@ def to_xlsx_bytes(dfs_dict):
 # --- DATABASE HANDLERS ---
 def get_db_connection():
     return st.connection("supabase", type="sql")
+    
+def log_activity(store, vendor, items_cnt, changes_cnt):
+    """Logs invoice processing events to Supabase."""
+    try:
+        conn = get_db_connection()
+        # Create a 1-row DataFrame
+        log_data = pd.DataFrame([{
+            "store": store,
+            "vendor": vendor,
+            "items_found": int(items_cnt),
+            "price_changes_found": int(changes_cnt),
+            "created_at": datetime.now()
+        }])
+        # Append to the SQL table
+        log_data.to_sql("invoice_history", conn.engine, if_exists='append', index=False)
+    except Exception as e:
+        print(f"Logging failed: {e}") # Fail silently so we don't stop the user
 
 def load_pricebook(table_name):
     conn = get_db_connection()
@@ -356,13 +373,21 @@ with tab_invoice:
             # 3. Identify Matches
             matched = merged[merged["Upc"].notna()].copy()
             unmatched = merged[merged["Upc"].isna()].copy()
+            
+            # --- LOG ACTIVITY ---
+            changes_count = 0
+            if not matched.empty:
+                 matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
+                 changes_count = matched["Cost_Changed"].sum()
+
+            log_activity(selected_store, vendor, len(full_inv), changes_count)
+            # --------------------
 
             if not matched.empty:
                 st.divider()
                 st.subheader("📊 Invoice Item Details & Retail Calculator")
                 
                 # --- A. CALCULATE METRICS ---
-                matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
                 
                 def calc_row_metrics(row):
                     # 1. Costs
@@ -450,7 +475,6 @@ with tab_invoice:
                 pos_out = pd.DataFrame()
                 
                 # 1. UPC Format (Clean first, then apply ="01234")
-                # This fixes the double-wrapping issue
                 def clean_and_format_upc(u):
                     s = str(u).replace('=', '').replace('"', '').strip()
                     return f'="{s}"'
