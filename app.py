@@ -122,28 +122,27 @@ with tab_order:
             except Exception as e:
                 st.error(f"Failed to process sales file: {e}")
 
-    # --- B. Generate Order Sheet (Database Driven) ---
+    # --- B. Interactive Order Builder ---
     with col_gen:
-        st.subheader("2. Generate Order Sheet")
+        st.subheader("2. Build Order")
         
         try:
             conn = get_db_connection()
             
-            # 1. DYNAMIC COMPANY LIST
+            # 1. Company List
             companies_df = conn.query('SELECT DISTINCT "Company" FROM "BeerandLiquorKey"', ttl=0)
-            
             if not companies_df.empty:
-                # Filter out None/NaN and sort
                 company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
             else:
                 company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"]
             
             target_company = st.selectbox("Select Company", company_options)
             
-            if st.button(f"Generate {target_company} Sheet"):
+            # Button to Load Data into Session State
+            if st.button(f"Load {target_company} Items"):
                 safe_company = target_company.replace("'", "''")
                 
-                # 2. Fetch Vendor Map
+                # Fetch Vendor Map
                 map_query = f"""
                     SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
                     FROM "BeerandLiquorKey" 
@@ -152,14 +151,13 @@ with tab_order:
                 vendor_df = conn.query(map_query, ttl=0)
                 
                 if vendor_df.empty:
-                    st.warning(f"No items found for {target_company} in BeerandLiquorKey.")
+                    st.warning(f"No items found for {target_company}.")
+                    st.session_state['order_df'] = None
                 else:
                     vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
                     
-                    # 3. Fetch Pricebook
+                    # Fetch Pricebook & Sales
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    
-                    # 4. Fetch Sales History (Last 8 Weeks)
                     start_date = datetime.today() - timedelta(weeks=8)
                     sales_query = f"""
                         SELECT "UPC", "week_date", "qty_sold" 
@@ -168,17 +166,16 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    # 5. Merge Map + Pricebook
-                    # This creates Name_x (from Vendor) and Name_y (from Pricebook)
+                    # Merge Map + Pricebook
                     merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
-                    # --- FIX: Handle Column Collision ---
+                    # Handle Name Collision
                     if "Name_x" in merged.columns:
                         merged = merged.rename(columns={"Name_x": "Name"})
                     elif "Name_y" in merged.columns and "Name" not in merged.columns:
                         merged = merged.rename(columns={"Name_y": "Name"})
                     
-                    # 6. Pivot Sales Data
+                    # Pivot Sales (Ascending Order: Oldest -> Newest)
                     sales_cols = []
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
@@ -189,49 +186,88 @@ with tab_order:
                             aggfunc="sum"
                         ).fillna(0)
                         
-                        sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=True)
-                        sales_pivot = sales_pivot[sorted_dates]
-                        
-                        sales_cols = sorted_dates[:4]
+                        # Sort Oldest to Newest (Reverse=False)
+                        sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
+                        # Keep last 4 weeks
+                        sales_cols = sorted_dates[-4:]
                         sales_pivot = sales_pivot[sales_cols]
                         
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
-                    
-                    # 7. Safe Calculations
+
+                    # Logic: Stock
                     if "setstock" in merged.columns:
-                        merged["Current Stock"] = pd.to_numeric(merged["setstock"], errors='coerce').fillna(0)
+                        merged["Stock"] = pd.to_numeric(merged["setstock"], errors='coerce').fillna(0)
                     else:
-                        merged["Current Stock"] = 0
+                        merged["Stock"] = 0
+                    
+                    # Logic: Initialize Order Column
+                    merged["Order"] = 0
+                    
+                    # Final Columns
+                    # Info -> Sales -> Stock -> Order
+                    base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK"]
+                    available_base = [c for c in base_cols if c in merged.columns]
+                    
+                    final_cols = available_base + sales_cols + ["Stock", "Order"]
+                    
+                    # Save to Session State
+                    st.session_state['order_df'] = merged[final_cols].copy()
+                    st.session_state['active_company'] = target_company
 
-                    if "cost_cents" in merged.columns:
-                        merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0)
-                        merged["Cost"] = merged["cost_cents"] / 100.0
+            # 2. Render Interactive Table (If data exists)
+            if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
+                st.divider()
+                st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
+                
+                # Editable Dataframe
+                edited_df = st.data_editor(
+                    st.session_state['order_df'],
+                    use_container_width=True,
+                    height=600,
+                    column_config={
+                        "Order": st.column_config.NumberColumn(
+                            "Order Qty",
+                            help="Enter cases to order",
+                            min_value=0,
+                            step=1,
+                            required=True
+                        ),
+                        "Stock": st.column_config.NumberColumn(
+                            "Stock",
+                            disabled=True # Prevent editing stock
+                        )
+                    },
+                    hide_index=True
+                )
+                
+                # 3. Finish & Download
+                if st.button("Finish & Download Order"):
+                    # Filter: Order > 0
+                    final_order = edited_df[edited_df["Order"] > 0].copy()
+                    
+                    if final_order.empty:
+                        st.warning("No items ordered (Order Qty is 0 for all rows).")
                     else:
-                        merged["Cost"] = 0.0
-                    
-                    # 8. Final Column Assembly
-                    # Check if "0" column exists (it might be numeric in DB)
-                    if "0" not in merged.columns and 0 in merged.columns:
-                         merged = merged.rename(columns={0: "0"})
+                        # Sort Alphabetically by Name
+                        final_order = final_order.sort_values(by="Name", ascending=True)
+                        
+                        # Select only requested columns
+                        output_cols = ["Name", "Size", "Order"]
+                        # Ensure columns exist before selecting
+                        valid_cols = [c for c in output_cols if c in final_order.columns]
+                        
+                        download_df = final_order[valid_cols]
+                        
+                        st.download_button(
+                            label=f"⬇️ Download {st.session_state['active_company']} Order",
+                            data=to_xlsx_bytes({st.session_state['active_company']: download_df}),
+                            file_name=f"ORDER_{st.session_state['active_company']}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        st.success(f"Ready! Contains {len(download_df)} items.")
 
-                    base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Current Stock", "Cost"]
-                    
-                    # Only include columns that actually exist to prevent crashes
-                    available_cols = [c for c in base_cols if c in merged.columns]
-                    final_cols = available_cols + [c for c in sales_cols if c in merged.columns]
-                    
-                    final_df = merged[final_cols].copy()
-                    
-                    st.download_button(
-                        f"⬇️ Download {target_company} Sheet",
-                        data=to_xlsx_bytes({target_company: final_df}),
-                        file_name=f"{target_company}_OrderSheet_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.success(f"Generated sheet with {len(final_df)} items.")
-                    
         except Exception as e:
-            st.error(f"Error generating sheet: {e}")
+            st.error(f"System Error: {e}")
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
