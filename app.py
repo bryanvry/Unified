@@ -389,6 +389,11 @@ with tab_invoice:
             if not rows: st.stop()
             
             inv_df = pd.concat(rows, ignore_index=True)
+
+            # --- CRITICAL FIX: Ensure 'Item Number' exists ---
+            # Southern Glazer's parser doesn't output this column, so we fill it if missing.
+            if "Item Number" not in inv_df.columns:
+                inv_df["Item Number"] = ""
             
             # ==============================================================================
             # PRIORITY MATCHING LOGIC
@@ -402,9 +407,7 @@ with tab_invoice:
             map_df["_map_key"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
             
             # Invoice Candidate 1: Item Number
-            inv_df["_key_item"] = ""
-            if "Item Number" in inv_df.columns:
-                 inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
+            inv_df["_key_item"] = inv_df["Item Number"].astype(str).apply(_norm_upc_12)
             
             # Invoice Candidate 2: UPC
             inv_df["_key_upc"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
