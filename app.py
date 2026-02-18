@@ -575,9 +575,6 @@ with tab_invoice:
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
             # --- LOG ACTIVITY ---
-            # We count changes later, but for now we log items found
-            # We'll need to calculate changes first to log accurately, 
-            # so we defer the log call until after valid items processing below.
             changes_count = 0 
             # --------------------
 
@@ -633,7 +630,7 @@ with tab_invoice:
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 changes_count = len(changes)
                 
-                # NOW WE LOG
+                # LOG ACTIVITY
                 log_activity(selected_store, vendor, len(inv_df), changes_count)
                 
                 if not changes.empty:
@@ -674,9 +671,14 @@ with tab_invoice:
                 
                 pos_out = pd.DataFrame()
                 
-                # Clean & Format UPC
+                # --- FIX: Clean UPC Formatter ---
+                def clean_and_format_upc(u):
+                    s = str(u).replace('=', '').replace('"', '').strip()
+                    return f'="{s}"'
+
                 raw_upc = final_check["Full Barcode"].astype(str)
-                pos_out["Upc"] = raw_upc.apply(lambda x: f'="{x.replace("=", "").replace('"', "").strip()}"')
+                pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+                # --------------------------------
                 
                 pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
                 pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
