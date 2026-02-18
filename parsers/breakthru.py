@@ -16,7 +16,7 @@ def _digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
 def _norm12(x: str) -> str:
-    # Pads chopped zeros (e.g. "123" -> "000000000123")
+    # Pads "123" -> "000000000123"
     d = _digits(x)
     if not d: return ""
     if len(d) > 12: d = d[-12:]
