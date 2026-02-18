@@ -105,6 +105,7 @@ with tab_order:
         if sales_file and st.button("Save Sales to DB", type="primary"):
             try:
                 sales_df = pd.read_csv(sales_file, dtype=str)
+                # Check for required columns based on your file: "# of Items", "Sales $"
                 req_cols = {"UPC", "Item", "# of Items", "Sales $"}
                 if not req_cols.issubset(sales_df.columns):
                     st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
@@ -134,7 +135,6 @@ with tab_order:
                 conn = get_db_connection()
                 
                 # 1. Fetch Vendor Map for this Company
-                # We normalize the Full Barcode immediately for matching
                 map_query = f"""
                     SELECT "Full Barcode", "Name", "Size", "PACK", "Company" 
                     FROM "BeerandLiquorKey" 
@@ -175,7 +175,6 @@ with tab_order:
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
                     # 6. Formatting for the User
-                    # Fill NaNs for cleaner looking sheet
                     if "setstock" in merged.columns:
                         merged["Current Stock"] = merged["setstock"].fillna(0)
                     else:
@@ -183,15 +182,14 @@ with tab_order:
 
                     merged["Cost"] = merged["cost_cents"] / 100.0
                     
-                    # Select & Rename Columns for the final Excel
+                    # Select & Rename Columns
                     base_cols = ["Full Barcode", "Name", "Size", "PACK", "Current Stock", "Cost"]
                     
                     # Get dynamic date columns (the pivoted sales weeks)
                     sales_cols = [c for c in merged.columns if isinstance(c, (str, datetime)) and c not in base_cols and c not in vendor_df.columns and c not in pb_df.columns]
-                    # Filter to ensure we only keep the valid date columns we just pivoted
-                    sales_cols = [c for c in sales_cols if str(c).startswith('20')]
+                    sales_cols = [c for c in sales_cols if str(c).startswith('20')] # Filter for date-like columns
                     
-                    final_cols = base_cols + sorted(sales_cols, key=str, reverse=True) # Most recent dates first
+                    final_cols = base_cols + sorted(sales_cols, key=str, reverse=True)
                     
                     final_df = merged[final_cols].copy()
                     
