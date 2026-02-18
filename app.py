@@ -332,9 +332,8 @@ with tab_invoice:
             updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
             
             if not updates.empty:
-                # --- FULL POS UPDATE FILE GENERATION ---
+                # --- FULL POS UPDATE (Preserve all DB columns) ---
                 pos_out = updates.copy()
-                # Apply updates in memory
                 pos_out["cost_cents"] = pos_out["New_Cost_Cents"]
                 pos_out["cost_qty"] = pos_out["New_Pack"]
                 
@@ -453,25 +452,28 @@ with tab_invoice:
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
                     
-                    # --- SAFE DISPLAY (No Rename Crash) ---
-                    display_cols = ["Full Barcode", "Cost", "cost_cents", "Diff"]
+                    # --- 1. Fix Display to show Dollars ---
+                    changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
+                    changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
+                    
+                    display_cols = ["Full Barcode", "Old Cost", "New Cost", "Diff"]
                     
                     # Smart Name selection
                     if "Item Name" in changes.columns:
-                        display_cols.insert(1, "Item Name") # Invoice Name
+                        display_cols.insert(1, "Item Name")
                     elif "Name" in changes.columns:
-                        display_cols.insert(1, "Name") # PB Name
+                        display_cols.insert(1, "Name")
                     elif "Name_x" in changes.columns:
                          display_cols.insert(1, "Name_x")
 
                     st.dataframe(changes[display_cols])
                     
-                    # --- FULL POS UPDATE FILE ---
+                    # --- 2. Fix POS Update to include ALL columns ---
                     pos_out = changes.copy()
                     pos_out["cost_cents"] = pos_out["Inv_Cost_Cents"]
                     pos_out["cost_qty"] = pos_out["PACK"]
                     
-                    # Filter to keep ONLY Pricebook columns (Drop invoice metadata)
+                    # Keep ALL columns that exist in the Pricebook (Departments, Taxes, etc.)
                     db_cols = [c for c in pb_df.columns if c in pos_out.columns]
                     pos_out = pos_out[db_cols]
                     
