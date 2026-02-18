@@ -295,7 +295,6 @@ with tab_invoice:
 
         # Unified UI
         if vendor == "Unified":
-            # UPDATED: Added 'xls' to supported types
             up_files = st.file_uploader("Upload Unified Invoice(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="un_files")
             if up_files and st.button("Process Unified"):
                 for f in up_files:
@@ -336,41 +335,95 @@ with tab_invoice:
             # Match against Pricebook
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
-            # Determine Updates
+            # 1. Calculate New Values
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
             merged["New_Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(1).astype(int)
             
+            # 2. Get Old Values (Handle NaNs)
+            merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0).astype(int)
+            merged["cost_qty"] = pd.to_numeric(merged["cost_qty"], errors='coerce').fillna(1).astype(int)
+            
+            # 3. Identify Matches
             matched = merged[merged["Upc"].notna()].copy()
-            
-            # --- FIX: Ensure database cost is numeric before subtraction ---
-            matched["cost_cents"] = pd.to_numeric(matched["cost_cents"], errors='coerce').fillna(0).astype(int)
-            matched["cost_qty"] = pd.to_numeric(matched["cost_qty"], errors='coerce').fillna(1).astype(int)
-            
-            # Logic: Update if Cost OR Pack size changes
-            matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
-            matched["Pack_Changed"] = matched["New_Pack"] != matched["cost_qty"]
-            
-            updates = matched[matched["Cost_Changed"] | matched["Pack_Changed"]].copy()
-            
-            if not updates.empty:
-                pos_out = pd.DataFrame()
-                pos_out["Upc"] = updates["Upc"]
-                pos_out["cost_cents"] = updates["New_Cost_Cents"]
-                pos_out["cost_qty"] = updates["New_Pack"]
-                
-                # Logic: Calculate addstock if Case Qty exists
-                if "Case Qty" in updates.columns:
-                     # AddStock = Cases Bought * New Pack Size
-                     pos_out["addstock"] = pd.to_numeric(updates["Case Qty"], errors='coerce').fillna(0) * updates["New_Pack"]
-                else:
-                     pos_out["addstock"] = 0
-                
-                st.success(f"Found {len(updates)} items requiring POS updates.")
-                st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
-            else:
-                st.info("No cost or pack changes detected against current Pricebook.")
-            
             unmatched = merged[merged["Upc"].isna()].copy()
+
+            if not matched.empty:
+                # --- A. DETECT & DISPLAY PRICE CHANGES ---
+                matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
+                
+                changes = matched[matched["Cost_Changed"]].copy()
+                
+                if not changes.empty:
+                    st.error(f"{len(changes)} Price Changes Detected")
+                    
+                    display_changes = pd.DataFrame()
+                    display_changes["UPC"] = changes["Upc"]
+                    display_changes["Description"] = changes["Description"]
+                    display_changes["Old Cost"] = changes["cost_cents"] / 100.0
+                    display_changes["New Cost"] = changes["New_Cost_Cents"] / 100.0
+                    
+                    st.dataframe(
+                        display_changes,
+                        column_config={
+                            "Old Cost": st.column_config.NumberColumn(format="$%.2f"),
+                            "New Cost": st.column_config.NumberColumn(format="$%.2f")
+                        },
+                        hide_index=True
+                    )
+                else:
+                    st.success("No price changes detected.")
+
+                # --- B. GENERATE POS UPDATE (ALL ITEMS) ---
+                st.divider()
+                st.subheader("POS Update File")
+                
+                pos_cols = [
+                    "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
+                    "Name", "size", "ebt", "byweight", "Fee Multiplier", 
+                    "cost_qty", "cost_cents", "addstock"
+                ]
+                
+                pos_out = pd.DataFrame()
+                
+                # 1. UPC Format (="01234")
+                pos_out["Upc"] = matched["Upc"].astype(str).apply(lambda x: f'="{x}"')
+                
+                # 2. Key Update Fields
+                pos_out["cost_cents"] = matched["New_Cost_Cents"]
+                pos_out["cost_qty"] = matched["New_Pack"]
+                
+                # 3. Calculate AddStock (Cases * Pack)
+                # Check for "Case Qty", "Case Quantity", or "Cases"
+                qty_col = next((c for c in matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
+                
+                if qty_col:
+                    cases = pd.to_numeric(matched[qty_col], errors='coerce').fillna(0)
+                    pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
+                else:
+                    pos_out["addstock"] = 0
+                
+                # 4. Fill Metadata from Pricebook (Preserve existing values)
+                # We map columns from the merged Pricebook data
+                for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
+                    if col in matched.columns:
+                        pos_out[col] = matched[col]
+                    else:
+                        pos_out[col] = ""
+
+                # 5. Filter & Download
+                final_pos_out = pos_out[pos_cols].copy()
+                total_units = final_pos_out["addstock"].sum()
+                
+                st.caption(f"Ready to update {len(final_pos_out)} items (Total Stock Added: {total_units})")
+                
+                st.download_button(
+                    "⬇️ Download POS Update CSV", 
+                    to_csv_bytes(final_pos_out), 
+                    f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                    "text/csv"
+                )
+            
+            # Show Unmatched Items
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
                 st.dataframe(unmatched[["UPC", "Description", "+Cost"]])
