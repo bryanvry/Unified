@@ -64,7 +64,8 @@ class BreakthruParser:
         )
         cost = net / qty.replace(0, np.nan)
 
-        # Output raw columns (Normalization happens in App)
+        # Output raw columns
+        # We DO NOT normalize Item Number here; we leave it raw so it matches your DB exactly
         out = pd.DataFrame({
             "UPC": df[c_upc].astype(str).map(_norm12),
             "Item Name": df[c_name].astype(str).str.strip(),
@@ -78,8 +79,9 @@ class BreakthruParser:
         else:
             out["Item Number"] = ""
 
-        # --- FILTERING ---
-        # Keep row if it has a valid UPC OR a valid Item Number
+        # --- FILTER LOGIC ---
+        # Keep row if it has (Valid UPC) OR (Valid Item Number)
+        # This fixes the issue where items without UPCs were disappearing
         has_upc = (out["UPC"] != "") & (out["UPC"] != "000000000000")
         has_item = (out["Item Number"] != "") & (out["Item Number"] != "000000000000")
         
