@@ -16,11 +16,11 @@ def _digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
 def _norm12(x: str) -> str:
-    # This function fixes the "chopped zeros" issue
+    # Pads chopped zeros (e.g. "123" -> "000000000123")
     d = _digits(x)
     if not d: return ""
     if len(d) > 12: d = d[-12:]
-    return d.zfill(12) # Pads with leading zeros to reach 12 digits
+    return d.zfill(12)
 
 def _find_col(cols, candidates):
     low = [c.lower() for c in cols]
@@ -64,9 +64,9 @@ class BreakthruParser:
         )
         cost = net / qty.replace(0, np.nan)
 
-        # Extract Raw Data (Normalization happens in App for matching)
+        # Output raw columns (Normalization happens in App)
         out = pd.DataFrame({
-            "UPC": df[c_upc].astype(str).map(_norm12), # Apply zero-padding here too
+            "UPC": df[c_upc].astype(str).map(_norm12),
             "Item Name": df[c_name].astype(str).str.strip(),
             "Cost": pd.to_numeric(cost, errors="coerce"),
             "Cases": qty,
