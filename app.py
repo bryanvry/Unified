@@ -449,8 +449,13 @@ with tab_invoice:
                 
                 pos_out = pd.DataFrame()
                 
-                # 1. UPC Format (="01234")
-                pos_out["Upc"] = matched["Upc"].astype(str).apply(lambda x: f'="{x}"')
+                # 1. UPC Format (Clean first, then apply ="01234")
+                # This fixes the double-wrapping issue
+                def clean_and_format_upc(u):
+                    s = str(u).replace('=', '').replace('"', '').strip()
+                    return f'="{s}"'
+
+                pos_out["Upc"] = matched["Upc"].apply(clean_and_format_upc)
                 
                 # 2. Key Update Fields
                 pos_out["cost_cents"] = matched["New_Cost_Cents"]
