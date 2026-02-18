@@ -397,10 +397,18 @@ with tab_invoice:
             # 1. Handle "Not in Master"
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
+
+            # --- STATUS SUMMARY (New) ---
+            st.markdown(f"""
+            ### 📊 Status Report
+            * **Items Found on Invoice:** {len(inv_df)}
+            * **Successfully Mapped:** {len(valid)}
+            * **Missing from Map:** {len(missing)}
+            """)
             
             if not missing.empty:
-                st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Edit below and click 'Save to Map'.")
+                st.warning(f"⚠️ {len(missing)} items are not in your Database Map.")
+                st.caption("Please add the Full Barcode below and click 'Save to Map'.")
                 
                 edit_df = pd.DataFrame({
                     "Invoice UPC": missing["UPC"],
@@ -420,7 +428,7 @@ with tab_invoice:
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
-                        st.success("Items added! Click 'Analyze Invoice' again.")
+                        st.success("Items added! Click 'Analyze Invoice' again to include them.")
                         st.rerun()
 
             # 2. Process Valid Items
@@ -441,7 +449,7 @@ with tab_invoice:
                     
                     display_changes = pd.DataFrame()
                     display_changes["Barcode"] = changes["Full Barcode"]
-                    # Use Pricebook Name if available (Name_y), else Vendor Name (Name_x)
+                    # Priority for Name: Pricebook > Vendor > Default
                     display_changes["Item"] = changes["Name_y"] if "Name_y" in changes.columns else (changes["Name_x"] if "Name_x" in changes.columns else changes["Name"])
                     display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
                     display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
@@ -461,7 +469,6 @@ with tab_invoice:
                 st.divider()
                 st.subheader("POS Update File")
                 
-                # 1. Define Requested Columns
                 pos_cols = [
                     "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
                     "Name", "size", "ebt", "byweight", "Fee Multiplier", 
@@ -470,12 +477,10 @@ with tab_invoice:
                 
                 pos_out = pd.DataFrame()
                 
-                # 2. Map Key Data
                 pos_out["Upc"] = final_check["Full Barcode"]
                 pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
                 pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
                 
-                # 3. Calculate AddStock
                 qty_col = "Cases" if "Cases" in final_check.columns else "Qty"
                 if qty_col in final_check.columns:
                     cases = pd.to_numeric(final_check[qty_col], errors='coerce').fillna(0)
@@ -483,8 +488,7 @@ with tab_invoice:
                 else:
                     pos_out["addstock"] = 0
 
-                # 4. Fill Metadata from Pricebook (Handle Defaults if Missing)
-                # Name often splits into Name_x / Name_y during merge
+                # Name Logic
                 if "Name_y" in final_check.columns:
                     pos_out["Name"] = final_check["Name_y"]
                 elif "Name_x" in final_check.columns:
@@ -494,14 +498,14 @@ with tab_invoice:
                 else:
                     pos_out["Name"] = ""
 
-                # Handle other columns gracefully
+                # Metadata Fill
                 for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier"]:
                     if col in final_check.columns:
                         pos_out[col] = final_check[col]
                     else:
-                        pos_out[col] = "" # Default empty if not in DB yet
+                        pos_out[col] = "" 
 
-                # Handle Case Sensitivity for Size/size
+                # Size Logic
                 if "size" in final_check.columns:
                     pos_out["size"] = final_check["size"]
                 elif "Size" in final_check.columns:
@@ -509,8 +513,6 @@ with tab_invoice:
                 else:
                     pos_out["size"] = ""
                 
-                # Reorder and Export
-                # Only keep columns that are in the requested list
                 final_pos_out = pos_out[pos_cols].copy()
                 
                 total_cases = pos_out["addstock"].sum()
