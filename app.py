@@ -134,11 +134,14 @@ with tab_order:
             try:
                 conn = get_db_connection()
                 
-                # 1. Fetch Vendor Map for this Company
+                # SQL FIX: Escape the single quote for names like "Southern Glazer's"
+                safe_company = target_company.replace("'", "''")
+                
+                # 1. Fetch Vendor Map (Added Invoice UPC and "0" column as requested)
                 map_query = f"""
-                    SELECT "Full Barcode", "Name", "Size", "PACK", "Company" 
+                    SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
                     FROM "BeerandLiquorKey" 
-                    WHERE "Company" = '{target_company}'
+                    WHERE "Company" = '{safe_company}'
                 """
                 vendor_df = conn.query(map_query, ttl=0)
                 
@@ -159,22 +162,35 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    # 4. Merge: Vendor Map + Pricebook
+                    # 4. Merge: Vendor Map + Pricebook (To get Stock)
                     merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
                     # 5. Pivot & Merge Sales
+                    sales_cols = []
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
+                        
+                        # Pivot date columns
                         sales_pivot = sales_hist.pivot_table(
                             index="_upc_norm", 
                             columns="week_date", 
                             values="qty_sold", 
                             aggfunc="sum"
                         ).fillna(0)
+                        
+                        # Sort columns so most recent date is first
+                        # Convert column names to dates for sorting, then back to strings
+                        sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=True)
+                        sales_pivot = sales_pivot[sorted_dates]
+                        
+                        # KEEP ONLY TOP 4
+                        sales_cols = sorted_dates[:4]
+                        sales_pivot = sales_pivot[sales_cols]
+                        
                         # Join Sales to the Master List
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    # 6. Formatting for the User
+                    # 6. Formatting Columns
                     if "setstock" in merged.columns:
                         merged["Current Stock"] = merged["setstock"].fillna(0)
                     else:
@@ -182,19 +198,19 @@ with tab_order:
 
                     merged["Cost"] = merged["cost_cents"] / 100.0
                     
-                    # Select & Rename Columns
-                    base_cols = ["Full Barcode", "Name", "Size", "PACK", "Current Stock", "Cost"]
+                    # Define Final Column Order
+                    # Requested: Full Barcode, Invoice UPC, 0, Name, Size, PACK, Sales1...4
+                    # Added: Current Stock, Cost (Useful for ordering)
                     
-                    # Get dynamic date columns (the pivoted sales weeks)
-                    sales_cols = [c for c in merged.columns if isinstance(c, (str, datetime)) and c not in base_cols and c not in vendor_df.columns and c not in pb_df.columns]
-                    sales_cols = [c for c in sales_cols if str(c).startswith('20')] # Filter for date-like columns
+                    base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Current Stock", "Cost"]
                     
-                    final_cols = base_cols + sorted(sales_cols, key=str, reverse=True)
+                    # Add the dynamic sales date columns
+                    final_cols = base_cols + [c for c in sales_cols if c in merged.columns]
                     
                     final_df = merged[final_cols].copy()
                     
                     st.download_button(
-                        f"⬇️ Download {target_company} Order Sheet",
+                        f"⬇️ Download {target_company} Sheet",
                         data=to_xlsx_bytes({target_company: final_df}),
                         file_name=f"{target_company}_OrderSheet_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
