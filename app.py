@@ -389,16 +389,35 @@ with tab_invoice:
             if not rows: st.stop()
             
             inv_df = pd.concat(rows, ignore_index=True)
-            inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
             
-            # Map Invoice UPC -> System UPC
-            mapped = inv_df.merge(map_df, on="_inv_upc_norm", how="left")
+            # --- LOGIC FIX: USE ITEM NUMBER AS BACKUP ---
+            # 1. Create a "Match Candidate" column
+            # Start with UPC
+            inv_df["_match_candidate"] = inv_df["UPC"]
+            
+            # If UPC is missing, fill it with Item Number
+            if "Item Number" in inv_df.columns:
+                mask_missing = inv_df["_match_candidate"] == ""
+                inv_df.loc[mask_missing, "_match_candidate"] = inv_df.loc[mask_missing, "Item Number"]
+            
+            # 2. Normalize both the Invoice Candidate AND the Database Map Key
+            # This ensures "9098459" matches "000009098459"
+            inv_df["_inv_key_norm"] = inv_df["_match_candidate"].astype(str).apply(_norm_upc_12)
+            
+            # We assume map_df has "Invoice UPC" which might be a UPC or an Item Number
+            # We create a temporary normalized key on the Map to ensure matching works
+            map_df["_map_key_norm"] = map_df["Invoice UPC"].astype(str).apply(_norm_upc_12)
+            
+            # 3. Merge using the normalized keys
+            mapped = inv_df.merge(map_df, left_on="_inv_key_norm", right_on="_map_key_norm", how="left")
+            
+            # --------------------------------------------
             
             # 1. Handle "Not in Master"
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
 
-            # --- STATUS SUMMARY (New) ---
+            # --- STATUS SUMMARY ---
             st.markdown(f"""
             ### 📊 Status Report
             * **Items Found on Invoice:** {len(inv_df)}
@@ -410,8 +429,9 @@ with tab_invoice:
                 st.warning(f"⚠️ {len(missing)} items are not in your Database Map.")
                 st.caption("Please add the Full Barcode below and click 'Save to Map'.")
                 
+                # Pre-fill the editor with useful data
                 edit_df = pd.DataFrame({
-                    "Invoice UPC": missing["UPC"],
+                    "Invoice UPC": missing["_match_candidate"], # Show the ID we tried to match (UPC or Item Num)
                     "Name": missing["Item Name"],
                     "Full Barcode": "",
                     "PACK": 1,
@@ -449,7 +469,6 @@ with tab_invoice:
                     
                     display_changes = pd.DataFrame()
                     display_changes["Barcode"] = changes["Full Barcode"]
-                    # Priority for Name: Pricebook > Vendor > Default
                     display_changes["Item"] = changes["Name_y"] if "Name_y" in changes.columns else (changes["Name_x"] if "Name_x" in changes.columns else changes["Name"])
                     display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
                     display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
