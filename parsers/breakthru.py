@@ -78,12 +78,16 @@ class BreakthruParser:
         else:
             out["Item Number"] = ""
 
-        # Filter
+        # --- CRITICAL FIX ---
+        # Keep row if it has a valid UPC OR a valid Item Number
+        # (Old logic deleted rows if UPC was empty, causing your missing items)
+        has_upc = (out["UPC"] != "") & (out["UPC"] != "000000000000")
+        has_item = (out["Item Number"] != "") & (out["Item Number"] != "000000000000")
+        
         out = out[
             out["Cases"].gt(0) & 
             out["Cost"].ge(0.01) & 
-            (out["UPC"] != "") & 
-            (out["UPC"] != "000000000000")
+            (has_upc | has_item)
         ].copy()
 
         if out.empty:
