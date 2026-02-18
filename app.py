@@ -344,13 +344,14 @@ with tab_invoice:
             # Match against Pricebook
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
-            # 1. Calculate New Values
+            # 1. Calculate New Values (Invoice)
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
             merged["New_Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(1).astype(int)
             
-            # 2. Get Old Values (Handle NaNs)
+            # 2. Get Old Values (Database)
             merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0).astype(int)
             merged["cost_qty"] = pd.to_numeric(merged["cost_qty"], errors='coerce').fillna(1).astype(int)
+            merged["cents"] = pd.to_numeric(merged["cents"], errors='coerce').fillna(0).astype(int) # Current Unit Price
             
             # 3. Identify Matches
             matched = merged[merged["Upc"].notna()].copy()
@@ -360,7 +361,7 @@ with tab_invoice:
                 st.divider()
                 st.subheader("📊 Invoice Item Details & Retail Calculator")
                 
-                # --- A. CALCULATE RETAIL & CHANGE FLAGS ---
+                # --- A. CALCULATE METRICS ---
                 matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
                 
                 def calc_row_metrics(row):
@@ -369,23 +370,26 @@ with tab_invoice:
                     pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
                     unit_cost = case_cost / pack
                     
-                    # 2. Retail (Target 40% margin -> Cost / 0.6 -> Round to .x9)
+                    # 2. Retail Calc (Target 40% margin -> Cost / 0.6 -> Round to .x9)
                     target_retail = unit_cost / 0.6
-                    # Round up to next 10 cents, minus 1 cent (3.12 -> 3.19)
+                    # Round up to next 10 cents, minus 1 cent (e.g. 3.12 -> 3.20 -> 3.19)
                     retail_val = np.ceil(target_retail * 10) / 10.0 - 0.01
+                    if retail_val < 0: retail_val = 0
                     
-                    # 3. Formatting Retail (Add * if Cost Changed)
+                    # 3. Format Retail String (Add * if Cost Changed)
                     retail_str = f"${retail_val:.2f}"
                     if row["Cost_Changed"]:
                         retail_str += " *"
                         
                     return unit_cost, retail_str
 
-                # Apply Metrics
+                # Apply
                 metrics = matched.apply(calc_row_metrics, axis=1, result_type='expand')
                 matched["Unit Cost"] = metrics[0]
                 matched["Retail String"] = metrics[1]
-                matched["Now"] = matched["cost_cents"] / 100.0 # Pricebook Cost
+                
+                # "Now" = Current Pricebook Unit Price (cents column)
+                matched["Now"] = matched["cents"] / 100.0
                 
                 # --- B. DISPLAY MAIN TABLE ---
                 # Columns: UPC, Brand, Description, Case Cost, Unit, Now, Retail
@@ -402,7 +406,7 @@ with tab_invoice:
                     column_config={
                         "Case Cost": st.column_config.NumberColumn(format="$%.2f"),
                         "Unit": st.column_config.NumberColumn(format="$%.2f"),
-                        "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Cost"),
+                        "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price (cents)"),
                         "Retail": st.column_config.TextColumn(help="Calculated Retail (40% Margin). * indicates cost change.")
                     },
                     use_container_width=True,
