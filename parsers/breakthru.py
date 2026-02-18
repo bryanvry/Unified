@@ -1,15 +1,4 @@
 # parsers/breakthru.py
-# Breakthru CSV parser → outputs columns: [UPC, Item Name, Cost, Cases, Item Number]
-# - UPC: "UPC Number(Each)" (may miss leading zeros → normalize to 12 digits)
-# - Item Name: "Item Description"
-# - Cases: "Quantity" (integer)
-# - Cost: per-case = "Net Value at Header Level" / "Quantity"
-# - Item Number: from "Item Number" (kept to allow UPC fallback in the app layer)
-#
-# Keeps invoice order. Skips rows with qty <= 0 or missing UPC/cost.
-# NOTE: The app will create a *download-only* version of invoice items where rows with
-# blank UPC will have "Item Number" substituted into the UPC column for manual fixing.
-
 from __future__ import annotations
 import io
 import pandas as pd
@@ -21,19 +10,17 @@ REQ_BASE = [
     "Net Value at Header Level",
     "Quantity",
 ]
-# Item Number can sometimes be missing; treat as optional but prefer to include.
 OPT_ITEMNUM = ["Item Number", "ItemNumber", "Item No", "Item #", "Item"]
 
 def _digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
 def _norm12(x: str) -> str:
+    # This function fixes the "chopped zeros" issue
     d = _digits(x)
-    if not d:
-        return ""
-    if len(d) > 12:
-        d = d[-12:]
-    return d.zfill(12)
+    if not d: return ""
+    if len(d) > 12: d = d[-12:]
+    return d.zfill(12) # Pads with leading zeros to reach 12 digits
 
 def _find_col(cols, candidates):
     low = [c.lower() for c in cols]
@@ -48,7 +35,7 @@ def _find_col(cols, candidates):
 
 class BreakthruParser:
     name = "Breakthru"
-    tokens = REQ_BASE[:]  # for any upstream token sniffing
+    tokens = REQ_BASE[:]
 
     def parse(self, uploaded_file) -> pd.DataFrame:
         raw = uploaded_file.read()
@@ -67,6 +54,7 @@ class BreakthruParser:
         if not all([c_upc, c_name, c_net, c_qty]):
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
+        # Calculations
         qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
         net = (
             df[c_net].astype(str)
@@ -74,34 +62,32 @@ class BreakthruParser:
             .pipe(pd.to_numeric, errors="coerce")
             .fillna(0.0)
         )
-        # cost per case; NaN when qty == 0 (filtered later)
         cost = net / qty.replace(0, np.nan)
 
+        # Extract Raw Data (Normalization happens in App for matching)
         out = pd.DataFrame({
-            "UPC": df[c_upc].astype(str).map(_norm12),
+            "UPC": df[c_upc].astype(str).map(_norm12), # Apply zero-padding here too
             "Item Name": df[c_name].astype(str).str.strip(),
             "Cost": pd.to_numeric(cost, errors="coerce"),
             "Cases": qty,
             "_order": range(len(df)),
         })
 
-        # Optional Item Number
         if c_itemn:
             out["Item Number"] = df[c_itemn].astype(str).str.strip()
         else:
             out["Item Number"] = ""
 
-        # Filter invalid rows for processing
+        # Filter
         out = out[
-            out["Cases"].gt(0) & out["Cost"].ge(0.01)
+            out["Cases"].gt(0) & 
+            out["Cost"].ge(0.01) & 
+            (out["UPC"] != "") & 
+            (out["UPC"] != "000000000000")
         ].copy()
 
         if out.empty:
             return pd.DataFrame(columns=["UPC", "Item Name", "Cost", "Cases", "Item Number"])
 
-        # Preserve invoice order; ensure UPC textual for downloads
         out = out.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-        out["UPC"] = out["UPC"].astype(str)
-
-        # Return with Item Number so the app can do the UPC fallback for the download only
         return out[["UPC", "Item Name", "Cost", "Cases", "Item Number"]]
