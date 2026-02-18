@@ -130,19 +130,17 @@ with tab_order:
             conn = get_db_connection()
             
             # 1. DYNAMIC COMPANY LIST
-            # Pulls what is ACTUALLY in the DB so we don't have spelling mismatches
             companies_df = conn.query('SELECT DISTINCT "Company" FROM "BeerandLiquorKey"', ttl=0)
             
             if not companies_df.empty:
-                # Clean and sort the list
-                company_options = sorted(companies_df["Company"].dropna().astype(str).unique().tolist())
+                # Filter out None/NaN and sort
+                company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
             else:
-                company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"] # Fallback
+                company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"]
             
             target_company = st.selectbox("Select Company", company_options)
             
             if st.button(f"Generate {target_company} Sheet"):
-                # SQL Escape for names with apostrophes
                 safe_company = target_company.replace("'", "''")
                 
                 # 2. Fetch Vendor Map
@@ -171,7 +169,14 @@ with tab_order:
                     sales_hist = conn.query(sales_query, ttl=0)
                     
                     # 5. Merge Map + Pricebook
+                    # This creates Name_x (from Vendor) and Name_y (from Pricebook)
                     merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
+                    
+                    # --- FIX: Handle Column Collision ---
+                    if "Name_x" in merged.columns:
+                        merged = merged.rename(columns={"Name_x": "Name"})
+                    elif "Name_y" in merged.columns and "Name" not in merged.columns:
+                        merged = merged.rename(columns={"Name_y": "Name"})
                     
                     # 6. Pivot Sales Data
                     sales_cols = []
@@ -184,29 +189,36 @@ with tab_order:
                             aggfunc="sum"
                         ).fillna(0)
                         
-                        # Sort by date descending (Newest first)
                         sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=True)
                         sales_pivot = sales_pivot[sorted_dates]
                         
-                        # Keep top 4 weeks
                         sales_cols = sorted_dates[:4]
                         sales_pivot = sales_pivot[sales_cols]
                         
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    # 7. Safe Calculations (CRITICAL FIX)
-                    # Force numeric conversion to prevent 'str / float' crashes
+                    # 7. Safe Calculations
                     if "setstock" in merged.columns:
                         merged["Current Stock"] = pd.to_numeric(merged["setstock"], errors='coerce').fillna(0)
                     else:
                         merged["Current Stock"] = 0
 
-                    merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0)
-                    merged["Cost"] = merged["cost_cents"] / 100.0
+                    if "cost_cents" in merged.columns:
+                        merged["cost_cents"] = pd.to_numeric(merged["cost_cents"], errors='coerce').fillna(0)
+                        merged["Cost"] = merged["cost_cents"] / 100.0
+                    else:
+                        merged["Cost"] = 0.0
                     
                     # 8. Final Column Assembly
+                    # Check if "0" column exists (it might be numeric in DB)
+                    if "0" not in merged.columns and 0 in merged.columns:
+                         merged = merged.rename(columns={0: "0"})
+
                     base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Current Stock", "Cost"]
-                    final_cols = base_cols + [c for c in sales_cols if c in merged.columns]
+                    
+                    # Only include columns that actually exist to prevent crashes
+                    available_cols = [c for c in base_cols if c in merged.columns]
+                    final_cols = available_cols + [c for c in sales_cols if c in merged.columns]
                     
                     final_df = merged[final_cols].copy()
                     
