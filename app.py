@@ -194,9 +194,11 @@ with tab_order:
                         
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
 
-                    # Logic: Stock
+                    # Logic: Stock (UPDATED TO FIX ="0" ISSUE)
                     if "setstock" in merged.columns:
-                        merged["Stock"] = pd.to_numeric(merged["setstock"], errors='coerce').fillna(0)
+                        # Clean the string: remove =, " and whitespace
+                        clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
+                        merged["Stock"] = pd.to_numeric(clean_stock, errors='coerce').fillna(0)
                     else:
                         merged["Stock"] = 0
                     
@@ -217,7 +219,7 @@ with tab_order:
         except Exception as e:
             st.error(f"System Error: {e}")
 
-    # 2. Render Interactive Table (Moved OUTSIDE col_gen to use full width)
+    # 2. Render Interactive Table (Outside col_gen for full width)
     if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
         st.divider()
         st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
