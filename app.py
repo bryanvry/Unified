@@ -10,7 +10,7 @@ from sqlalchemy import text
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="LFM Process — Database Edition", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
 # --- GLOBAL HELPERS ---
 def _norm_upc_12(u: str) -> str:
@@ -42,11 +42,9 @@ def get_db_connection():
 
 def load_pricebook(table_name):
     conn = get_db_connection()
-    # Fetch essential columns for processing
     query = f'SELECT "Upc", "cents", "cost_cents", "setstock", "cost_qty", "Name" FROM "{table_name}"'
     try:
-        df = conn.query(query, ttl=0) # ttl=0 to ensure fresh data
-        # Normalize UPCs immediately for merging
+        df = conn.query(query, ttl=0)
         df["_norm_upc"] = df["Upc"].apply(_norm_upc_12)
         return df
     except Exception as e:
@@ -65,21 +63,27 @@ def load_vendor_map():
         st.error(f"Error loading Vendor Map: {e}")
         return pd.DataFrame()
 
-# --- SIDEBAR: STORE SELECTION ---
-with st.sidebar:
-    # Removed large Title and fixed width CSS for a more compact look
-    selected_store = st.radio("Select Store", ["Twain", "Rancho"], index=0, horizontal=True)
-    
-    # Map selection to Table Names
-    if selected_store == "Twain":
-        PRICEBOOK_TABLE = "PricebookTwain"
-        SALES_TABLE = "salestwain1"
-    else:
-        PRICEBOOK_TABLE = "PricebookRancho"
-        SALES_TABLE = "salesrancho1"
+# --- HEADER & STORE SELECTOR (Top Right) ---
+col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
 
-    st.divider()
-    st.caption(f"DB: **{PRICEBOOK_TABLE}**")
+with col_title:
+    st.title("LFM Process")
+
+with col_store:
+    # Tiny footprint: Selectbox with hidden label
+    # This sits neatly in the top right
+    selected_store = st.selectbox("Store", ["Twain", "Rancho"], label_visibility="collapsed")
+    # Small indicator of connection
+    st.caption(f"📍 **{selected_store}**")
+
+# Map selection to Table Names
+if selected_store == "Twain":
+    PRICEBOOK_TABLE = "PricebookTwain"
+    SALES_TABLE = "salestwain1"
+else:
+    PRICEBOOK_TABLE = "PricebookRancho"
+    SALES_TABLE = "salesrancho1"
+
 
 # --- MAIN APP TABS ---
 tab_order, tab_invoice, tab_admin = st.tabs(["📋 Order Management", "🧾 Invoice Processing", "⚙️ Admin / Uploads"])
@@ -88,7 +92,7 @@ tab_order, tab_invoice, tab_admin = st.tabs(["📋 Order Management", "🧾 Invo
 # TAB 1: ORDER MANAGEMENT
 # ==============================================================================
 with tab_order:
-    st.header(f"Order Management — {selected_store}")
+    st.header(f"Orders: {selected_store}")
     
     col_sales, col_gen = st.columns([1, 1])
     
@@ -101,12 +105,10 @@ with tab_order:
         if sales_file and st.button("Save Sales to DB", type="primary"):
             try:
                 sales_df = pd.read_csv(sales_file, dtype=str)
-                # Check required columns
                 req_cols = {"UPC", "Item", "# of Items", "Sales $"}
                 if not req_cols.issubset(sales_df.columns):
                     st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
                 else:
-                    # Prepare for DB
                     db_rows = pd.DataFrame()
                     db_rows["week_date"] = [sales_date] * len(sales_df)
                     db_rows["UPC"] = sales_df["UPC"]
@@ -116,7 +118,7 @@ with tab_order:
                     
                     conn = get_db_connection()
                     db_rows.to_sql(SALES_TABLE, conn.engine, if_exists='append', index=False)
-                    st.success(f"Successfully added {len(db_rows)} sales records to {SALES_TABLE} for {sales_date}")
+                    st.success(f"Added {len(db_rows)} records to {SALES_TABLE}")
             except Exception as e:
                 st.error(f"Failed to process sales file: {e}")
 
@@ -127,11 +129,9 @@ with tab_order:
         
         if template_file and st.button("Generate Filled Order Sheet"):
             try:
-                # 1. Load Template
                 template_df = pd.read_csv(template_file) if template_file.name.endswith('.csv') else pd.read_excel(template_file)
                 template_df.columns = [c.strip() for c in template_df.columns]
                 
-                # Find the Key Column (UPC)
                 key_col = None
                 for c in ["Full Barcode", "Full UPC", "UPC", "Barcode"]:
                     if c in template_df.columns:
@@ -141,7 +141,6 @@ with tab_order:
                 if not key_col:
                     st.error("Could not find a UPC column in template (Full Barcode, Full UPC, UPC).")
                 else:
-                    # 2. Load Current Data
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
                     conn = get_db_connection()
                     start_date = datetime.today() - timedelta(weeks=8)
@@ -152,7 +151,6 @@ with tab_order:
                     """
                     sales_hist = conn.query(sales_query, ttl=0)
                     
-                    # 3. Merge Data
                     template_df["_key_norm"] = template_df[key_col].astype(str).apply(_norm_upc_12)
                     merged = template_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                     
@@ -166,7 +164,6 @@ with tab_order:
                         ).fillna(0)
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
                     
-                    # 4. Format Output
                     if "Stock" in merged.columns:
                         merged["Stock"] = merged["setstock"]
                     
@@ -191,17 +188,18 @@ with tab_order:
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
 with tab_invoice:
-    # Updated Vendor List with Split Options
-    vendor = st.selectbox("Select Vendor", ["Unified", "JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"])
+    # 1. Vendor Selection
+    vendor_options = ["Unified", "JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"]
+    vendor = st.selectbox("Select Vendor", vendor_options)
     
-    # --- A. Unified OR JC Sales (Pricebook Direct Match) ---
+    # --- UNIFIED / JC SALES ---
     if vendor in ["Unified", "JC Sales"]:
         st.info(f"Processing against **{PRICEBOOK_TABLE}**")
         
-        # Dynamic Input based on selection
         inv_dfs = []
         should_process = False
 
+        # Unified UI
         if vendor == "Unified":
             up_files = st.file_uploader("Upload Unified Invoice(s)", accept_multiple_files=True, key="un_files")
             if up_files and st.button("Process Unified"):
@@ -214,36 +212,31 @@ with tab_invoice:
                         st.error(f"Error parsing {f.name}: {e}")
                 should_process = True
         
+        # JC Sales UI
         elif vendor == "JC Sales":
             jc_text = st.text_area("Paste JC Sales Text", height=200)
             if jc_text and st.button("Process JC Sales"):
                 jc_df, _ = JCSalesParser().parse(jc_text)
                 if not jc_df.empty:
-                    # Rename JC cols to match Unified standard
                     jc_df = jc_df.rename(columns={"ITEM": "inv_upc_raw", "DESCRIPTION": "Description", "PACK": "Pack", "UNIT": "+Cost"})
                     jc_df["UPC"] = jc_df["inv_upc_raw"]
                     inv_dfs.append(jc_df)
                 should_process = True
 
-        # Common Processing Logic
         if should_process:
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             if pb_df.empty:
-                st.error("Pricebook is empty. Please upload one in Admin tab.")
+                st.error("Pricebook is empty.")
                 st.stop()
             
             if not inv_dfs:
                 st.warning("No valid data parsed.")
                 st.stop()
 
-            # Merge invoice rows
             full_inv = pd.concat(inv_dfs, ignore_index=True)
             full_inv["_norm_upc"] = full_inv["UPC"].astype(str).apply(_norm_upc_12)
-            
-            # Match against Pricebook
             merged = full_inv.merge(pb_df, on="_norm_upc", how="left")
             
-            # Determine Updates
             merged["New_Cost_Cents"] = (pd.to_numeric(merged["+Cost"], errors='coerce') * 100).fillna(0).astype(int)
             merged["New_Pack"] = pd.to_numeric(merged["Pack"], errors='coerce').fillna(1).astype(int)
             
@@ -267,14 +260,14 @@ with tab_invoice:
                 st.success(f"Found {len(updates)} items requiring POS updates.")
                 st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(pos_out), f"POS_Update_{selected_store}.csv", "text/csv")
             else:
-                st.info("No cost or pack changes detected against current Pricebook.")
+                st.info("No cost/pack changes detected.")
             
             unmatched = merged[merged["Upc"].isna()].copy()
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
                 st.dataframe(unmatched[["UPC", "Description", "+Cost"]])
 
-    # --- B. SG / NV / Breakthru (Vendor Map + Pricebook) ---
+    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
         
@@ -285,7 +278,7 @@ with tab_invoice:
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
             if map_df.empty: 
-                st.error("Vendor Map is empty. Go to Admin.")
+                st.error("Vendor Map is empty.")
                 st.stop()
             
             rows = []
@@ -302,17 +295,14 @@ with tab_invoice:
             
             inv_df = pd.concat(rows, ignore_index=True)
             inv_df["_inv_upc_norm"] = inv_df["UPC"].astype(str).apply(_norm_upc_12)
-            
-            # Map Invoice UPC -> System UPC
             mapped = inv_df.merge(map_df, on="_inv_upc_norm", how="left")
             
-            # "Not in Master" Handling
             missing = mapped[mapped["Full Barcode"].isna()].copy()
             valid = mapped[mapped["Full Barcode"].notna()].copy()
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items not found in Vendor Map.")
-                st.caption("Edit below and click 'Save to Map' to add them.")
+                st.caption("Edit below and click 'Save to Map'.")
                 
                 edit_df = pd.DataFrame({
                     "Invoice UPC": missing["UPC"],
@@ -332,10 +322,9 @@ with tab_invoice:
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
-                        st.success("Items added to Map! Please click 'Analyze Invoice' again.")
+                        st.success("Items added! Click 'Analyze Invoice' again.")
                         st.rerun()
 
-            # Compare Costs
             if not valid.empty:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
@@ -353,7 +342,7 @@ with tab_invoice:
                 else:
                     st.success("All mapped items match Pricebook costs.")
 
-    # --- C. Costco (Original File-Based Logic for now) ---
+    # --- COSTCO ---
     elif vendor == "Costco":
         st.header("Costco Processor")
         st.markdown("**Note:** Upload your Costco Master List manually.")
@@ -365,12 +354,10 @@ with tab_invoice:
             if not costco_master or not costco_text:
                 st.error("Please provide both Master file and Receipt text.")
             else:
-                # 1. Parse Receipt
                 parsed_df = CostcoParser().parse(costco_text)
                 if parsed_df.empty:
                     st.error("No items found in receipt.")
                 else:
-                    # 2. Match with Master
                     try:
                         master_df = pd.read_excel(costco_master, dtype=str)
                         # Clean Master
@@ -381,7 +368,7 @@ with tab_invoice:
                         master_df["_cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
                         item_cost_map = dict(zip(master_df["_item_str"], master_df["_cost_float"]))
                         
-                        # 3. Auto-Match Logic
+                        # Auto-Match
                         parsed_df["Item Number"] = parsed_df["Item Number"].astype(str).str.strip()
                         
                         results = []
@@ -392,7 +379,6 @@ with tab_invoice:
                             
                             qty = 1
                             if known_cost > 0:
-                                # Simple division check
                                 ratio = price / known_cost
                                 if abs(ratio - round(ratio)) < 0.05:
                                     qty = int(round(ratio))
@@ -421,13 +407,12 @@ with tab_admin:
     st.header("Database Administration")
     col_pb, col_map = st.columns(2)
     
-    # --- A. Pricebook Initialization ---
     with col_pb:
         st.subheader(f"Update Pricebook ({selected_store})")
-        st.caption(f"Target Table: `{PRICEBOOK_TABLE}`")
+        st.caption(f"Target: `{PRICEBOOK_TABLE}`")
         pb_upload = st.file_uploader("Upload Pricebook CSV", type=["csv"], key="pb_admin")
         
-        if pb_upload and st.button("Replace Pricebook in DB", type="primary"):
+        if pb_upload and st.button("Replace Pricebook", type="primary"):
             try:
                 df = pd.read_csv(pb_upload, dtype=str)
                 df.columns = [c.strip() for c in df.columns]
@@ -447,14 +432,13 @@ with tab_admin:
                     cols_to_use = [c for c in valid_cols if c in df.columns]
                     
                     df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
-                    st.success(f"Successfully replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
+                    st.success(f"Replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
             except Exception as e:
                 st.error(f"Error updating pricebook: {e}")
 
-    # --- B. Vendor Map Initialization ---
     with col_map:
         st.subheader("Update Vendor Map (Global)")
-        st.caption("Target Table: `BeerandLiquorKey`")
+        st.caption("Target: `BeerandLiquorKey`")
         map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
         
         if map_upload and st.button("Append/Update Map"):
