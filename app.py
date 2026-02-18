@@ -452,6 +452,62 @@ with tab_invoice:
                         f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
                         "text/csv"
                     )
+
+    # --- COSTCO ---
+    elif vendor == "Costco":
+        st.header("Costco Processor")
+        st.markdown("**Note:** Upload your Costco Master List manually.")
+        
+        costco_master = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
+        costco_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
+
+        if st.button("Process Costco Receipt"):
+            if not costco_master or not costco_text:
+                st.error("Please provide both Master file and Receipt text.")
+            else:
+                try:
+                    parsed_df = CostcoParser().parse(costco_text)
+                    if parsed_df.empty:
+                        st.error("No items found in receipt.")
+                    else:
+                        master_df = pd.read_excel(costco_master, dtype=str)
+                        m_item_num = next((c for c in ["Item Number", "Item #"] if c in master_df.columns), "Item Number")
+                        m_cost = next((c for c in ["Cost"] if c in master_df.columns), "Cost")
+                        
+                        master_df["_item_str"] = master_df[m_item_num].astype(str).str.strip()
+                        master_df["_cost_float"] = pd.to_numeric(master_df[m_cost], errors="coerce").fillna(0.0)
+                        item_cost_map = dict(zip(master_df["_item_str"], master_df["_cost_float"]))
+                        
+                        parsed_df["Item Number"] = parsed_df["Item Number"].astype(str).str.strip()
+                        
+                        results = []
+                        for _, row in parsed_df.iterrows():
+                            item = row["Item Number"]
+                            price = float(row["Receipt Price"])
+                            known_cost = item_cost_map.get(item, 0.0)
+                            
+                            qty = 1
+                            if known_cost > 0:
+                                ratio = price / known_cost
+                                if abs(ratio - round(ratio)) < 0.05:
+                                    qty = int(round(ratio))
+                                    if qty == 0: qty = 1
+                            
+                            results.append({
+                                "Item Number": item,
+                                "Description": row["Item Name"],
+                                "Receipt Price": price,
+                                "Calc Qty": qty,
+                                "Unit Cost": price / qty
+                            })
+                        
+                        res_df = pd.DataFrame(results)
+                        st.success(f"Processed {len(res_df)} items.")
+                        st.dataframe(res_df)
+                        st.download_button("⬇️ Download Costco Report", to_xlsx_bytes({"Costco": res_df}), "Costco_Report.xlsx")
+                        
+                except Exception as e:
+                    st.error(f"Error processing master/receipt: {e}")
 # ==============================================================================
 # TAB 3: ADMIN / UPLOADS
 # ==============================================================================
