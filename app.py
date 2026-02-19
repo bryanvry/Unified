@@ -16,7 +16,7 @@ st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 # ==============================================================================
 # --- AUTHENTICATION GATE ---
 # ==============================================================================
-MASTER_PASSKEY = "LFM2026!" 
+MASTER_PASSKEY = st.secrets["APP_PASSKEY"]
 
 # Initialize session state for authentication
 if "authenticated" not in st.session_state:
