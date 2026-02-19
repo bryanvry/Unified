@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 # ===== vendor parsers =====
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
+
 # --- CONFIGURATION ---
 st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
