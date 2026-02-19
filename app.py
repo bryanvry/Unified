@@ -53,9 +53,6 @@ if not st.session_state["authenticated"]:
                 
     st.stop() # Prevents the rest of the app from loading
 
-# 2. THE MAIN APP SCREEN LOGO
-# This places the logo neatly in the top-left corner above the sidebar!
-st.logo(LOGO_PATH)
 
 # ==============================================================================
 
@@ -131,7 +128,9 @@ def load_vendor_map():
 col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
 
 with col_title:
-    st.title("LFM Process")
+    # We use width=250 so it doesn't stretch massively across the whole screen.
+    # You can change 250 to 300, 400, etc., to make it bigger!
+    st.image(LOGO_PATH, width=250)
 
 with col_store:
     # Tiny footprint: Selectbox with hidden label
