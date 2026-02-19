@@ -10,26 +10,39 @@ from sqlalchemy import text
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
 # --- CONFIGURATION ---
-# This MUST be the very first Streamlit command!
 st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
 # ==============================================================================
-# --- AUTHENTICATION GATE ---
+# --- AUTHENTICATION GATE & LOGO ---
 # ==============================================================================
 MASTER_PASSKEY = st.secrets["APP_PASSKEY"]
+
+# 👉 Change this to the exact name of your uploaded logo file!
+LOGO_PATH = "logo.png" 
 
 # Initialize session state for authentication
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
-# If not authenticated, show the login page and STOP the script
+# 1. THE LOGIN SCREEN
 if not st.session_state["authenticated"]:
-    # Center the login box for a cleaner landing page look
+    # Center the login box
     col1, col2, col3 = st.columns([1, 2, 1])
     
     with col2:
         st.write("")
         st.write("")
+        
+        # --- Centered Logo on Login Screen ---
+        # We use nested columns here to force the logo perfectly into the middle
+        logo_col1, logo_col2, logo_col3 = st.columns([1, 2, 1])
+        with logo_col2:
+            try:
+                st.image(LOGO_PATH, use_container_width=True)
+            except Exception:
+                # If the image isn't found, it just skips it instead of crashing
+                st.caption("(Upload logo.png to see your logo here)")
+        
         st.title("🔒 LFM Portal Login")
         st.markdown("Please enter the master passkey to access the system.")
         
@@ -43,6 +56,14 @@ if not st.session_state["authenticated"]:
                 st.error("❌ Incorrect passkey. Please try again.")
                 
     st.stop() # Prevents the rest of the app from loading
+
+# 2. THE MAIN APP SCREEN LOGO
+# This places the logo neatly in the top-left corner above the sidebar!
+try:
+    st.logo(LOGO_PATH)
+except Exception:
+    pass
+
 # ==============================================================================
 
 # --- GLOBAL HELPERS ---
