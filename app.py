@@ -10,13 +10,13 @@ from sqlalchemy import text
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
 # --- CONFIGURATION ---
+# This MUST be the very first Streamlit command!
 st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
 # ==============================================================================
 # --- AUTHENTICATION GATE ---
 # ==============================================================================
-# Change this to whatever you want your store's passkey to be
-MASTER_PASSKEY = "LFM1" 
+MASTER_PASSKEY = "LFM2026!" 
 
 # Initialize session state for authentication
 if "authenticated" not in st.session_state:
@@ -38,19 +38,12 @@ if not st.session_state["authenticated"]:
         if st.button("Login", use_container_width=True):
             if entered_key == MASTER_PASSKEY:
                 st.session_state["authenticated"] = True
-                st.rerun() # Reloads the page to show the main app
+                st.rerun() 
             else:
                 st.error("❌ Incorrect passkey. Please try again.")
                 
-    st.stop() # This prevents any code below this line from running!
+    st.stop() # Prevents the rest of the app from loading
 # ==============================================================================
-
-# --- GLOBAL HELPERS ---
-def _norm_upc_12(u: str) -> str:
-# ... (the rest of your app code continues normally below)
-
-# --- CONFIGURATION ---
-st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
 # --- GLOBAL HELPERS ---
 def _norm_upc_12(u: str) -> str:
@@ -78,8 +71,7 @@ def to_xlsx_bytes(dfs_dict):
 
 # --- DATABASE HANDLERS ---
 def get_db_connection():
-    return st.connection("supabase", type="sql")
-    
+    return st.connection("supabase", type="sql")    
 def log_activity(store, vendor, items_cnt, changes_cnt):
     """Logs invoice processing events to Supabase."""
     try:
