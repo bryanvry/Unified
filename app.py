@@ -190,7 +190,36 @@ with tab_order:
             
             # Button to Load Data into Session State
             if st.button(f"Load {target_company} Items"):
-                safe_company = target_company.replace("'", "''")
+                # NO MORE safe_company string replacement needed
+                
+                # Fetch Vendor Map (Notice the :company_name placeholder)
+                map_query = """
+                    SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
+                    FROM "BeerandLiquorKey" 
+                    WHERE "Company" = :company_name
+                """
+                # Pass the parameter safely
+                vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
+                
+                if vendor_df.empty:
+                    st.warning(f"No items found for {target_company}.")
+                    st.session_state['order_df'] = None
+                else:
+                    vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
+                    
+                    # Fetch Pricebook & Sales
+                    pb_df = load_pricebook(PRICEBOOK_TABLE)
+                    
+                    start_date = datetime.today() - timedelta(weeks=12) 
+                    
+                    # Also update the Sales query to be safe! (Notice the :start_date placeholder)
+                    sales_query = f"""
+                        SELECT "UPC", "week_date", "qty_sold" 
+                        FROM "{SALES_TABLE}" 
+                        WHERE "week_date" >= :start_date
+                    """
+                    # Pass the date safely
+                    sales_hist = conn.query(sales_query, params={"start_date": start_date.strftime('%Y-%m-%d')}, ttl=0)
                 
                 # Fetch Vendor Map
                 map_query = f"""
