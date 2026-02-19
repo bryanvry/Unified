@@ -41,8 +41,6 @@ if not st.session_state["authenticated"]:
         with logo_col2:
             st.image(LOGO_PATH, use_column_width=True)
         
-        st.title("🔒 LFM Portal Login")
-        st.markdown("Please enter the master passkey to access the system.")
         
         entered_key = st.text_input("Passkey", type="password", placeholder="Enter passkey...")
         
