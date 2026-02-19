@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import os
 from io import BytesIO
 from datetime import datetime, timedelta
 from sqlalchemy import text
@@ -17,8 +18,9 @@ st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 # ==============================================================================
 MASTER_PASSKEY = st.secrets["APP_PASSKEY"]
 
-# 👉 Change this to the exact name of your uploaded logo file!
-LOGO_PATH = "logo.png" 
+# Dynamically build the exact path to the logo file
+current_dir = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(current_dir, "logo.png")
 
 # Initialize session state for authentication
 if "authenticated" not in st.session_state:
