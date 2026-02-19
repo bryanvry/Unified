@@ -5,7 +5,45 @@ import re
 from io import BytesIO
 from datetime import datetime, timedelta
 from sqlalchemy import text
+# --- CONFIGURATION ---
+st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
+# ==============================================================================
+# --- AUTHENTICATION GATE ---
+# ==============================================================================
+# Change this to whatever you want your store's passkey to be
+MASTER_PASSKEY = "LFM1" 
+
+# Initialize session state for authentication
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+# If not authenticated, show the login page and STOP the script
+if not st.session_state["authenticated"]:
+    # Center the login box for a cleaner landing page look
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.write("")
+        st.write("")
+        st.title("🔒 LFM Portal Login")
+        st.markdown("Please enter the master passkey to access the system.")
+        
+        entered_key = st.text_input("Passkey", type="password", placeholder="Enter passkey...")
+        
+        if st.button("Login", use_container_width=True):
+            if entered_key == MASTER_PASSKEY:
+                st.session_state["authenticated"] = True
+                st.rerun() # Reloads the page to show the main app
+            else:
+                st.error("❌ Incorrect passkey. Please try again.")
+                
+    st.stop() # This prevents any code below this line from running!
+# ==============================================================================
+
+# --- GLOBAL HELPERS ---
+def _norm_upc_12(u: str) -> str:
+# ... (the rest of your app code continues normally below)
 # ===== vendor parsers =====
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
