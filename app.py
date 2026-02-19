@@ -190,17 +190,16 @@ with tab_order:
             
             # Button to Load Data into Session State
             if st.button(f"Load {target_company} Items"):
-                # NO MORE safe_company string replacement needed
                 
-                # Fetch Vendor Map (Notice the :company_name placeholder)
+                # --- SECURITY FIX: Parameterized Query (No f-string) ---
                 map_query = """
                     SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
                     FROM "BeerandLiquorKey" 
                     WHERE "Company" = :company_name
                 """
-                # Pass the parameter safely
                 vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
-                
+                # -------------------------------------------------------
+
                 if vendor_df.empty:
                     st.warning(f"No items found for {target_company}.")
                     st.session_state['order_df'] = None
@@ -210,42 +209,16 @@ with tab_order:
                     # Fetch Pricebook & Sales
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
                     
+                    # Look back 12 weeks to ensure we get at least 6 weeks of valid data
                     start_date = datetime.today() - timedelta(weeks=12) 
                     
-                    # Also update the Sales query to be safe! (Notice the :start_date placeholder)
+                    # Note: {SALES_TABLE} is safe here because users can't edit that variable
                     sales_query = f"""
                         SELECT "UPC", "week_date", "qty_sold" 
                         FROM "{SALES_TABLE}" 
                         WHERE "week_date" >= :start_date
                     """
-                    # Pass the date safely
                     sales_hist = conn.query(sales_query, params={"start_date": start_date.strftime('%Y-%m-%d')}, ttl=0)
-                
-                # Fetch Vendor Map
-                map_query = f"""
-                    SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
-                    FROM "BeerandLiquorKey" 
-                    WHERE "Company" = '{safe_company}'
-                """
-                vendor_df = conn.query(map_query, ttl=0)
-                
-                if vendor_df.empty:
-                    st.warning(f"No items found for {target_company}.")
-                    st.session_state['order_df'] = None
-                else:
-                    vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
-                    
-                    # Fetch Pricebook & Sales
-                    pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    
-                    # Look back 12 weeks just to make sure we always hit at least 6 unique weeks
-                    start_date = datetime.today() - timedelta(weeks=12) 
-                    sales_query = f"""
-                        SELECT "UPC", "week_date", "qty_sold" 
-                        FROM "{SALES_TABLE}" 
-                        WHERE "week_date" >= '{start_date.strftime('%Y-%m-%d')}'
-                    """
-                    sales_hist = conn.query(sales_query, ttl=0)
                     
                     # Merge Map + Pricebook
                     merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
@@ -267,7 +240,7 @@ with tab_order:
                             aggfunc="sum"
                         ).fillna(0)
                         
-                        # Sort Oldest to Newest (Reverse=False)
+                        # Sort Oldest to Newest
                         sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
                         
                         # CHANGED: Keep last 6 weeks instead of 4
@@ -278,7 +251,6 @@ with tab_order:
 
                     # Logic: Stock
                     if "setstock" in merged.columns:
-                        # Clean the string: remove =, " and whitespace
                         clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
                         merged["Stock"] = pd.to_numeric(clean_stock, errors='coerce').fillna(0)
                     else:
@@ -287,8 +259,7 @@ with tab_order:
                     # Logic: Initialize Order Column
                     merged["Order"] = 0
                     
-                    # Final Columns
-                    # CHANGED: Removed "Invoice UPC" and "0"
+                    # Final Columns (REMOVED: "Invoice UPC" and "0")
                     base_cols = ["Full Barcode", "Name", "Size", "PACK"]
                     available_base = [c for c in base_cols if c in merged.columns]
                     
@@ -340,7 +311,6 @@ with tab_order:
                 
                 # Select only requested columns
                 output_cols = ["Name", "Size", "Order"]
-                # Ensure columns exist before selecting
                 valid_cols = [c for c in output_cols if c in final_order.columns]
                 
                 download_df = final_order[valid_cols]
