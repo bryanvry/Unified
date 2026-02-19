@@ -176,7 +176,9 @@ with tab_order:
                     
                     # Fetch Pricebook & Sales
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    start_date = datetime.today() - timedelta(weeks=8)
+                    
+                    # Look back 12 weeks just to make sure we always hit at least 6 unique weeks
+                    start_date = datetime.today() - timedelta(weeks=12) 
                     sales_query = f"""
                         SELECT "UPC", "week_date", "qty_sold" 
                         FROM "{SALES_TABLE}" 
@@ -206,13 +208,14 @@ with tab_order:
                         
                         # Sort Oldest to Newest (Reverse=False)
                         sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
-                        # Keep last 4 weeks
-                        sales_cols = sorted_dates[-4:]
+                        
+                        # CHANGED: Keep last 6 weeks instead of 4
+                        sales_cols = sorted_dates[-6:]
                         sales_pivot = sales_pivot[sales_cols]
                         
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
 
-                    # Logic: Stock (UPDATED TO FIX ="0" ISSUE)
+                    # Logic: Stock
                     if "setstock" in merged.columns:
                         # Clean the string: remove =, " and whitespace
                         clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
@@ -224,8 +227,8 @@ with tab_order:
                     merged["Order"] = 0
                     
                     # Final Columns
-                    # Info -> Sales -> Stock -> Order
-                    base_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK"]
+                    # CHANGED: Removed "Invoice UPC" and "0"
+                    base_cols = ["Full Barcode", "Name", "Size", "PACK"]
                     available_base = [c for c in base_cols if c in merged.columns]
                     
                     final_cols = available_base + sales_cols + ["Stock", "Order"]
