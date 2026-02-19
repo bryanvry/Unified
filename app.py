@@ -37,11 +37,7 @@ if not st.session_state["authenticated"]:
         # We use nested columns here to force the logo perfectly into the middle
         logo_col1, logo_col2, logo_col3 = st.columns([1, 2, 1])
         with logo_col2:
-            try:
-                st.image(LOGO_PATH, use_container_width=True)
-            except Exception:
-                # If the image isn't found, it just skips it instead of crashing
-                st.caption("(Upload logo.png to see your logo here)")
+            st.image(LOGO_PATH, use_container_width=True)
         
         st.title("🔒 LFM Portal Login")
         st.markdown("Please enter the master passkey to access the system.")
@@ -59,10 +55,7 @@ if not st.session_state["authenticated"]:
 
 # 2. THE MAIN APP SCREEN LOGO
 # This places the logo neatly in the top-left corner above the sidebar!
-try:
-    st.logo(LOGO_PATH)
-except Exception:
-    pass
+st.logo(LOGO_PATH)
 
 # ==============================================================================
 
