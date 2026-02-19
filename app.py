@@ -5,6 +5,9 @@ import re
 from io import BytesIO
 from datetime import datetime, timedelta
 from sqlalchemy import text
+
+# ===== vendor parsers =====
+from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 # --- CONFIGURATION ---
 st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
 
@@ -44,8 +47,6 @@ if not st.session_state["authenticated"]:
 # --- GLOBAL HELPERS ---
 def _norm_upc_12(u: str) -> str:
 # ... (the rest of your app code continues normally below)
-# ===== vendor parsers =====
-from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
