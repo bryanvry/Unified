@@ -569,9 +569,23 @@ with tab_invoice:
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
         
+        # 1. Keep track of the vendor so we reset analysis if they switch tabs/vendors
+        if st.session_state.get("current_sg_vendor") != vendor:
+            st.session_state["analyze_sg"] = False
+            st.session_state["current_sg_vendor"] = vendor
+            
         inv_files = st.file_uploader(f"Upload {vendor} Invoice(s)", accept_multiple_files=True)
         
+        # 2. Reset if they clear the uploaded files
+        if not inv_files:
+            st.session_state["analyze_sg"] = False
+
+        # 3. Use the button to flip a persistent "Session State" switch
         if st.button("Analyze Invoice"):
+            st.session_state["analyze_sg"] = True
+            
+        # 4. Check the session state switch instead of the button!
+        if st.session_state.get("analyze_sg", False) and inv_files:
             map_df = load_vendor_map()
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
@@ -654,14 +668,18 @@ with tab_invoice:
                 edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
                 
                 if st.button("Save New Items to Map"):
-                    to_insert = edited_rows[edited_rows["Full Barcode"].str.len() > 3].copy()
+                    to_insert = edited_rows[edited_rows["Full Barcode"].astype(str).str.len() > 3].copy()
+                    
                     if not to_insert.empty:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
-                        st.success("Items added! Click 'Analyze Invoice' again to include them.")
-                        st.rerun()
+                        
+                        st.success("Items successfully mapped! Re-analyzing invoice...")
+                        st.rerun() # Forces the page to reload, automatically processing the newly added items!
+                    else:
+                        st.error("No valid Barcodes were entered.")
 
             # 2. Process Valid Items
             if not valid.empty:
