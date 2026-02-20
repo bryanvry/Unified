@@ -656,14 +656,26 @@ with tab_invoice:
                 missing["_display_id"] = missing["Item Number"]
                 missing.loc[missing["_display_id"] == "", "_display_id"] = missing["UPC"]
                 
+                # --- FIX 1: Map Vendor name to the Key's short name ---
+                company_db_name = vendor
+                if vendor == "Southern Glazer's":
+                    company_db_name = "Southern"
+                elif vendor == "Nevada Beverage":
+                    company_db_name = "Nevada"
+                # (Breakthru already matches perfectly, so we leave it as is)
+                # ------------------------------------------------------
+
+                # --- FIX 2: Reorder columns and add "Size" ---
                 edit_df = pd.DataFrame({
-                    "Invoice UPC": missing["_display_id"], 
-                    "Name": missing["Item Name"],
                     "Full Barcode": "",
+                    "Invoice UPC": missing["_display_id"], 
+                    "0": "",
+                    "Name": missing["Item Name"],
+                    "Size": "",
                     "PACK": 1,
-                    "Company": vendor,
-                    "0": ""
+                    "Company": company_db_name
                 })
+                # ---------------------------------------------
                 
                 edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
                 
@@ -674,10 +686,11 @@ with tab_invoice:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
+                        # We pass the perfectly ordered and formatted dataframe directly to the DB!
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
                         
                         st.success("Items successfully mapped! Re-analyzing invoice...")
-                        st.rerun() # Forces the page to reload, automatically processing the newly added items!
+                        st.rerun() 
                     else:
                         st.error("No valid Barcodes were entered.")
 
