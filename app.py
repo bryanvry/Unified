@@ -406,13 +406,29 @@ with tab_invoice:
     if vendor in ["Unified", "JC Sales"]:
         st.info(f"Processing against **{PRICEBOOK_TABLE}**")
         
+        # 1. MEMORY LOCK: Keep track of the vendor to reset analysis if switched
+        if st.session_state.get("current_un_vendor") != vendor:
+            st.session_state["analyze_unified"] = False
+            st.session_state["current_un_vendor"] = vendor
+            if "unified_final_df" in st.session_state:
+                del st.session_state["unified_final_df"]
+                
         inv_dfs = []
-        should_process = False
 
         # Unified UI
         if vendor == "Unified":
             up_files = st.file_uploader("Upload Unified Invoice(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="un_files")
-            if up_files and st.button("Process Unified"):
+            
+            # Reset if files are cleared
+            if not up_files:
+                st.session_state["analyze_unified"] = False
+                
+            if st.button("Process Unified"):
+                st.session_state["analyze_unified"] = True
+                if "unified_final_df" in st.session_state: # Clear old exports
+                    del st.session_state["unified_final_df"]
+                    
+            if st.session_state.get("analyze_unified", False) and up_files:
                 for f in up_files:
                     try:
                         f.seek(0)
@@ -420,12 +436,20 @@ with tab_invoice:
                         inv_dfs.append(df)
                     except Exception as e:
                         st.error(f"Error parsing {f.name}: {e}")
-                should_process = True
         
         # JC Sales UI
         elif vendor == "JC Sales":
             jc_text = st.text_area("Paste JC Sales Text", height=200)
-            if jc_text and st.button("Process JC Sales"):
+            
+            if not jc_text:
+                st.session_state["analyze_unified"] = False
+                
+            if st.button("Process JC Sales"):
+                st.session_state["analyze_unified"] = True
+                if "unified_final_df" in st.session_state:
+                    del st.session_state["unified_final_df"]
+                    
+            if st.session_state.get("analyze_unified", False) and jc_text:
                 jc_df, _ = JCSalesParser().parse(jc_text)
                 if not jc_df.empty:
                     # Rename JC cols to match Unified standard
@@ -434,17 +458,12 @@ with tab_invoice:
                     jc_df["Brand"] = "" 
                     jc_df["invoice_date"] = datetime.today() 
                     inv_dfs.append(jc_df)
-                should_process = True
 
         # Shared Processing Logic
-        if should_process:
+        if inv_dfs:
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             if pb_df.empty:
                 st.error("Pricebook is empty. Please upload one in Admin tab.")
-                st.stop()
-            
-            if not inv_dfs:
-                st.warning("No valid data parsed.")
                 st.stop()
 
             full_inv = pd.concat(inv_dfs, ignore_index=True)
@@ -476,62 +495,47 @@ with tab_invoice:
             # --- LOG ACTIVITY & UNIT COST COMPARISON ---
             changes_count = 0
             if not matched.empty:
-                 # 1. Prevent Division by Zero (just in case a pack is set to 0)
                  safe_old_pack = matched["cost_qty"].replace(0, 1)
                  safe_new_pack = matched["New_Pack"].replace(0, 1)
                  
-                 # 2. Calculate Unit Cost in Cents
                  matched["Old_Unit_Cents"] = matched["cost_cents"] / safe_old_pack
                  matched["New_Unit_Cents"] = matched["New_Cost_Cents"] / safe_new_pack
                  
-                 # 3. Flag if the UNIT cost changed by more than 1 cent
                  matched["Cost_Changed"] = abs(matched["New_Unit_Cents"] - matched["Old_Unit_Cents"]) > 1.0
                  changes_count = matched["Cost_Changed"].sum()
 
             log_activity(selected_store, vendor, len(full_inv), changes_count)
-            # --------------------
 
             if not matched.empty:
                 st.divider()
                 st.subheader("📊 Invoice Item Details & Retail Calculator")
                 
                 # --- A. CALCULATE METRICS ---
-                
-                # Determine margin divisor based on the selected store
                 margin_divisor = 0.7 if selected_store == "Rancho" else 0.6
                 margin_label = "30%" if selected_store == "Rancho" else "40%"
                 
                 def calc_row_metrics(row):
-                    # 1. Costs
                     case_cost = row["+Cost"] if pd.notna(row["+Cost"]) else 0.0
                     pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
                     unit_cost = case_cost / pack
                     
-                    # 2. Retail Calc (Target Margin -> Cost / Divisor -> Round to .x9)
                     target_retail = unit_cost / margin_divisor
-                    # Round up to next 10 cents, minus 1 cent (e.g. 3.12 -> 3.20 -> 3.19)
                     retail_val = np.ceil(target_retail * 10) / 10.0 - 0.01
                     if retail_val < 0: retail_val = 0
                     
-                    # 3. Format Retail String (Add * if Cost Changed)
                     retail_str = f"${retail_val:.2f}"
                     if row["Cost_Changed"]:
                         retail_str += " *"
                         
                     return unit_cost, retail_str
 
-                # Apply
                 metrics = matched.apply(calc_row_metrics, axis=1, result_type='expand')
                 matched["Unit Cost"] = metrics[0]
                 matched["Retail String"] = metrics[1]
-                
-                # "Now" = Current Pricebook Unit Price (cents column)
                 matched["Now"] = matched["cents"] / 100.0
                 
                 # --- B. DISPLAY MAIN TABLE ---
-                # Add our blank 'New' column for user input
                 matched["New"] = None
-                
                 display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail String", "New"]
                 
                 final_view = matched[display_cols].rename(columns={
@@ -540,7 +544,6 @@ with tab_invoice:
                     "Retail String": "Retail"
                 })
                 
-                # Make the table editable!
                 st.write("**Edit the 'New' column to set a custom retail price.**")
                 edited_df = st.data_editor(
                     final_view,
@@ -552,121 +555,89 @@ with tab_invoice:
                         "Unit": st.column_config.NumberColumn(format="$%.2f", disabled=True),
                         "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price", disabled=True),
                         "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.", disabled=True),
-                        "New": st.column_config.NumberColumn(
-                            "New ($)", 
-                            format="$%.2f", 
-                            min_value=0.0,
-                            help="Type your desired item price here"
-                        )
+                        "New": st.column_config.NumberColumn("New ($)", format="$%.2f", min_value=0.0)
                     },
                     use_container_width=True,
                     hide_index=True,
-                    height=500
+                    height=450
                 )
-
-                # Capture the edited prices back into our matched dataframe
-                matched["User_New_Price"] = edited_df["New"].values
 
                 # --- C. PRICE CHANGES TABLE ---
                 changes = matched[matched["Cost_Changed"]].copy()
-                
-                st.divider()
                 if not changes.empty:
                     st.error(f"{len(changes)} Unit Price Changes Detected")
-                    
                     display_changes = pd.DataFrame()
                     display_changes["UPC"] = changes["Upc"]
                     display_changes["Brand"] = changes["Brand"] 
                     display_changes["Description"] = changes["Description"]
-                    
                     display_changes["Old Unit Cost"] = changes["Old_Unit_Cents"] / 100.0
                     display_changes["New Unit Cost"] = changes["New_Unit_Cents"] / 100.0
                     display_changes["Old Case"] = changes["cost_cents"] / 100.0
                     display_changes["New Case"] = changes["New_Cost_Cents"] / 100.0
                     
-                    st.dataframe(
-                        display_changes,
-                        column_config={
-                            "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                            "New Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                            "Old Case": st.column_config.NumberColumn(format="$%.2f"),
-                            "New Case": st.column_config.NumberColumn(format="$%.2f")
-                        },
-                        hide_index=True
-                    )
-                else:
-                    st.success("No unit price changes detected.")
+                    st.dataframe(display_changes, column_config={"Old Unit Cost": st.column_config.NumberColumn(format="$%.2f"), "New Unit Cost": st.column_config.NumberColumn(format="$%.2f"), "Old Case": st.column_config.NumberColumn(format="$%.2f"), "New Case": st.column_config.NumberColumn(format="$%.2f")}, hide_index=True)
 
-                # --- D. POS UPDATE & LABELS FILE ---
+                # --- D. CONFIRM & GENERATE FILES ---
+                st.divider()
                 st.subheader("Generate Export Files")
+                st.caption("When you are finished entering prices, click the button below to build your POS update and Labels.")
                 
-                pos_cols = [
-                    "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
-                    "Name", "size", "ebt", "byweight", "Fee Multiplier", 
-                    "cost_qty", "cost_cents", "addstock"
-                ]
+                if st.button("Confirm Prices & Generate Files", type="primary"):
+                    st.session_state["unified_final_df"] = edited_df
+                    st.session_state["unified_matched_df"] = matched
                 
-                pos_out = pd.DataFrame()
-                
-                def clean_and_format_upc(u):
-                    s = str(u).replace('=', '').replace('"', '').strip()
-                    return f'="{s}"'
-
-                pos_out["Upc"] = matched["Upc"].apply(clean_and_format_upc)
-                pos_out["cost_cents"] = matched["New_Cost_Cents"]
-                pos_out["cost_qty"] = matched["New_Pack"]
-                
-                qty_col = next((c for c in matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
-                if qty_col:
-                    cases = pd.to_numeric(matched[qty_col], errors='coerce').fillna(0)
-                    pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
-                else:
-                    pos_out["addstock"] = 0
-                
-                # Fill Metadata, checking for User_New_Price overrides!
-                for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
-                    if col == "cents":
-                        base_cents = pd.to_numeric(matched["cents"], errors='coerce').fillna(0).astype(int)
-                        mask = matched["User_New_Price"].notna()
-                        # Override the cents if the user typed a new price
-                        base_cents[mask] = (matched.loc[mask, "User_New_Price"] * 100).astype(int)
-                        pos_out["cents"] = base_cents
-                    elif col in matched.columns:
-                        pos_out[col] = matched[col]
-                    else:
-                        pos_out[col] = ""
-
-                final_pos_out = pos_out[pos_cols].copy()
-                total_units = final_pos_out["addstock"].sum()
-                
-                st.caption(f"Ready to update {len(final_pos_out)} items (Total Stock Added: {total_units})")
-                
-                # Place downloads side-by-side
-                dl_col1, dl_col2 = st.columns(2)
-                
-                with dl_col1:
-                    st.download_button(
-                        "⬇️ Download POS Update CSV", 
-                        to_csv_bytes(final_pos_out), 
-                        f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                        "text/csv",
-                        use_container_width=True
-                    )
-                
-                with dl_col2:
-                    # Filter only the items where the user set a 'New' price
-                    edited_items_only = edited_df[edited_df["New"].notna() & (edited_df["New"] > 0)].copy()
+                # Check if the user has clicked "Confirm"
+                if "unified_final_df" in st.session_state and "unified_matched_df" in st.session_state:
+                    st.success("Files prepared successfully! Ready for download.")
                     
-                    if not edited_items_only.empty:
-                        st.download_button(
-                            "🏷️ Download Price Labels (Excel)",
-                            data=generate_barcode_excel(edited_items_only),
-                            file_name=f"Price_Labels_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+                    final_edited = st.session_state["unified_final_df"]
+                    final_matched = st.session_state["unified_matched_df"]
+                    
+                    # Capture the finalized edited prices
+                    final_matched["User_New_Price"] = final_edited["New"].values
+                
+                    pos_cols = ["Upc", "Department", "qty", "cents", "incltaxes", "inclfees", "Name", "size", "ebt", "byweight", "Fee Multiplier", "cost_qty", "cost_cents", "addstock"]
+                    pos_out = pd.DataFrame()
+                    
+                    def clean_and_format_upc(u):
+                        s = str(u).replace('=', '').replace('"', '').strip()
+                        return f'="{s}"'
+
+                    pos_out["Upc"] = final_matched["Upc"].apply(clean_and_format_upc)
+                    pos_out["cost_cents"] = final_matched["New_Cost_Cents"]
+                    pos_out["cost_qty"] = final_matched["New_Pack"]
+                    
+                    qty_col = next((c for c in final_matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
+                    if qty_col:
+                        cases = pd.to_numeric(final_matched[qty_col], errors='coerce').fillna(0)
+                        pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
                     else:
-                        st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", use_container_width=True)
+                        pos_out["addstock"] = 0
+                    
+                    for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
+                        if col == "cents":
+                            base_cents = pd.to_numeric(final_matched["cents"], errors='coerce').fillna(0).astype(int)
+                            mask = final_matched["User_New_Price"].notna()
+                            base_cents[mask] = (final_matched.loc[mask, "User_New_Price"] * 100).astype(int)
+                            pos_out["cents"] = base_cents
+                        elif col in final_matched.columns:
+                            pos_out[col] = final_matched[col]
+                        else:
+                            pos_out[col] = ""
+
+                    final_pos_out = pos_out[pos_cols].copy()
+                    
+                    dl_col1, dl_col2 = st.columns(2)
+                    
+                    with dl_col1:
+                        st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(final_pos_out), f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", "text/csv", use_container_width=True)
+                    
+                    with dl_col2:
+                        edited_items_only = final_edited[final_edited["New"].notna() & (final_edited["New"] > 0)].copy()
+                        if not edited_items_only.empty:
+                            st.download_button("🏷️ Download Price Labels (Excel)", data=generate_barcode_excel(edited_items_only), file_name=f"Price_Labels_{datetime.today().strftime('%Y-%m-%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                        else:
+                            st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", use_container_width=True)
             
             # Show Unmatched Items
             if not unmatched.empty:
