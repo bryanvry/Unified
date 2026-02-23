@@ -445,14 +445,18 @@ with tab_invoice:
                 
                 # --- A. CALCULATE METRICS ---
                 
+                # Determine margin divisor based on the selected store
+                margin_divisor = 0.7 if selected_store == "Rancho" else 0.6
+                margin_label = "30%" if selected_store == "Rancho" else "40%"
+                
                 def calc_row_metrics(row):
                     # 1. Costs
                     case_cost = row["+Cost"] if pd.notna(row["+Cost"]) else 0.0
                     pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
                     unit_cost = case_cost / pack
                     
-                    # 2. Retail Calc (Target 40% margin -> Cost / 0.6 -> Round to .x9)
-                    target_retail = unit_cost / 0.6
+                    # 2. Retail Calc (Target Margin -> Cost / Divisor -> Round to .x9)
+                    target_retail = unit_cost / margin_divisor
                     # Round up to next 10 cents, minus 1 cent (e.g. 3.12 -> 3.20 -> 3.19)
                     retail_val = np.ceil(target_retail * 10) / 10.0 - 0.01
                     if retail_val < 0: retail_val = 0
@@ -488,7 +492,7 @@ with tab_invoice:
                         "Case Cost": st.column_config.NumberColumn(format="$%.2f"),
                         "Unit": st.column_config.NumberColumn(format="$%.2f"),
                         "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price (cents)"),
-                        "Retail": st.column_config.TextColumn(help="Calculated Retail (40% Margin). * indicates cost change.")
+                        "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.")
                     },
                     use_container_width=True,
                     hide_index=True
