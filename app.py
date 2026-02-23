@@ -120,7 +120,7 @@ def generate_barcode_excel(df):
                 'y_scale': 0.4,
                 'positioning': 1
             })
-            worksheet.set_row(row_num, 60) # Make row tall enough for image
+            worksheet.set_row(row_num, 35) # Make row tall enough for image
         except Exception:
             worksheet.write(row_num, 5, "Error generating")
             
