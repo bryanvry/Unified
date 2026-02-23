@@ -9,3 +9,5 @@ sqlalchemy
 psycopg2-binary
 pg8000           
 xlrd
+python-barcode 
+Pillow 
