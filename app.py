@@ -79,7 +79,56 @@ def to_xlsx_bytes(dfs_dict):
             df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
     output.seek(0)
     return output.getvalue()
-
+def generate_barcode_excel(df):
+    """Generates an Excel file with embedded barcode images."""
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet('New Prices')
+    
+    # Write headers
+    headers = ["UPC", "Brand", "Description", "Now", "New", "Barcode"]
+    for col_num, header in enumerate(headers):
+        worksheet.write(0, col_num, header)
+        
+    EAN = barcode.get_barcode_class('ean13')
+    
+    for row_num, (index, row) in enumerate(df.iterrows(), 1):
+        worksheet.write(row_num, 0, str(row['UPC']))
+        worksheet.write(row_num, 1, str(row['Brand']))
+        worksheet.write(row_num, 2, str(row['Description']))
+        worksheet.write(row_num, 3, f"${row['Now']:.2f}" if pd.notna(row['Now']) else "")
+        worksheet.write(row_num, 4, f"${row['New']:.2f}")
+        
+        # Barcode logic (Pad to 12, add leading 0 for EAN-13)
+        clean_upc = "".join(filter(str.isdigit, str(row['UPC']))).zfill(12)
+        ean_str = "0" + clean_upc
+        
+        try:
+            ean_img = EAN(ean_str, writer=ImageWriter())
+            img_io = BytesIO()
+            # Generate a clean, text-less barcode image
+            ean_img.write(img_io, options={"write_text": False, "module_height": 8.0, "quiet_zone": 2.0})
+            img_io.seek(0)
+            
+            # Insert image into cell
+            worksheet.insert_image(row_num, 5, 'barcode.png', {
+                'image_data': img_io, 
+                'x_scale': 0.4, 
+                'y_scale': 0.4,
+                'positioning': 1
+            })
+            worksheet.set_row(row_num, 60) # Make row tall enough for image
+        except Exception:
+            worksheet.write(row_num, 5, "Error generating")
+            
+    # Format column widths
+    worksheet.set_column('A:A', 15)
+    worksheet.set_column('C:C', 40)
+    worksheet.set_column('F:F', 30)
+    
+    workbook.close()
+    output.seek(0)
+    return output.getvalue()
 # --- DATABASE HANDLERS ---
 def get_db_connection():
     return st.connection("supabase", type="sql")    
@@ -477,8 +526,10 @@ with tab_invoice:
                 matched["Now"] = matched["cents"] / 100.0
                 
                 # --- B. DISPLAY MAIN TABLE ---
-                # Columns: UPC, Brand, Description, Case Cost, Unit, Now, Retail
-                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail String"]
+                # Add our blank 'New' column for user input
+                matched["New"] = None
+                
+                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail", "New"]
                 
                 final_view = matched[display_cols].rename(columns={
                     "+Cost": "Case Cost",
@@ -486,17 +537,32 @@ with tab_invoice:
                     "Retail String": "Retail"
                 })
                 
-                st.dataframe(
+                # Make the table editable!
+                st.write("**Edit the 'New' column to set a custom retail price.**")
+                edited_df = st.data_editor(
                     final_view,
                     column_config={
-                        "Case Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Unit": st.column_config.NumberColumn(format="$%.2f"),
-                        "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price (cents)"),
-                        "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.")
+                        "UPC": st.column_config.TextColumn(disabled=True),
+                        "Brand": st.column_config.TextColumn(disabled=True),
+                        "Description": st.column_config.TextColumn(disabled=True),
+                        "Case Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                        "Unit": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                        "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price", disabled=True),
+                        "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.", disabled=True),
+                        "New": st.column_config.NumberColumn(
+                            "New ($)", 
+                            format="$%.2f", 
+                            min_value=0.0,
+                            help="Type your desired item price here"
+                        )
                     },
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
+                    height=500
                 )
+
+                # Capture the edited prices back into our matched dataframe
+                matched["User_New_Price"] = edited_df["New"].values
 
                 # --- C. PRICE CHANGES TABLE ---
                 changes = matched[matched["Cost_Changed"]].copy()
@@ -510,11 +576,8 @@ with tab_invoice:
                     display_changes["Brand"] = changes["Brand"] 
                     display_changes["Description"] = changes["Description"]
                     
-                    # Show Unit Costs
                     display_changes["Old Unit Cost"] = changes["Old_Unit_Cents"] / 100.0
                     display_changes["New Unit Cost"] = changes["New_Unit_Cents"] / 100.0
-                    
-                    # Show Case Costs for Context
                     display_changes["Old Case"] = changes["cost_cents"] / 100.0
                     display_changes["New Case"] = changes["New_Cost_Cents"] / 100.0
                     
@@ -531,8 +594,8 @@ with tab_invoice:
                 else:
                     st.success("No unit price changes detected.")
 
-                # --- D. POS UPDATE FILE ---
-                st.subheader("POS Update File")
+                # --- D. POS UPDATE & LABELS FILE ---
+                st.subheader("Generate Export Files")
                 
                 pos_cols = [
                     "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
@@ -542,45 +605,65 @@ with tab_invoice:
                 
                 pos_out = pd.DataFrame()
                 
-                # 1. UPC Format (Clean first, then apply ="01234")
                 def clean_and_format_upc(u):
                     s = str(u).replace('=', '').replace('"', '').strip()
                     return f'="{s}"'
 
                 pos_out["Upc"] = matched["Upc"].apply(clean_and_format_upc)
-                
-                # 2. Key Update Fields
                 pos_out["cost_cents"] = matched["New_Cost_Cents"]
                 pos_out["cost_qty"] = matched["New_Pack"]
                 
-                # 3. Calculate AddStock (Cases * Pack)
                 qty_col = next((c for c in matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
-                
                 if qty_col:
                     cases = pd.to_numeric(matched[qty_col], errors='coerce').fillna(0)
                     pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
                 else:
                     pos_out["addstock"] = 0
                 
-                # 4. Fill Metadata from Pricebook
+                # Fill Metadata, checking for User_New_Price overrides!
                 for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
-                    if col in matched.columns:
+                    if col == "cents":
+                        base_cents = pd.to_numeric(matched["cents"], errors='coerce').fillna(0).astype(int)
+                        mask = matched["User_New_Price"].notna()
+                        # Override the cents if the user typed a new price
+                        base_cents[mask] = (matched.loc[mask, "User_New_Price"] * 100).astype(int)
+                        pos_out["cents"] = base_cents
+                    elif col in matched.columns:
                         pos_out[col] = matched[col]
                     else:
                         pos_out[col] = ""
 
-                # 5. Filter & Download
                 final_pos_out = pos_out[pos_cols].copy()
                 total_units = final_pos_out["addstock"].sum()
                 
                 st.caption(f"Ready to update {len(final_pos_out)} items (Total Stock Added: {total_units})")
                 
-                st.download_button(
-                    "⬇️ Download POS Update CSV", 
-                    to_csv_bytes(final_pos_out), 
-                    f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                    "text/csv"
-                )
+                # Place downloads side-by-side
+                dl_col1, dl_col2 = st.columns(2)
+                
+                with dl_col1:
+                    st.download_button(
+                        "⬇️ Download POS Update CSV", 
+                        to_csv_bytes(final_pos_out), 
+                        f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                        "text/csv",
+                        use_container_width=True
+                    )
+                
+                with dl_col2:
+                    # Filter only the items where the user set a 'New' price
+                    edited_items_only = edited_df[edited_df["New"].notna() & (edited_df["New"] > 0)].copy()
+                    
+                    if not edited_items_only.empty:
+                        st.download_button(
+                            "🏷️ Download Price Labels (Excel)",
+                            data=generate_barcode_excel(edited_items_only),
+                            file_name=f"Price_Labels_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    else:
+                        st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", use_container_width=True)
             
             # Show Unmatched Items
             if not unmatched.empty:
