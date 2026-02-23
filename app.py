@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import xlsxwriter
+import barcode
+from barcode.writer import ImageWriter
 import re
 import os
 from io import BytesIO
