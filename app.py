@@ -532,7 +532,7 @@ with tab_invoice:
                 # Add our blank 'New' column for user input
                 matched["New"] = None
                 
-                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail", "New"]
+                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail String", "New"]
                 
                 final_view = matched[display_cols].rename(columns={
                     "+Cost": "Case Cost",
