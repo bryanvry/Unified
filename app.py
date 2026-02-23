@@ -421,10 +421,19 @@ with tab_invoice:
             matched = merged[merged["Upc"].notna()].copy()
             unmatched = merged[merged["Upc"].isna()].copy()
             
-            # --- LOG ACTIVITY ---
+            # --- LOG ACTIVITY & UNIT COST COMPARISON ---
             changes_count = 0
             if not matched.empty:
-                 matched["Cost_Changed"] = abs(matched["New_Cost_Cents"] - matched["cost_cents"]) > 1
+                 # 1. Prevent Division by Zero (just in case a pack is set to 0)
+                 safe_old_pack = matched["cost_qty"].replace(0, 1)
+                 safe_new_pack = matched["New_Pack"].replace(0, 1)
+                 
+                 # 2. Calculate Unit Cost in Cents
+                 matched["Old_Unit_Cents"] = matched["cost_cents"] / safe_old_pack
+                 matched["New_Unit_Cents"] = matched["New_Cost_Cents"] / safe_new_pack
+                 
+                 # 3. Flag if the UNIT cost changed by more than 1 cent
+                 matched["Cost_Changed"] = abs(matched["New_Unit_Cents"] - matched["Old_Unit_Cents"]) > 1.0
                  changes_count = matched["Cost_Changed"].sum()
 
             log_activity(selected_store, vendor, len(full_inv), changes_count)
@@ -490,25 +499,33 @@ with tab_invoice:
                 
                 st.divider()
                 if not changes.empty:
-                    st.error(f"{len(changes)} Price Changes Detected")
+                    st.error(f"{len(changes)} Unit Price Changes Detected")
                     
                     display_changes = pd.DataFrame()
                     display_changes["UPC"] = changes["Upc"]
                     display_changes["Brand"] = changes["Brand"] 
                     display_changes["Description"] = changes["Description"]
-                    display_changes["Old Cost"] = changes["cost_cents"] / 100.0
-                    display_changes["New Cost"] = changes["New_Cost_Cents"] / 100.0
+                    
+                    # Show Unit Costs
+                    display_changes["Old Unit Cost"] = changes["Old_Unit_Cents"] / 100.0
+                    display_changes["New Unit Cost"] = changes["New_Unit_Cents"] / 100.0
+                    
+                    # Show Case Costs for Context
+                    display_changes["Old Case"] = changes["cost_cents"] / 100.0
+                    display_changes["New Case"] = changes["New_Cost_Cents"] / 100.0
                     
                     st.dataframe(
                         display_changes,
                         column_config={
-                            "Old Cost": st.column_config.NumberColumn(format="$%.2f"),
-                            "New Cost": st.column_config.NumberColumn(format="$%.2f")
+                            "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                            "New Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                            "Old Case": st.column_config.NumberColumn(format="$%.2f"),
+                            "New Case": st.column_config.NumberColumn(format="$%.2f")
                         },
                         hide_index=True
                     )
                 else:
-                    st.success("No price changes detected.")
+                    st.success("No unit price changes detected.")
 
                 # --- D. POS UPDATE FILE ---
                 st.subheader("POS Update File")
