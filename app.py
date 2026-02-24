@@ -201,7 +201,7 @@ else:
 
 
 # --- MAIN APP TABS ---
-tab_order, tab_invoice, tab_admin = st.tabs(["📋 Order Management", "🧾 Invoice Processing", "⚙️ Admin / Uploads"])
+tab_order, tab_invoice, tab_search, tab_admin = st.tabs(["Order Management", "Invoice Processing", "🔍 Item Search", "Admin / Uploads"])
 
 # ==============================================================================
 # TAB 1: ORDER MANAGEMENT
@@ -945,7 +945,126 @@ with tab_invoice:
                 except Exception as e:
                     st.error(f"Error processing master/receipt: {e}")
 # ==============================================================================
-# TAB 3: ADMIN / UPLOADS
+# TAB 3: ITEM SEARCH
+# ==============================================================================
+with tab_search:
+    st.header(f"Pricebook & Sales Search: {selected_store}")
+    
+    conn = get_db_connection()
+    
+    # 1. Figure out exactly how many weeks of sales history exist in the database
+    try:
+        max_wks_df = conn.query(f'SELECT COUNT(DISTINCT week_date) AS count FROM "{SALES_TABLE}"', ttl=0)
+        max_available_weeks = int(max_wks_df.iloc[0]["count"])
+    except Exception:
+        max_available_weeks = 15 # Fallback
+        
+    if max_available_weeks < 1: 
+        max_available_weeks = 1
+    
+    # 2. Build the Search UI
+    col_search, col_weeks = st.columns([3, 1])
+    with col_search:
+        search_query = st.text_input("Search by UPC or Item Name", placeholder="e.g. 'Coors' or '071990095116'")
+    with col_weeks:
+        num_weeks = st.number_input(
+            "Sales Weeks to Show", 
+            min_value=1, 
+            max_value=max_available_weeks, 
+            value=min(15, max_available_weeks),
+            help=f"Maximum available in database: {max_available_weeks}"
+        )
+        
+    if st.button("Search Pricebook", type="primary") and search_query:
+        # Use ILIKE for case-insensitive partial matching (% surrounds the query)
+        safe_search = f"%{search_query}%"
+        
+        pb_query = f"""
+            SELECT "Upc", "Name", "size", "cost_cents", "cost_qty", "cents"
+            FROM "{PRICEBOOK_TABLE}"
+            WHERE "Upc" ILIKE :sq OR "Name" ILIKE :sq
+        """
+        matched_pb = conn.query(pb_query, params={"sq": safe_search}, ttl=0)
+        
+        if matched_pb.empty:
+            st.warning("No items found matching your search.")
+        else:
+            # --- Format Pricebook Data ---
+            matched_pb["UPC"] = matched_pb["Upc"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
+            matched_pb["Item Name"] = matched_pb["Name"]
+            matched_pb["Size"] = matched_pb["size"]
+            
+            # Calculate Cost (Cost Cents / Cost Qty -> Dollars)
+            safe_cost_qty = pd.to_numeric(matched_pb["cost_qty"], errors="coerce").fillna(1).replace(0, 1)
+            cost_cents = pd.to_numeric(matched_pb["cost_cents"], errors="coerce").fillna(0)
+            matched_pb["Cost"] = (cost_cents / safe_cost_qty) / 100.0
+            
+            # Calculate Price (Cents -> Dollars)
+            price_cents = pd.to_numeric(matched_pb["cents"], errors="coerce").fillna(0)
+            matched_pb["Price"] = price_cents / 100.0
+            
+            base_display = matched_pb[["UPC", "Item Name", "Size", "Cost", "Price"]].copy()
+            base_display["_norm_upc"] = base_display["UPC"].apply(_norm_upc_12)
+            
+            # --- Fetch Sales History ---
+            # Smart querying: Only pull sales data back to the exact number of weeks requested
+            dates_df = conn.query(f'SELECT DISTINCT week_date FROM "{SALES_TABLE}" ORDER BY week_date DESC LIMIT :limit', params={"limit": num_weeks}, ttl=0)
+            
+            sales_cols = []
+            if not dates_df.empty:
+                cutoff_date = dates_df["week_date"].min()
+                
+                sales_query = f"""
+                    SELECT "UPC", "week_date", "qty_sold" 
+                    FROM "{SALES_TABLE}" 
+                    WHERE "week_date" >= :start_date
+                """
+                sales_hist = conn.query(sales_query, params={"start_date": cutoff_date}, ttl=0)
+                
+                if not sales_hist.empty:
+                    sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
+                    
+                    # Convert dates to strings to prevent JSON rendering crashes
+                    sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
+                    
+                    sales_pivot = sales_hist.pivot_table(
+                        index="_upc_norm", 
+                        columns="week_date", 
+                        values="qty_sold", 
+                        aggfunc="sum"
+                    ).fillna(0)
+                    
+                    # Sort dates from oldest to newest
+                    sales_cols = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
+                    sales_pivot = sales_pivot[sales_cols]
+                    
+                    # Merge sales back into our main display
+                    base_display = base_display.merge(sales_pivot, left_on="_norm_upc", right_index=True, how="left")
+            
+            # --- Cleanup and Display ---
+            base_display = base_display.drop(columns=["_norm_upc"])
+            
+            # Fill NaNs with 0 for items that have no sales history in the timeframe
+            for c in sales_cols:
+                if c in base_display.columns:
+                    base_display[c] = base_display[c].fillna(0).astype(int)
+                    
+            st.success(f"Found {len(base_display)} items matching '{search_query}'.")
+            
+            st.dataframe(
+                base_display,
+                column_config={
+                    "UPC": st.column_config.TextColumn("UPC"),
+                    "Item Name": st.column_config.TextColumn("Item Name"),
+                    "Size": st.column_config.TextColumn("Size"),
+                    "Cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
+                    "Price": st.column_config.NumberColumn("Retail Price", format="$%.2f")
+                },
+                hide_index=True,
+                use_container_width=True
+            )                    
+# ==============================================================================
+# TAB 4: ADMIN / UPLOADS
 # ==============================================================================
 with tab_admin:
     st.header("Database Administration")
