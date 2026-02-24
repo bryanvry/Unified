@@ -274,8 +274,8 @@ with tab_order:
                     # Fetch Pricebook & Sales
                     pb_df = load_pricebook(PRICEBOOK_TABLE)
                     
-                    # Look back 12 weeks to ensure we get at least 6 weeks of valid data
-                    start_date = datetime.today() - timedelta(weeks=12) 
+                    # Look back 24 weeks to ensure we get at least 15 weeks of valid data
+                    start_date = datetime.today() - timedelta(weeks=24) 
                     
                     # Note: {SALES_TABLE} is safe here because users can't edit that variable
                     sales_query = f"""
@@ -308,8 +308,8 @@ with tab_order:
                         # Sort Oldest to Newest
                         sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
                         
-                        # CHANGED: Keep last 6 weeks instead of 4
-                        sales_cols = sorted_dates[-6:]
+                        # Keep last 15 weeks
+                        sales_cols = sorted_dates[-15:]
                         sales_pivot = sales_pivot[sales_cols]
                         
                         merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
@@ -342,11 +342,16 @@ with tab_order:
         st.divider()
         st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
         
+        # --- Lock all columns EXCEPT 'Order' ---
+        all_columns = st.session_state['order_df'].columns.tolist()
+        locked_columns = [col for col in all_columns if col != "Order"]
+        
         # Editable Dataframe
         edited_df = st.data_editor(
             st.session_state['order_df'],
             use_container_width=True,
             height=600,
+            disabled=locked_columns, # Locks everything except 'Order'
             column_config={
                 "Order": st.column_config.NumberColumn(
                     "Order Qty",
@@ -354,11 +359,8 @@ with tab_order:
                     min_value=0,
                     step=1,
                     required=True
-                ),
-                "Stock": st.column_config.NumberColumn(
-                    "Stock",
-                    disabled=True # Prevent editing stock
                 )
+                # Removed the emoji column configs for Stock and PACK
             },
             hide_index=True
         )
