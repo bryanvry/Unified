@@ -298,6 +298,11 @@ with tab_order:
                     sales_cols = []
                     if not sales_hist.empty:
                         sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
+                        
+                        # --- NEW: Convert date objects to strings to prevent JSON crash ---
+                        sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
+                        # ------------------------------------------------------------------
+                        
                         sales_pivot = sales_hist.pivot_table(
                             index="_upc_norm", 
                             columns="week_date", 
