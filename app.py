@@ -952,10 +952,16 @@ with tab_search:
     
     conn = get_db_connection()
     
-    # 1. Figure out exactly how many weeks of sales history exist in the database
-    try:
-        max_wks_df = conn.query(f'SELECT COUNT(DISTINCT week_date) AS count FROM "{SALES_TABLE}"', ttl=0)
-        max_available_weeks = int(max_wks_df.iloc[0]["count"])
+    # --- Fetch Sales History ---
+            # Smart querying: Only pull sales data back to the exact number of weeks requested
+            dates_query = f"""
+                SELECT DISTINCT week_date 
+                FROM "{SALES_TABLE}" 
+                WHERE week_date IS NOT NULL 
+                ORDER BY week_date DESC 
+                LIMIT :limit
+            """
+            dates_df = conn.query(dates_query, params={"limit": num_weeks}, ttl=0)
     except Exception:
         max_available_weeks = 15 # Fallback
         
