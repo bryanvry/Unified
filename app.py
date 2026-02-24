@@ -1012,14 +1012,22 @@ with tab_search:
             
             sales_cols = []
             if not dates_df.empty:
-                cutoff_date = dates_df["week_date"].min()
+                # FIX: Force datetime conversion and drop any blanks/floats so .min() doesn't crash
+                dates_df["week_date"] = pd.to_datetime(dates_df["week_date"], errors="coerce")
+                clean_dates = dates_df.dropna(subset=["week_date"])
                 
-                sales_query = f"""
-                    SELECT "UPC", "week_date", "qty_sold" 
-                    FROM "{SALES_TABLE}" 
-                    WHERE "week_date" >= :start_date
-                """
-                sales_hist = conn.query(sales_query, params={"start_date": cutoff_date}, ttl=0)
+                if not clean_dates.empty:
+                    cutoff_date = clean_dates["week_date"].min()
+                    
+                    # Convert to string for the SQL query parameter to be extra safe
+                    cutoff_str = cutoff_date.strftime('%Y-%m-%d')
+                    
+                    sales_query = f"""
+                        SELECT "UPC", "week_date", "qty_sold" 
+                        FROM "{SALES_TABLE}" 
+                        WHERE "week_date" >= :start_date
+                    """
+                    sales_hist = conn.query(sales_query, params={"start_date": cutoff_str}, ttl=0)
                 
                 if not sales_hist.empty:
                     sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
