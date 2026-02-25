@@ -1048,7 +1048,7 @@ with tab_search:
                 
             display_df = filtered_df[cols_to_show]
             
-            st.success(f"⚡ Found {len(display_df)} items instantly.")
+            st.success(f"Found {len(display_df)} items.")
             
             st.dataframe(
                 display_df,
