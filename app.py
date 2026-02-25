@@ -6,6 +6,7 @@ import os
 from io import BytesIO
 import xlsxwriter
 import barcode
+from st_keyup import st_keyup
 from barcode.writer import ImageWriter
 from datetime import datetime, timedelta
 from sqlalchemy import text
@@ -945,129 +946,112 @@ with tab_invoice:
                 except Exception as e:
                     st.error(f"Error processing master/receipt: {e}")
 # ==============================================================================
-# TAB 3: ITEM SEARCH
+# TAB 3: ITEM SEARCH (INSTANT LIVE SEARCH)
 # ==============================================================================
-with tab_search:
-    st.header(f"Pricebook & Sales Search: {selected_store}")
-    
+
+# --- INSTANT CACHE ENGINE ---
+# This downloads the DB to RAM once every 5 minutes to eliminate network delay
+@st.cache_data(ttl=300, show_spinner=False)
+def get_full_search_data(store):
     conn = get_db_connection()
+    pb_table = "PricebookTwain" if store == "Twain" else "PricebookRancho"
+    sales_table = "salestwain1" if store == "Twain" else "salesrancho1"
+
+    # 1. Fetch entire Pricebook
+    pb_df = conn.query(f'SELECT "Upc", "Name", "size", "cost_cents", "cost_qty", "cents" FROM "{pb_table}"', ttl=300)
     
-    # 1. Figure out exactly how many weeks of sales history exist in the database
-    try:
-        max_wks_df = conn.query(f'SELECT COUNT(DISTINCT week_date) AS count FROM "{SALES_TABLE}" WHERE week_date IS NOT NULL', ttl=0)
-        max_available_weeks = int(max_wks_df.iloc[0]["count"])
-    except Exception:
-        max_available_weeks = 15 # Fallback
+    if pb_df.empty:
+        return pd.DataFrame(), []
+
+    pb_df["UPC"] = pb_df["Upc"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
+    pb_df["Item Name"] = pb_df["Name"]
+    pb_df["Size"] = pb_df["size"]
+    
+    safe_cost_qty = pd.to_numeric(pb_df["cost_qty"], errors="coerce").fillna(1).replace(0, 1)
+    cost_cents = pd.to_numeric(pb_df["cost_cents"], errors="coerce").fillna(0)
+    pb_df["Cost"] = (cost_cents / safe_cost_qty) / 100.0
+    pb_df["Price"] = pd.to_numeric(pb_df["cents"], errors="coerce").fillna(0) / 100.0
+    
+    base_display = pb_df[["UPC", "Item Name", "Size", "Cost", "Price"]].copy()
+    base_display["_norm_upc"] = base_display["UPC"].apply(_norm_upc_12)
+    
+    # 2. Fetch Sales History (Last 15 Weeks)
+    dates_query = f'SELECT DISTINCT week_date FROM "{sales_table}" WHERE week_date IS NOT NULL ORDER BY week_date DESC LIMIT 15'
+    dates_df = conn.query(dates_query, ttl=300)
+    
+    sales_cols = []
+    if not dates_df.empty:
+        dates_df["week_date"] = pd.to_datetime(dates_df["week_date"], errors="coerce")
+        clean_dates = dates_df.dropna(subset=["week_date"])
         
-    if max_available_weeks < 1: 
-        max_available_weeks = 1
+        if not clean_dates.empty:
+            cutoff_date = clean_dates["week_date"].min().strftime('%Y-%m-%d')
+            sales_query = f'SELECT "UPC", "week_date", "qty_sold" FROM "{sales_table}" WHERE "week_date" >= \'{cutoff_date}\''
+            sales_hist = conn.query(sales_query, ttl=300)
+            
+            if not sales_hist.empty:
+                sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
+                sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
+                
+                sales_pivot = sales_hist.pivot_table(index="_upc_norm", columns="week_date", values="qty_sold", aggfunc="sum").fillna(0)
+                sales_cols = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
+                sales_pivot = sales_pivot[sales_cols]
+                
+                base_display = base_display.merge(sales_pivot, left_on="_norm_upc", right_index=True, how="left")
     
-    # 2. Build the Search UI
+    base_display = base_display.drop(columns=["_norm_upc"])
+    for c in sales_cols:
+        if c in base_display.columns:
+            base_display[c] = base_display[c].fillna(0).astype(int)
+            
+    return base_display, sales_cols
+
+# --- TAB UI ---
+with tab_search:
+    st.header(f"Live Pricebook Search: {selected_store}")
+    
+    # Silently load the DB into RAM (takes ~1-2 secs on first load, instant after)
+    full_db, available_sales_cols = get_full_search_data(selected_store)
+    max_available_weeks = len(available_sales_cols) if available_sales_cols else 1
+
     col_search, col_weeks = st.columns([3, 1])
+    
     with col_search:
-        search_query = st.text_input("Search by UPC or Item Name", placeholder="e.g. 'Coors' or '071990095116'")
+        # Use st_keyup to detect every single keystroke instantly!
+        search_query = st_keyup("Search by UPC or Item Name", placeholder="Start typing... e.g. 'Modelo'", key="live_search")
+        
     with col_weeks:
         num_weeks = st.number_input(
             "Sales Weeks to Show", 
             min_value=1, 
             max_value=max_available_weeks, 
-            value=min(15, max_available_weeks),
-            help=f"Maximum available in database: {max_available_weeks}"
+            value=min(15, max_available_weeks)
         )
+
+    # Only show the table if they typed something
+    if search_query:
+        safe_query = str(search_query).lower()
         
-    if st.button("Search Pricebook", type="primary") and search_query:
-        # Use ILIKE for case-insensitive partial matching (% surrounds the query)
-        safe_search = f"%{search_query}%"
+        # INSTANT PANDAS FILTER (No Database hit required!)
+        filtered_df = full_db[
+            full_db["UPC"].str.lower().str.contains(safe_query, na=False) |
+            full_db["Item Name"].str.lower().str.contains(safe_query, na=False)
+        ]
         
-        pb_query = f"""
-            SELECT "Upc", "Name", "size", "cost_cents", "cost_qty", "cents"
-            FROM "{PRICEBOOK_TABLE}"
-            WHERE "Upc" ILIKE :sq OR "Name" ILIKE :sq
-        """
-        matched_pb = conn.query(pb_query, params={"sq": safe_search}, ttl=0)
-        
-        if matched_pb.empty:
-            st.warning("No items found matching your search.")
+        if filtered_df.empty:
+            st.warning("No items found.")
         else:
-            # --- Format Pricebook Data ---
-            matched_pb["UPC"] = matched_pb["Upc"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
-            matched_pb["Item Name"] = matched_pb["Name"]
-            matched_pb["Size"] = matched_pb["size"]
-            
-            # Calculate Cost (Cost Cents / Cost Qty -> Dollars)
-            safe_cost_qty = pd.to_numeric(matched_pb["cost_qty"], errors="coerce").fillna(1).replace(0, 1)
-            cost_cents = pd.to_numeric(matched_pb["cost_cents"], errors="coerce").fillna(0)
-            matched_pb["Cost"] = (cost_cents / safe_cost_qty) / 100.0
-            
-            # Calculate Price (Cents -> Dollars)
-            price_cents = pd.to_numeric(matched_pb["cents"], errors="coerce").fillna(0)
-            matched_pb["Price"] = price_cents / 100.0
-            
-            base_display = matched_pb[["UPC", "Item Name", "Size", "Cost", "Price"]].copy()
-            base_display["_norm_upc"] = base_display["UPC"].apply(_norm_upc_12)
-            
-            # --- Fetch Sales History ---
-            # Smart querying: Only pull sales data back to the exact number of weeks requested
-            dates_query = f"""
-                SELECT DISTINCT week_date 
-                FROM "{SALES_TABLE}" 
-                WHERE week_date IS NOT NULL 
-                ORDER BY week_date DESC 
-                LIMIT :limit
-            """
-            dates_df = conn.query(dates_query, params={"limit": num_weeks}, ttl=0)
-            
-            sales_cols = []
-            if not dates_df.empty:
-                # FIX: Force datetime conversion and drop any blanks/floats so .min() doesn't crash
-                dates_df["week_date"] = pd.to_datetime(dates_df["week_date"], errors="coerce")
-                clean_dates = dates_df.dropna(subset=["week_date"])
+            # Build final display columns based on requested weeks
+            cols_to_show = ["UPC", "Item Name", "Size", "Cost", "Price"]
+            if available_sales_cols:
+                cols_to_show.extend(available_sales_cols[-num_weeks:])
                 
-                if not clean_dates.empty:
-                    cutoff_date = clean_dates["week_date"].min()
-                    
-                    # Convert to string for the SQL query parameter to be extra safe
-                    cutoff_str = cutoff_date.strftime('%Y-%m-%d')
-                    
-                    sales_query = f"""
-                        SELECT "UPC", "week_date", "qty_sold" 
-                        FROM "{SALES_TABLE}" 
-                        WHERE "week_date" >= :start_date
-                    """
-                    sales_hist = conn.query(sales_query, params={"start_date": cutoff_str}, ttl=0)
-                
-                if not sales_hist.empty:
-                    sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
-                    
-                    # Convert dates to strings to prevent JSON rendering crashes
-                    sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
-                    
-                    sales_pivot = sales_hist.pivot_table(
-                        index="_upc_norm", 
-                        columns="week_date", 
-                        values="qty_sold", 
-                        aggfunc="sum"
-                    ).fillna(0)
-                    
-                    # Sort dates from oldest to newest
-                    sales_cols = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
-                    sales_pivot = sales_pivot[sales_cols]
-                    
-                    # Merge sales back into our main display
-                    base_display = base_display.merge(sales_pivot, left_on="_norm_upc", right_index=True, how="left")
+            display_df = filtered_df[cols_to_show]
             
-            # --- Cleanup and Display ---
-            base_display = base_display.drop(columns=["_norm_upc"])
-            
-            # Fill NaNs with 0 for items that have no sales history in the timeframe
-            for c in sales_cols:
-                if c in base_display.columns:
-                    base_display[c] = base_display[c].fillna(0).astype(int)
-                    
-            st.success(f"Found {len(base_display)} items matching '{search_query}'.")
+            st.success(f"⚡ Found {len(display_df)} items instantly.")
             
             st.dataframe(
-                base_display,
+                display_df,
                 column_config={
                     "UPC": st.column_config.TextColumn("UPC"),
                     "Item Name": st.column_config.TextColumn("Item Name"),
