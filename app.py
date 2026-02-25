@@ -1018,7 +1018,7 @@ with tab_search:
     
     with col_search:
         # Use st_keyup to detect every single keystroke instantly!
-        search_query = st_keyup("Search by UPC or Item Name", placeholder="Start typing... e.g. 'Modelo'", key="live_search")
+        search_query = st_keyup("Search by UPC or Item Name", placeholder="Start typing...", key="live_search")
         
     with col_weeks:
         num_weeks = st.number_input(
