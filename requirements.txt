@@ -12,3 +12,4 @@ xlrd
 python-barcode 
 Pillow 
 streamlit-keyup
+psutil
