@@ -675,6 +675,8 @@ with tab_invoice:
             
         # 4. Check the session state switch instead of the button!
         if st.session_state.get("analyze_sg", False) and inv_files:
+            map_df = load_vendor_map()
+            pb_df = load_pricebook(PRICEBOOK_TABLE)
             
             if map_df.empty: 
                 st.error("Vendor Map is empty. Go to Admin.")
@@ -749,8 +751,6 @@ with tab_invoice:
                     company_db_name = "Southern"
                 elif vendor == "Nevada Beverage":
                     company_db_name = "Nevada"
-                # (Breakthru already matches perfectly, so we leave it as is)
-                # ------------------------------------------------------
 
                 # --- FIX 2: Reorder columns and add "Size" ---
                 edit_df = pd.DataFrame({
@@ -762,7 +762,6 @@ with tab_invoice:
                     "PACK": 1,
                     "Company": company_db_name
                 })
-                # ---------------------------------------------
                 
                 edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
                 
@@ -773,7 +772,6 @@ with tab_invoice:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
-                        # We pass the perfectly ordered and formatted dataframe directly to the DB!
                         to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
                         
                         st.success("Items successfully mapped! Re-analyzing invoice...")
@@ -786,7 +784,6 @@ with tab_invoice:
                 valid["_sys_upc_norm"] = valid["Full Barcode"].astype(str).apply(_norm_upc_12)
                 final_check = valid.merge(pb_df, left_on="_sys_upc_norm", right_on="_norm_upc", how="left")
                 
-                # Calculate Costs
                 final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["Cost"], errors='coerce') * 100).fillna(0).astype(int)
                 final_check["PB_Cost_Cents"] = final_check["cost_cents"].fillna(0).astype(int)
                 final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
