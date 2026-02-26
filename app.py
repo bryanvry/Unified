@@ -919,7 +919,13 @@ with tab_invoice:
                     final_pos_out = pos_out[pos_cols].copy()
                     
                     total_cases = pos_out["addstock"].sum()
-                    st.caption(f"Ready to update stock for {len(final_pos_out)} items (Total Units: {total_cases})")
+                    
+                    # Count how many items the user set a valid >$0 custom price for
+                    num_price_updates = 0
+                    if "User_New_Price" in final_check.columns:
+                        num_price_updates = (final_check["User_New_Price"] > 0).sum()
+                        
+                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Units: {total_cases})")
                     
                     st.download_button(
                         "⬇️ Download POS Update CSV", 
