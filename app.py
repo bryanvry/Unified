@@ -4,6 +4,7 @@ import numpy as np
 import re
 import os
 from io import BytesIO
+import psutil
 import xlsxwriter
 import barcode
 from st_keyup import st_keyup
@@ -1067,8 +1068,18 @@ with tab_search:
 # ==============================================================================
 with tab_admin:
     st.header("Database Administration")
-    col_pb, col_map = st.columns(2)
     
+    # --- LIVE RAM MONITOR ---
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    ram_mb = mem_info.rss / (1024 * 1024) # Convert bytes to Megabytes
+    
+    # Display it beautifully
+    st.metric("⚡ Current App RAM Usage", f"{ram_mb:.2f} MB")
+    st.divider()
+    # ------------------------
+    
+    col_pb, col_map = st.columns(2)
     with col_pb:
         st.subheader(f"Update Pricebook ({selected_store})")
         st.caption(f"Target: `{PRICEBOOK_TABLE}`")
