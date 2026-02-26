@@ -660,6 +660,7 @@ with tab_invoice:
         if st.session_state.get("current_sg_vendor") != vendor:
             st.session_state["analyze_sg"] = False
             st.session_state["current_sg_vendor"] = vendor
+            if "sg_pos_ready" in st.session_state: del st.session_state["sg_pos_ready"]
             
         inv_files = st.file_uploader(f"Upload {vendor} Invoice(s)", accept_multiple_files=True)
         
@@ -670,11 +671,10 @@ with tab_invoice:
         # 3. Use the button to flip a persistent "Session State" switch
         if st.button("Analyze Invoice"):
             st.session_state["analyze_sg"] = True
+            if "sg_pos_ready" in st.session_state: del st.session_state["sg_pos_ready"]
             
         # 4. Check the session state switch instead of the button!
         if st.session_state.get("analyze_sg", False) and inv_files:
-            map_df = load_vendor_map()
-            pb_df = load_pricebook(PRICEBOOK_TABLE)
             
             if map_df.empty: 
                 st.error("Vendor Map is empty. Go to Admin.")
@@ -798,8 +798,12 @@ with tab_invoice:
                 # LOG ACTIVITY
                 log_activity(selected_store, vendor, len(inv_df), changes_count)
                 
+                ready_for_pos = False
+                edited_changes = None
+                
                 if not changes.empty:
                     st.error(f"{len(changes)} Cost Changes Detected")
+                    st.write("**Edit the 'New Price' column to set a custom retail price.**")
                     
                     display_changes = pd.DataFrame()
                     display_changes["Barcode"] = changes["Full Barcode"]
@@ -813,84 +817,119 @@ with tab_invoice:
                     display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
                     display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
                     
-                    st.dataframe(
+                    # New interactive column
+                    display_changes["New Price"] = None
+                    
+                    edited_changes = st.data_editor(
                         display_changes,
                         column_config={
-                            "Old Cost": st.column_config.NumberColumn(format="$%.2f"),
-                            "New Cost": st.column_config.NumberColumn(format="$%.2f")
+                            "Barcode": st.column_config.TextColumn(disabled=True),
+                            "Item": st.column_config.TextColumn(disabled=True),
+                            "Old Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
+                        use_container_width=True,
                         hide_index=True
                     )
+                    
+                    st.divider()
+                    st.caption("When you are finished entering prices, click confirm to build your POS update.")
+                    if st.button("Confirm Prices & Generate POS", type="primary"):
+                        st.session_state["sg_pos_ready"] = True
+                        st.session_state["sg_edited_changes"] = edited_changes
+                        st.session_state["sg_final_check"] = final_check
+                        
+                    # Check if the user has confirmed
+                    if st.session_state.get("sg_pos_ready"):
+                        st.success("Prices confirmed! Ready for download.")
+                        ready_for_pos = True
+                        edited_changes = st.session_state["sg_edited_changes"]
+                        final_check = st.session_state["sg_final_check"]
                 else:
                     st.success("All mapped items match Pricebook costs.")
+                    # If there are no changes, immediately jump to POS generation!
+                    ready_for_pos = True
 
                 # --- B. GENERATE POS UPDATE ---
-                st.divider()
-                st.subheader("POS Update File")
-                
-                pos_cols = [
-                    "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
-                    "Name", "size", "ebt", "byweight", "Fee Multiplier", 
-                    "cost_qty", "cost_cents", "addstock"
-                ]
-                
-                pos_out = pd.DataFrame()
-                
-                # --- FIX: Clean UPC Formatter ---
-                def clean_and_format_upc(u):
-                    s = str(u).replace('=', '').replace('"', '').strip()
-                    return f'="{s}"'
+                if ready_for_pos:
+                    st.divider()
+                    st.subheader("POS Update File")
+                    
+                    pos_cols = [
+                        "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
+                        "Name", "size", "ebt", "byweight", "Fee Multiplier", 
+                        "cost_qty", "cost_cents", "addstock"
+                    ]
+                    
+                    pos_out = pd.DataFrame()
+                    
+                    def clean_and_format_upc(u):
+                        s = str(u).replace('=', '').replace('"', '').strip()
+                        return f'="{s}"'
 
-                raw_upc = final_check["Full Barcode"].astype(str)
-                pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
-                # --------------------------------
-                
-                pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
-                pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
-                
-                qty_col = "Cases" if "Cases" in final_check.columns else "Qty"
-                if qty_col in final_check.columns:
-                    cases = pd.to_numeric(final_check[qty_col], errors='coerce').fillna(0)
-                    pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
-                else:
-                    pos_out["addstock"] = 0
-
-                # Name Logic
-                if "Name_y" in final_check.columns:
-                    pos_out["Name"] = final_check["Name_y"]
-                elif "Name_x" in final_check.columns:
-                    pos_out["Name"] = final_check["Name_x"]
-                elif "Name" in final_check.columns:
-                    pos_out["Name"] = final_check["Name"]
-                else:
-                    pos_out["Name"] = ""
-
-                # Metadata Fill
-                for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier"]:
-                    if col in final_check.columns:
-                        pos_out[col] = final_check[col]
+                    raw_upc = final_check["Full Barcode"].astype(str)
+                    pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+                    
+                    pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
+                    pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
+                    
+                    qty_col = "Cases" if "Cases" in final_check.columns else "Qty"
+                    if qty_col in final_check.columns:
+                        cases = pd.to_numeric(final_check[qty_col], errors='coerce').fillna(0)
+                        pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
                     else:
-                        pos_out[col] = "" 
+                        pos_out["addstock"] = 0
 
-                # Size Logic
-                if "size" in final_check.columns:
-                    pos_out["size"] = final_check["size"]
-                elif "Size" in final_check.columns:
-                    pos_out["size"] = final_check["Size"]
-                else:
-                    pos_out["size"] = ""
-                
-                final_pos_out = pos_out[pos_cols].copy()
-                
-                total_cases = pos_out["addstock"].sum()
-                st.caption(f"Ready to update stock for {len(final_pos_out)} items (Total Units: {total_cases})")
-                
-                st.download_button(
-                    "⬇️ Download POS Update CSV", 
-                    to_csv_bytes(final_pos_out), 
-                    f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                    "text/csv"
-                )
+                    if "Name_y" in final_check.columns:
+                        pos_out["Name"] = final_check["Name_y"]
+                    elif "Name_x" in final_check.columns:
+                        pos_out["Name"] = final_check["Name_x"]
+                    elif "Name" in final_check.columns:
+                        pos_out["Name"] = final_check["Name"]
+                    else:
+                        pos_out["Name"] = ""
+
+                    # We need to map edited prices back to final_check if changes exist
+                    user_prices = {}
+                    if edited_changes is not None and "New Price" in edited_changes.columns:
+                        # Only grab items that the user actively typed a new price into
+                        priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
+                        user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
+
+                    final_check["User_New_Price"] = final_check["Full Barcode"].map(user_prices)
+
+                    # Metadata Fill & Cents Override
+                    for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier"]:
+                        if col == "cents":
+                            base_cents = pd.to_numeric(final_check["cents"], errors='coerce').fillna(0).astype(int)
+                            mask = final_check["User_New_Price"].notna()
+                            # Override the cents if the user typed a new price
+                            base_cents[mask] = (final_check.loc[mask, "User_New_Price"] * 100).astype(int)
+                            pos_out["cents"] = base_cents
+                        elif col in final_check.columns:
+                            pos_out[col] = final_check[col]
+                        else:
+                            pos_out[col] = "" 
+
+                    if "size" in final_check.columns:
+                        pos_out["size"] = final_check["size"]
+                    elif "Size" in final_check.columns:
+                        pos_out["size"] = final_check["Size"]
+                    else:
+                        pos_out["size"] = ""
+                    
+                    final_pos_out = pos_out[pos_cols].copy()
+                    
+                    total_cases = pos_out["addstock"].sum()
+                    st.caption(f"Ready to update stock for {len(final_pos_out)} items (Total Units: {total_cases})")
+                    
+                    st.download_button(
+                        "⬇️ Download POS Update CSV", 
+                        to_csv_bytes(final_pos_out), 
+                        f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                        "text/csv"
+                    )
     # --- COSTCO ---
     elif vendor == "Costco":
         st.header("Costco Processor")
