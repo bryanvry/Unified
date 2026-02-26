@@ -931,10 +931,12 @@ with tab_invoice:
                     
                     # Count how many items the user set a valid >$0 custom price for
                     num_price_updates = 0
-                    if "User_New_Price" in final_check.columns:
-                        num_price_updates = (final_check["User_New_Price"] > 0).sum()
+                    if "User_New_Price" in final_matched.columns:
+                        num_price_updates = (final_matched["User_New_Price"] > 0).sum()
                         
-                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Units: {total_cases})")
+                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Cases: {total_cases})")
+                    
+                    dl_col1, dl_col2 = st.columns(2)
                     
                     st.download_button(
                         "⬇️ Download POS Update CSV", 
