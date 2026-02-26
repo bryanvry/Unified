@@ -617,9 +617,12 @@ with tab_invoice:
                     pos_out["cost_qty"] = final_matched["New_Pack"]
                     
                     qty_col = next((c for c in final_matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
+                    total_actual_cases = 0
                     if qty_col:
                         cases = pd.to_numeric(final_matched[qty_col], errors='coerce').fillna(0)
                         pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
+                        # NEW: Capture the actual case count before it multiplies into units!
+                        total_actual_cases = int(cases.sum())
                     else:
                         pos_out["addstock"] = 0
                     
@@ -636,14 +639,12 @@ with tab_invoice:
 
                     final_pos_out = pos_out[pos_cols].copy()
                     
-                    total_cases = pos_out["addstock"].sum()
-                    
-                    # Count how many items the user set a valid >$0 custom price for
+                    # NEW: Correctly using final_matched for the Unified section
                     num_price_updates = 0
                     if "User_New_Price" in final_matched.columns:
                         num_price_updates = (final_matched["User_New_Price"] > 0).sum()
                         
-                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Units: {total_cases})")
+                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Cases: {total_actual_cases})")
                     
                     dl_col1, dl_col2 = st.columns(2)
                     
@@ -881,9 +882,12 @@ with tab_invoice:
                     pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
                     
                     qty_col = "Cases" if "Cases" in final_check.columns else "Qty"
+                    total_actual_cases = 0
                     if qty_col in final_check.columns:
                         cases = pd.to_numeric(final_check[qty_col], errors='coerce').fillna(0)
                         pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
+                        # NEW: Capture the actual case count before it multiplies into units!
+                        total_actual_cases = int(cases.sum())
                     else:
                         pos_out["addstock"] = 0
 
@@ -927,16 +931,12 @@ with tab_invoice:
                     
                     final_pos_out = pos_out[pos_cols].copy()
                     
-                    total_cases = pos_out["addstock"].sum()
-                    
-                    # Count how many items the user set a valid >$0 custom price for
+                    # NEW: Correctly using final_check for the SG section
                     num_price_updates = 0
-                    if "User_New_Price" in final_matched.columns:
-                        num_price_updates = (final_matched["User_New_Price"] > 0).sum()
+                    if "User_New_Price" in final_check.columns:
+                        num_price_updates = (final_check["User_New_Price"] > 0).sum()
                         
-                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Cases: {total_cases})")
-                    
-                    dl_col1, dl_col2 = st.columns(2)
+                    st.caption(f"Ready to update stock for {len(final_pos_out)} items and update price for {num_price_updates} items (Total Cases: {total_actual_cases})")
                     
                     st.download_button(
                         "⬇️ Download POS Update CSV", 
