@@ -166,9 +166,9 @@ def load_pricebook(table_name):
         st.error(f"Error loading Pricebook ({table_name}): {e}")
         return pd.DataFrame()
 
-def load_vendor_map():
+def load_vendor_map(table_name):
     conn = get_db_connection()
-    query = 'SELECT * FROM "BeerandLiquorKey"'
+    query = f'SELECT * FROM "{table_name}"'
     try:
         df = conn.query(query, ttl=0)
         if not df.empty:
@@ -182,24 +182,21 @@ def load_vendor_map():
 col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
 
 with col_title:
-    # We use width=250 so it doesn't stretch massively across the whole screen.
-    # You can change 250 to 300, 400, etc., to make it bigger!
     st.image(LOGO_PATH, width=250)
 
 with col_store:
-    # Tiny footprint: Selectbox with hidden label
-    # This sits neatly in the top right
     selected_store = st.selectbox("Store", ["Twain", "Rancho"], label_visibility="collapsed")
-    # Small indicator of connection
     st.caption(f"📍 **{selected_store}**")
 
 # Map selection to Table Names
 if selected_store == "Twain":
     PRICEBOOK_TABLE = "PricebookTwain"
     SALES_TABLE = "salestwain1"
+    VENDOR_MAP_TABLE = "BeerandLiquorKeyTwain"
 else:
     PRICEBOOK_TABLE = "PricebookRancho"
     SALES_TABLE = "salesrancho1"
+    VENDOR_MAP_TABLE = "BeerandLiquorKeyRancho"
 
 
 # --- MAIN APP TABS ---
@@ -247,7 +244,7 @@ with tab_order:
             conn = get_db_connection()
             
             # 1. Company List
-            companies_df = conn.query('SELECT DISTINCT "Company" FROM "BeerandLiquorKey"', ttl=0)
+            companies_df = conn.query(f'SELECT DISTINCT "Company" FROM "{VENDOR_MAP_TABLE}"', ttl=0)
             if not companies_df.empty:
                 company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
             else:
@@ -259,9 +256,9 @@ with tab_order:
             if st.button(f"Load {target_company} Items"):
                 
                 # --- SECURITY FIX: Parameterized Query (No f-string) ---
-                map_query = """
+                map_query = f"""
                     SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
-                    FROM "BeerandLiquorKey" 
+                    FROM "{VENDOR_MAP_TABLE}" 
                     WHERE "Company" = :company_name
                 """
                 vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
@@ -685,7 +682,7 @@ with tab_invoice:
             
         # 4. Check the session state switch instead of the button!
         if st.session_state.get("analyze_sg", False) and inv_files:
-            map_df = load_vendor_map()
+            map_df = load_vendor_map(VENDOR_MAP_TABLE)
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
             if map_df.empty: 
@@ -782,7 +779,7 @@ with tab_invoice:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
-                        to_insert.to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
+                        to_insert.to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
                         
                         st.success("Items successfully mapped! Re-analyzing invoice...")
                         st.rerun() 
@@ -1169,11 +1166,27 @@ with tab_admin:
                 st.error(f"Error updating pricebook: {e}")
 
     with col_map:
-        st.subheader("Update Vendor Map (Global)")
-        st.caption("Target: `BeerandLiquorKey`")
+        st.subheader(f"Update Vendor Map ({selected_store})")
+        st.caption(f"Target: `{VENDOR_MAP_TABLE}`")
+        
+        # --- NEW: Download Current Map Button ---
+        current_map = load_vendor_map(VENDOR_MAP_TABLE)
+        if not current_map.empty:
+            # Drop internal columns so the exported excel is clean
+            export_map = current_map.drop(columns=["_inv_upc_norm"], errors="ignore")
+            st.download_button(
+                label=f"⬇️ Download Current {selected_store} Map",
+                data=to_xlsx_bytes({"VendorMap": export_map}),
+                file_name=f"VendorMap_{selected_store}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        # ----------------------------------------
+        
         map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
         
-        if map_upload and st.button("Append/Update Map"):
+        # Renamed to "Replace Map" because it uses TRUNCATE (which wipes the old list)
+        if map_upload and st.button("Replace Map", type="primary"):
             try:
                 df = pd.read_excel(map_upload, dtype=str)
                 if "Full Barcode" not in df.columns or "Invoice UPC" not in df.columns:
@@ -1184,10 +1197,10 @@ with tab_admin:
                     cols_to_load = [c for c in target_cols if c in df.columns]
                     
                     with conn.session as session:
-                        session.execute(text('TRUNCATE TABLE "BeerandLiquorKey";'))
+                        session.execute(text(f'TRUNCATE TABLE "{VENDOR_MAP_TABLE}";'))
                         session.commit()
                         
-                    df[cols_to_load].to_sql("BeerandLiquorKey", conn.engine, if_exists='append', index=False)
-                    st.success(f"Map updated with {len(df)} rows.")
+                    df[cols_to_load].to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
+                    st.success(f"Map replaced successfully with {len(df)} rows.")
             except Exception as e:
                 st.error(f"Error updating map: {e}")
