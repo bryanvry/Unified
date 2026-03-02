@@ -744,82 +744,98 @@ with tab_invoice:
                 
                 # Only run the scraper once per unique batch so we don't spam the website
                 if st.session_state.get("last_scrape_hash") != scrape_hash:
-                    with st.spinner(f"🤖 Auto-Scraping JCSalesWeb to find barcodes for {len(items_to_scrape)} unmatched items..."):
-                        import requests
-                        from bs4 import BeautifulSoup
-                        import time # <--- NEW: Imported time for the delay!
+                    
+                    # --- NEW: Live Progress UI ---
+                    st.write(f"### 🤖 Auto-Scraping {len(items_to_scrape)} Items")
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    import requests
+                    from bs4 import BeautifulSoup
+                    import time 
+                    
+                    potential_matches = []
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    
+                    for i, item_num in enumerate(items_to_scrape):
+                        # Update UI to show what it is currently working on
+                        status_text.info(f"🔍 Searching {i+1}/{len(items_to_scrape)}: Item **{item_num}**...")
                         
-                        potential_matches = []
-                        # --- USE THE EXACT HEADERS FROM YOUR SCRAPER.PY ---
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                        }
-                        
-                        for item_num in items_to_scrape:
-                            try:
-                                url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
-                                resp = requests.get(url, headers=headers, timeout=10)
-                                
-                                # If the website blocks us, tell the user instead of failing silently!
-                                if resp.status_code != 200:
-                                    st.warning(f"⚠️ JC Sales blocked the search for item {item_num} (HTTP {resp.status_code})")
-                                    continue
-                                
-                                soup = BeautifulSoup(resp.content, "html.parser")
-                                
-                                best_upc = None
-                                fallback_upc = None
-                                barcode_labels = soup.find_all("span", class_="barcode-list")
-                                
-                                # Just grab the first barcode list found on the page
-                                if barcode_labels:
-                                    label = barcode_labels[0]
-                                    # EXACT logic from scraper.py
-                                    text = label.parent.get_text(strip=True)
-                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
-                                    
-                                    if clean_text:
-                                        found_codes = [c.strip() for c in clean_text.split(',')]
-                                        
-                                        for code in found_codes:
-                                            norm_code = _norm_upc_12(code)
-                                            
-                                            # Prefer a 12 or 13 digit barcode as the fallback 
-                                            if fallback_upc is None and len(norm_code) >= 12:
-                                                fallback_upc = norm_code
-                                                
-                                            # Perfect pricebook match
-                                            if norm_code in pb_upcs:
-                                                best_upc = norm_code
-                                                break
-                                                
-                                        # Use the best fallback we have
-                                        if not best_upc:
-                                            best_upc = fallback_upc if fallback_upc else _norm_upc_12(found_codes[0])
-                                                
-                                if best_upc:
-                                    row_data = jc_df[jc_df["ITEM_str"] == item_num].iloc[0]
-                                    potential_matches.append({
-                                        "Confirm": True,
-                                        "ITEM": item_num,
-                                        "Found UPC": best_upc,
-                                        "Invoice Desc": row_data["DESCRIPTION"],
-                                        "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
-                                        "PACK": row_data["PACK"],
-                                        "COST": row_data["COST"]
-                                    })
-                            except Exception as e:
-                                # Stop hiding errors so we can debug if it breaks!
-                                st.error(f"Error scraping {item_num}: {e}") 
+                        try:
+                            url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
+                            # Bumped timeout to 15 seconds to give their slow website more time to reply
+                            resp = requests.get(url, headers=headers, timeout=15)
                             
-                            # --- POLITE DELAY --- 
-                            # Pause for 1 second between items so JC Sales doesn't ban the server IP!
-                            time.sleep(1)
+                            if resp.status_code != 200:
+                                status_text.warning(f"⚠️ Blocked on item {item_num} (HTTP {resp.status_code})")
+                                time.sleep(1.5)
+                                continue
+                            
+                            soup = BeautifulSoup(resp.content, "html.parser")
+                            
+                            best_upc = None
+                            fallback_upc = None
+                            barcode_labels = soup.find_all("span", class_="barcode-list")
+                            
+                            if barcode_labels:
+                                label = barcode_labels[0]
+                                text = label.parent.get_text(strip=True)
+                                clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
                                 
-                        st.session_state["scraped_matches"] = potential_matches
-                        st.session_state["last_scrape_hash"] = scrape_hash
-
-                # --- SHOW THE REVIEW BOARD ---
+                                if clean_text:
+                                    found_codes = [c.strip() for c in clean_text.split(',')]
+                                    
+                                    for code in found_codes:
+                                        norm_code = _norm_upc_12(code)
+                                        
+                                        if fallback_upc is None and len(norm_code) >= 12:
+                                            fallback_upc = norm_code
+                                            
+                                        if norm_code in pb_upcs:
+                                            best_upc = norm_code
+                                            break
+                                            
+                                    if not best_upc:
+                                        best_upc = fallback_upc if fallback_upc else _norm_upc_12(found_codes[0])
+                                            
+                            if best_upc:
+                                row_data = jc_df[jc_df["ITEM_str"] == item_num].iloc[0]
+                                potential_matches.append({
+                                    "Confirm": True,
+                                    "ITEM": item_num,
+                                    "Found UPC": best_upc,
+                                    "Invoice Desc": row_data["DESCRIPTION"],
+                                    "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
+                                    "PACK": row_data["PACK"],
+                                    "COST": row_data["COST"]
+                                })
+                                status_text.success(f"✅ Found UPC for **{item_num}**")
+                            else:
+                                status_text.error(f"❌ No barcodes found for **{item_num}**")
+                                
+                        except requests.exceptions.Timeout:
+                            # Catch the timeout error gracefully instead of crashing!
+                            status_text.error(f"⏳ Timeout: JC Sales website is too slow for item **{item_num}**.")
+                        except Exception as e:
+                            status_text.error(f"⚠️ Error scraping **{item_num}**: {e}")
+                        
+                        # Update the visual progress bar
+                        progress_bar.progress((i + 1) / len(items_to_scrape))
+                        
+                        # Polite delay to avoid IP bans, and gives you time to read the success/fail message
+                        time.sleep(1.5)
+                            
+                    status_text.info("✨ Scraping complete! Preparing review board...")
+                    time.sleep(1)
+                    
+                    st.session_state["scraped_matches"] = potential_matches
+                    st.session_state["last_scrape_hash"] = scrape_hash
+                    
+                    # Hide the progress UI before showing the review board
+                    status_text.empty()
+                    progress_bar.empty()
 
                 # --- SHOW THE REVIEW BOARD ---
                 scraped_results = st.session_state.get("scraped_matches", [])
