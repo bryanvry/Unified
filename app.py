@@ -834,34 +834,159 @@ with tab_invoice:
                         jc_key["ITEM_str"] = jc_key["ITEM"].astype(str).str.strip()
                         st.success(f"Auto-Scraper successfully matched and saved {len(new_db_rows) + len(update_db_rows)} items directly to the database!")
             # ==========================================
-            # POPUP 1: MISSING ITEM NUMBERS (NOT IN DB)
+            # 🤖 AUTO-SCRAPER ENGINE (REVIEW BOARD)
             # ==========================================
-            missing_items = jc_df[~jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
+            pb_upcs = set(pb_df["_norm_upc"])
+            pb_names = dict(zip(pb_df["_norm_upc"], pb_df["Name"])) # Used to show the PB Name in the UI
             
-            if not missing_items.empty:
-                st.warning(f"⚠️ {len(missing_items)} Items are not in your Database (JCSalesKey).")
-                st.caption("Please fill in the missing UPCs below and click 'Save to Database'.")
+            # 1. Find items missing from DB entirely
+            missing_items_list = jc_df[~jc_df["ITEM_str"].isin(jc_key["ITEM_str"])]["ITEM_str"].unique()
+            
+            # 2. Find items in DB, but mapping is bad ("No Match")
+            db_matched_pre = jc_df[jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
+            pre_mapped = db_matched_pre.merge(jc_key, on="ITEM_str", how="left")
+            
+            def has_valid_upc(row):
+                u1 = _norm_upc_12(row.get("UPC1", ""))
+                u2 = _norm_upc_12(row.get("UPC2", ""))
+                return bool(u1 and u1 in pb_upcs) or bool(u2 and u2 in pb_upcs)
                 
-                edit_df = pd.DataFrame({
-                    "ITEM": missing_items["ITEM_str"],
-                    "UPC1": "",
-                    "UPC2": "",
-                    "DESCRIPTION": missing_items["DESCRIPTION"],
-                    "PACK": missing_items["PACK"],
-                    "COST": missing_items["COST"]
-                })
+            if not pre_mapped.empty:
+                pre_mapped["Valid"] = pre_mapped.apply(has_valid_upc, axis=1)
+                mismatched_items_list = pre_mapped[~pre_mapped["Valid"]]["ITEM_str"].unique()
+            else:
+                mismatched_items_list = []
+            
+            # Combine and filter out items the user previously chose to ignore/uncheck
+            if "ignore_scrape" not in st.session_state:
+                st.session_state["ignore_scrape"] = set()
                 
-                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="jc_missing_items")
+            raw_items_to_scrape = list(set(list(missing_items_list) + list(mismatched_items_list)))
+            items_to_scrape = [i for i in raw_items_to_scrape if i not in st.session_state["ignore_scrape"]]
+            
+            if items_to_scrape:
+                scrape_hash = "_".join(sorted(items_to_scrape))
                 
-                if st.button("Save New Items to Database", type="primary"):
-                    to_insert = edited_rows[edited_rows["UPC1"].str.strip() != ""].copy()
-                    if not to_insert.empty:
-                        conn = get_db_connection()
-                        to_insert.to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
-                        st.success("Items saved! Re-analyzing invoice...")
-                        st.rerun()
-                    else:
-                        st.error("Please enter at least one UPC1 to save.")
+                # Only run the scraper once per unique batch so we don't spam the website
+                if st.session_state.get("last_scrape_hash") != scrape_hash:
+                    with st.spinner(f"🤖 Auto-Scraping JCSalesWeb to find barcodes for {len(items_to_scrape)} unmatched items..."):
+                        import requests
+                        from bs4 import BeautifulSoup
+                        
+                        potential_matches = []
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                        
+                        for item_num in items_to_scrape:
+                            try:
+                                url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
+                                resp = requests.get(url, headers=headers, timeout=5)
+                                soup = BeautifulSoup(resp.content, "html.parser")
+                                
+                                best_upc = None
+                                barcode_labels = soup.find_all("span", class_="barcode-list")
+                                
+                                # Just grab the first barcode list found on the page!
+                                if barcode_labels:
+                                    label = barcode_labels[0]
+                                    text = label.parent.get_text(separator=" ", strip=True)
+                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
+                                    
+                                    if clean_text:
+                                        found_codes = [c.strip() for c in clean_text.split(',')]
+                                        for code in found_codes:
+                                            norm_code = _norm_upc_12(code)
+                                            if norm_code in pb_upcs:
+                                                best_upc = norm_code
+                                                break
+                                                
+                                if best_upc:
+                                    row_data = jc_df[jc_df["ITEM_str"] == item_num].iloc[0]
+                                    potential_matches.append({
+                                        "Confirm": True,
+                                        "ITEM": item_num,
+                                        "Found UPC": best_upc,
+                                        "Invoice Desc": row_data["DESCRIPTION"],
+                                        "Pricebook Name": pb_names.get(best_upc, "Unknown"),
+                                        "PACK": row_data["PACK"],
+                                        "COST": row_data["COST"]
+                                    })
+                            except Exception as e:
+                                pass 
+                                
+                        st.session_state["scraped_matches"] = potential_matches
+                        st.session_state["last_scrape_hash"] = scrape_hash
+
+                # --- SHOW THE REVIEW BOARD ---
+                scraped_results = st.session_state.get("scraped_matches", [])
+                
+                if scraped_results:
+                    st.info("🤖 **Auto-Scraper found potential matches!** Review the items below:")
+                    st.caption("Leave the box checked if the Pricebook Name matches the Invoice Description.")
+                    
+                    df_matches = pd.DataFrame(scraped_results)
+                    edited_matches = st.data_editor(
+                        df_matches,
+                        column_config={
+                            "Confirm": st.column_config.CheckboxColumn("Confirm?", default=True),
+                            "ITEM": st.column_config.TextColumn(disabled=True),
+                            "Found UPC": st.column_config.TextColumn(disabled=True),
+                            "Invoice Desc": st.column_config.TextColumn(disabled=True),
+                            "Pricebook Name": st.column_config.TextColumn(disabled=True),
+                            "PACK": None, # Hide background data
+                            "COST": None  # Hide background data
+                        },
+                        hide_index=True,
+                        key="scraper_review"
+                    )
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Save Confirmed Matches", type="primary"):
+                            confirmed = edited_matches[edited_matches["Confirm"]]
+                            
+                            # Add UNCONFIRMED items to the ignore list so it doesn't try to scrape them again
+                            unconfirmed = edited_matches[~edited_matches["Confirm"]]
+                            if not unconfirmed.empty:
+                                st.session_state["ignore_scrape"].update(unconfirmed["ITEM"].tolist())
+                                
+                            if not confirmed.empty:
+                                new_db_rows = []
+                                update_db_rows = []
+                                for _, r in confirmed.iterrows():
+                                    if r["ITEM"] in jc_key["ITEM_str"].values:
+                                        update_db_rows.append({"ITEM": r["ITEM"], "UPC1": r["Found UPC"]})
+                                    else:
+                                        new_db_rows.append({
+                                            "ITEM": r["ITEM"],
+                                            "UPC1": r["Found UPC"],
+                                            "UPC2": "",
+                                            "DESCRIPTION": r["Invoice Desc"],
+                                            "PACK": r["PACK"],
+                                            "COST": r["COST"]
+                                        })
+                                        
+                                conn = get_db_connection()
+                                with conn.session as session:
+                                    if new_db_rows:
+                                        pd.DataFrame(new_db_rows).to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+                                    if update_db_rows:
+                                        for r in update_db_rows:
+                                            session.execute(text('UPDATE "JCSalesKey" SET "UPC1" = :u WHERE "ITEM" = :i'), {"u": r["UPC1"], "i": r["ITEM"]})
+                                    session.commit()
+                                
+                            st.session_state.pop("last_scrape_hash", None)
+                            st.session_state.pop("scraped_matches", None)
+                            st.success("Matches Saved! Re-analyzing...")
+                            st.rerun()
+                            
+                    with col2:
+                        if st.button("Discard All & Map Manually"):
+                            st.session_state["ignore_scrape"].update(df_matches["ITEM"].tolist())
+                            st.session_state.pop("last_scrape_hash", None)
+                            st.session_state.pop("scraped_matches", None)
+                            st.rerun()
+                    
+                    st.stop() # Wait for the user to clear the review board before showing the manual POPUP 1
                 
             # ==========================================
             # POPUP 2: NO MATCH (UPC NOT IN PRICEBOOK)
