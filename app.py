@@ -752,36 +752,55 @@ with tab_invoice:
                             url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
                             resp = requests.get(url, headers=headers, timeout=5)
                             soup = BeautifulSoup(resp.content, "html.parser")
-                            barcode_labels = soup.find_all("span", class_="barcode-list")
                             
                             best_upc = None
                             
-                            if barcode_labels:
-                                for label in barcode_labels:
-                                    # 1. Grab the entire product box (climbing up the HTML tree)
-                                    # We go up a few levels to make sure we capture the title and item number
-                                    product_box = label.parent.parent.parent.parent
-                                    box_text = product_box.get_text(separator=" ", strip=True)
+                            # --- STRATEGY 1: Anchor on the Item Number first ---
+                            # Find all text on the page that matches the exact item number
+                            matching_text_nodes = soup.find_all(string=re.compile(rf"\b{item_num}\b"))
+                            
+                            for text_node in matching_text_nodes:
+                                # Climb up 6 levels to capture the entire "Product Card" HTML block
+                                container = text_node.parent
+                                for _ in range(6):
+                                    if container and container.parent and container.name not in ['body', 'html', 'main']:
+                                        container = container.parent
+                                        
+                                # Look for the barcode list strictly inside this specific product card!
+                                barcode_label = container.find("span", class_="barcode-list")
+                                if barcode_label:
+                                    text = barcode_label.parent.get_text(separator=" ", strip=True)
+                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
                                     
-                                    # 2. VERIFICATION: Does this specific box contain our exact item number?
-                                    # The \b ensures it matches the whole number (so "123" doesn't match "12345")
-                                    if re.search(rf"\b{item_num}\b", box_text):
+                                    if clean_text:
+                                        found_codes = [c.strip() for c in clean_text.split(',')]
                                         
-                                        # It's a match! Now we can safely extract the barcode
-                                        text = label.parent.get_text(strip=True)
-                                        clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
-                                        
-                                        if clean_text:
-                                            found_codes = [c.strip() for c in clean_text.split(',')]
-                                            # Check if ANY of the scraped barcodes are in the Pricebook
+                                        # Check if ANY of these barcodes exist in our pricebook
+                                        for code in found_codes:
+                                            norm_code = _norm_upc_12(code)
+                                            if norm_code in pb_upcs:
+                                                best_upc = norm_code
+                                                break
+                                if best_upc: break # Stop if we found a pricebook match
+
+                            # --- STRATEGY 2: The Hidden Shortcut Fallback ---
+                            # Just in case the item number IS secretly in the barcode list (like your 273531 example)
+                            if not best_upc:
+                                barcode_labels = soup.find_all("span", class_="barcode-list")
+                                for label in barcode_labels:
+                                    text = label.parent.get_text(separator=" ", strip=True)
+                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
+                                    if clean_text:
+                                        found_codes = [c.strip() for c in clean_text.split(',')]
+                                        if item_num in found_codes:
                                             for code in found_codes:
                                                 norm_code = _norm_upc_12(code)
                                                 if norm_code in pb_upcs:
                                                     best_upc = norm_code
                                                     break
-                                                    
-                                        if best_upc: break # Stop searching if we found a match inside this box
-                            
+                                    if best_upc: break
+
+                            # --- SAVE RESULTS ---
                             # If we found a valid barcode, queue it for database saving
                             if best_upc:
                                 if item_num in jc_key["ITEM_str"].values:
