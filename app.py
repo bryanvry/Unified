@@ -747,24 +747,35 @@ with tab_invoice:
                     with st.spinner(f"🤖 Auto-Scraping JCSalesWeb to find barcodes for {len(items_to_scrape)} unmatched items..."):
                         import requests
                         from bs4 import BeautifulSoup
+                        import time # <--- NEW: Imported time for the delay!
                         
                         potential_matches = []
-                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                        # --- USE THE EXACT HEADERS FROM YOUR SCRAPER.PY ---
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                        }
                         
                         for item_num in items_to_scrape:
                             try:
                                 url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
-                                resp = requests.get(url, headers=headers, timeout=10) # Bumped timeout to be safe
+                                resp = requests.get(url, headers=headers, timeout=10)
+                                
+                                # If the website blocks us, tell the user instead of failing silently!
+                                if resp.status_code != 200:
+                                    st.warning(f"⚠️ JC Sales blocked the search for item {item_num} (HTTP {resp.status_code})")
+                                    continue
+                                
                                 soup = BeautifulSoup(resp.content, "html.parser")
                                 
                                 best_upc = None
                                 fallback_upc = None
                                 barcode_labels = soup.find_all("span", class_="barcode-list")
                                 
-                                # Just grab the first barcode list found on the page!
+                                # Just grab the first barcode list found on the page
                                 if barcode_labels:
                                     label = barcode_labels[0]
-                                    text = label.parent.get_text(separator=" ", strip=True)
+                                    # EXACT logic from scraper.py
+                                    text = label.parent.get_text(strip=True)
                                     clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
                                     
                                     if clean_text:
@@ -774,16 +785,15 @@ with tab_invoice:
                                             norm_code = _norm_upc_12(code)
                                             
                                             # Prefer a 12 or 13 digit barcode as the fallback 
-                                            # (this prevents it from accidentally picking the short item number)
                                             if fallback_upc is None and len(norm_code) >= 12:
                                                 fallback_upc = norm_code
                                                 
-                                            # If it perfectly matches the Pricebook, this is the absolute winner!
+                                            # Perfect pricebook match
                                             if norm_code in pb_upcs:
                                                 best_upc = norm_code
                                                 break
                                                 
-                                        # If it didn't find a perfect pricebook match, show the best fallback we have!
+                                        # Use the best fallback we have
                                         if not best_upc:
                                             best_upc = fallback_upc if fallback_upc else _norm_upc_12(found_codes[0])
                                                 
@@ -794,16 +804,22 @@ with tab_invoice:
                                         "ITEM": item_num,
                                         "Found UPC": best_upc,
                                         "Invoice Desc": row_data["DESCRIPTION"],
-                                        # Show a warning if it scraped successfully but isn't in your PB
                                         "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
                                         "PACK": row_data["PACK"],
                                         "COST": row_data["COST"]
                                     })
                             except Exception as e:
-                                pass
+                                # Stop hiding errors so we can debug if it breaks!
+                                st.error(f"Error scraping {item_num}: {e}") 
+                            
+                            # --- POLITE DELAY --- 
+                            # Pause for 1 second between items so JC Sales doesn't ban the server IP!
+                            time.sleep(1)
                                 
                         st.session_state["scraped_matches"] = potential_matches
                         st.session_state["last_scrape_hash"] = scrape_hash
+
+                # --- SHOW THE REVIEW BOARD ---
 
                 # --- SHOW THE REVIEW BOARD ---
                 scraped_results = st.session_state.get("scraped_matches", [])
