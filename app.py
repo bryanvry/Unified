@@ -178,6 +178,15 @@ def load_vendor_map(table_name):
         st.error(f"Error loading Vendor Map: {e}")
         return pd.DataFrame()
 
+def load_jcsales_key():
+    conn = get_db_connection()
+    query = 'SELECT * FROM "JCSalesKey"'
+    try:
+        df = conn.query(query, ttl=0)
+        return df
+    except Exception as e:
+        st.error(f"Error loading JC Sales Key: {e}")
+        return pd.DataFrame()
 # --- HEADER & STORE SELECTOR (Top Right) ---
 col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
 
@@ -409,7 +418,7 @@ with tab_invoice:
     vendor = st.selectbox("Select Vendor", vendor_options)
     
     # --- UNIFIED / JC SALES ---
-    if vendor in ["Unified", "JC Sales"]:
+    if vendor == "Unified":
         st.info(f"Processing against **{PRICEBOOK_TABLE}**")
         
         # 1. MEMORY LOCK: Keep track of the vendor to reset analysis if switched
@@ -443,27 +452,6 @@ with tab_invoice:
                     except Exception as e:
                         st.error(f"Error parsing {f.name}: {e}")
         
-        # JC Sales UI
-        elif vendor == "JC Sales":
-            jc_text = st.text_area("Paste JC Sales Text", height=200)
-            
-            if not jc_text:
-                st.session_state["analyze_unified"] = False
-                
-            if st.button("Process JC Sales"):
-                st.session_state["analyze_unified"] = True
-                if "unified_final_df" in st.session_state:
-                    del st.session_state["unified_final_df"]
-                    
-            if st.session_state.get("analyze_unified", False) and jc_text:
-                jc_df, _ = JCSalesParser().parse(jc_text)
-                if not jc_df.empty:
-                    # Rename JC cols to match Unified standard
-                    jc_df = jc_df.rename(columns={"ITEM": "inv_upc_raw", "DESCRIPTION": "Description", "PACK": "Pack", "UNIT": "+Cost"})
-                    jc_df["UPC"] = jc_df["inv_upc_raw"]
-                    jc_df["Brand"] = "" 
-                    jc_df["invoice_date"] = datetime.today() 
-                    inv_dfs.append(jc_df)
 
         # Shared Processing Logic
         if inv_dfs:
@@ -659,6 +647,163 @@ with tab_invoice:
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
                 st.dataframe(unmatched[["UPC", "Description", "+Cost"]])
+
+    # --- JC SALES (INTERACTIVE DATABASE ROUTE) ---
+    elif vendor == "JC Sales":
+        st.info(f"Using Global **JCSalesKey** + **{PRICEBOOK_TABLE}**")
+        
+        if st.session_state.get("current_jc_vendor") != vendor:
+            st.session_state["analyze_jc"] = False
+            st.session_state["current_jc_vendor"] = vendor
+            
+        jc_text = st.text_area("Paste JC Sales Text (Select All in PDF -> Copy -> Paste)", height=250)
+        
+        if not jc_text:
+            st.session_state["analyze_jc"] = False
+            
+        if st.button("Analyze JC Sales", type="primary"):
+            st.session_state["analyze_jc"] = True
+            
+        if st.session_state.get("analyze_jc", False) and jc_text:
+            jc_key = load_jcsales_key()
+            pb_df = load_pricebook(PRICEBOOK_TABLE)
+            
+            if jc_key.empty:
+                st.error("JCSalesKey is empty. Please upload it in the Admin tab.")
+                st.stop()
+                
+            jc_df, _ = JCSalesParser().parse(jc_text)
+            if jc_df.empty:
+                st.error("No items parsed from text.")
+                st.stop()
+                
+            # Clean items for mapping
+            jc_df["ITEM_str"] = jc_df["ITEM"].astype(str).str.strip()
+            jc_key["ITEM_str"] = jc_key["ITEM"].astype(str).str.strip()
+            
+            # ==========================================
+            # POPUP 1: MISSING ITEM NUMBERS (NOT IN DB)
+            # ==========================================
+            missing_items = jc_df[~jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
+            
+            if not missing_items.empty:
+                st.warning(f"⚠️ {len(missing_items)} Items are not in your Database (JCSalesKey).")
+                st.caption("Please fill in the missing UPCs below and click 'Save to Database'.")
+                
+                edit_df = pd.DataFrame({
+                    "ITEM": missing_items["ITEM_str"],
+                    "UPC1": "",
+                    "UPC2": "",
+                    "DESCRIPTION": missing_items["DESCRIPTION"],
+                    "PACK": missing_items["PACK"],
+                    "COST": missing_items["COST"]
+                })
+                
+                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="jc_missing_items")
+                
+                if st.button("Save New Items to Database", type="primary"):
+                    to_insert = edited_rows[edited_rows["UPC1"].str.strip() != ""].copy()
+                    if not to_insert.empty:
+                        conn = get_db_connection()
+                        to_insert.to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+                        st.success("Items saved! Re-analyzing invoice...")
+                        st.rerun()
+                    else:
+                        st.error("Please enter at least one UPC1 to save.")
+                st.stop() # Pause everything until they fix the missing items!
+                
+            # ==========================================
+            # POPUP 2: NO MATCH (UPC NOT IN PRICEBOOK)
+            # ==========================================
+            mapped_inv = jc_df.merge(jc_key, left_on="ITEM_str", right_on="ITEM_str", how="left", suffixes=("", "_db"))
+            pb_upcs = set(pb_df["_norm_upc"])
+            
+            def resolve_upc(row):
+                u1 = _norm_upc_12(row.get("UPC1", ""))
+                u2 = _norm_upc_12(row.get("UPC2", ""))
+                if u1 and u1 in pb_upcs: return u1
+                if u2 and u2 in pb_upcs: return u2
+                return None
+                
+            mapped_inv["Resolved_UPC"] = mapped_inv.apply(resolve_upc, axis=1)
+            no_match_upcs = mapped_inv[mapped_inv["Resolved_UPC"].isna()].copy()
+            
+            if not no_match_upcs.empty:
+                st.error(f"⚠️ {len(no_match_upcs)} Items were found in the database, but their UPC is 'No Match' in the Pricebook.")
+                st.caption("Enter the Correct UPC1 below to fix the mapping in your database.")
+                
+                fix_df = pd.DataFrame({
+                    "ITEM": no_match_upcs["ITEM_str"],
+                    "Current UPC1": no_match_upcs["UPC1"],
+                    "Correct UPC1": "",
+                    "DESCRIPTION": no_match_upcs["DESCRIPTION"]
+                })
+                
+                fixed_rows = st.data_editor(fix_df, hide_index=True, key="jc_fix_upcs")
+                
+                if st.button("Update Database UPCs", type="primary"):
+                    updates = fixed_rows[fixed_rows["Correct UPC1"].str.strip() != ""]
+                    if not updates.empty:
+                        conn = get_db_connection()
+                        with conn.session as session:
+                            for _, r in updates.iterrows():
+                                new_u = str(r["Correct UPC1"]).strip()
+                                item_val = str(r["ITEM"]).strip()
+                                # Update the DB row permanently!
+                                session.execute(text('UPDATE "JCSalesKey" SET "UPC1" = :u WHERE "ITEM" = :i'), {"u": new_u, "i": item_val})
+                            session.commit()
+                        st.success("Database updated! Re-analyzing invoice...")
+                        st.rerun()
+                    else:
+                        st.error("No corrections were entered.")
+                st.stop() # Pause everything until they fix the mappings!
+                
+            # ==========================================
+            # ALL ITEMS MATCHED: GENERATE POS
+            # ==========================================
+            st.success(f"✅ All {len(mapped_inv)} items successfully mapped to the {PRICEBOOK_TABLE}!")
+            
+            final_check = mapped_inv.merge(pb_df, left_on="Resolved_UPC", right_on="_norm_upc", how="left")
+            
+            st.divider()
+            st.subheader("POS Update File")
+            
+            pos_cols = [
+                "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
+                "Name", "size", "ebt", "byweight", "Fee Multiplier", 
+                "cost_qty", "cost_cents", "addstock"
+            ]
+            
+            pos_out = pd.DataFrame()
+            
+            def clean_and_format_upc(u):
+                s = str(u).replace('=', '').replace('"', '').strip()
+                return f'="{s}"'
+
+            raw_upc = final_check["Resolved_UPC"].astype(str)
+            pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+            
+            # Map JC Sales Cost and Pack directly into the POS update
+            pos_out["cost_cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
+            pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
+            
+            # Keep other metadata from the pricebook
+            for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
+                if col in final_check.columns:
+                    pos_out[col] = final_check[col]
+                else:
+                    pos_out[col] = "" 
+                    
+            final_pos_out = pos_out[pos_cols].copy()
+            
+            st.dataframe(final_pos_out, use_container_width=True)
+            
+            st.download_button(
+                "⬇️ Download POS Update CSV", 
+                to_csv_bytes(final_pos_out), 
+                f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                "text/csv"
+            )
    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
@@ -1129,7 +1274,7 @@ with tab_admin:
     st.divider()
     # ------------------------
     
-    col_pb, col_map = st.columns(2)
+    col_pb, col_map, col_jc = st.columns(3)
     with col_pb:
         st.subheader(f"Update Pricebook ({selected_store})")
         st.caption(f"Target: `{PRICEBOOK_TABLE}`")
@@ -1151,15 +1296,12 @@ with tab_admin:
                         session.execute(text(f'TRUNCATE TABLE "{PRICEBOOK_TABLE}";'))
                         session.commit()
                     
-                    # UPDATED: Expanded list of columns to save to DB
                     valid_cols = [
                         "Upc", "Department", "qty", "cents", "setstock", "cost_qty", "cost_cents", "Name",
                         "incltaxes", "inclfees", "size", "ebt", "byweight", "Fee Multiplier"
                     ]
                     
-                    # Only save columns that actually exist in the uploaded file
                     cols_to_use = [c for c in valid_cols if c in df.columns]
-                    
                     df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
                     st.success(f"Replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
             except Exception as e:
@@ -1169,10 +1311,8 @@ with tab_admin:
         st.subheader(f"Update Vendor Map ({selected_store})")
         st.caption(f"Target: `{VENDOR_MAP_TABLE}`")
         
-        # --- NEW: Download Current Map Button ---
         current_map = load_vendor_map(VENDOR_MAP_TABLE)
         if not current_map.empty:
-            # Drop internal columns so the exported excel is clean
             export_map = current_map.drop(columns=["_inv_upc_norm"], errors="ignore")
             st.download_button(
                 label=f"⬇️ Download Current {selected_store} Map",
@@ -1181,11 +1321,9 @@ with tab_admin:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-        # ----------------------------------------
         
         map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
         
-        # Renamed to "Replace Map" because it uses TRUNCATE (which wipes the old list)
         if map_upload and st.button("Replace Map", type="primary"):
             try:
                 df = pd.read_excel(map_upload, dtype=str)
@@ -1204,3 +1342,35 @@ with tab_admin:
                     st.success(f"Map replaced successfully with {len(df)} rows.")
             except Exception as e:
                 st.error(f"Error updating map: {e}")
+
+    with col_jc:
+        st.subheader("Update JC Sales Key (Global)")
+        st.caption("Target: `JCSalesKey`")
+        
+        current_jc = load_jcsales_key()
+        if not current_jc.empty:
+            st.download_button(
+                label="⬇️ Download Current JC Sales Key",
+                data=to_xlsx_bytes({"JCSalesKey": current_jc}),
+                file_name=f"JCSalesKey_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            
+        jc_upload = st.file_uploader("Upload JC Sales Key xlsx/csv", type=["xlsx", "csv"], key="jc_admin")
+        
+        if jc_upload and st.button("Replace JC Sales Key", type="primary"):
+            try:
+                df = pd.read_excel(jc_upload, dtype=str) if jc_upload.name.endswith('.xlsx') else pd.read_csv(jc_upload, dtype=str)
+                target_cols = ["ITEM", "UPC1", "UPC2", "DESCRIPTION", "PACK", "COST"]
+                cols_to_load = [c for c in target_cols if c in df.columns]
+                
+                conn = get_db_connection()
+                with conn.session as session:
+                    session.execute(text('TRUNCATE TABLE "JCSalesKey";'))
+                    session.commit()
+                    
+                df[cols_to_load].to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+                st.success(f"JC Sales Key replaced with {len(df)} rows.")
+            except Exception as e:
+                st.error(f"Error updating JC Sales Key: {e}")
