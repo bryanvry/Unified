@@ -13,3 +13,5 @@ python-barcode
 Pillow 
 streamlit-keyup
 psutil
+beautifulsoup4
+requests
