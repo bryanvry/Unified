@@ -765,45 +765,118 @@ with tab_invoice:
             
             final_check = mapped_inv.merge(pb_df, left_on="Resolved_UPC", right_on="_norm_upc", how="left")
             
-            st.divider()
-            st.subheader("POS Update File")
+            # --- DETECT COST CHANGES ---
+            final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
+            final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors="coerce").fillna(0).astype(int)
+            final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
             
-            pos_cols = [
-                "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
-                "Name", "size", "ebt", "byweight", "Fee Multiplier", 
-                "cost_qty", "cost_cents", "addstock"
-            ]
+            changes = final_check[abs(final_check["Diff"]) > 1].copy()
             
-            pos_out = pd.DataFrame()
+            # Log activity (assuming log_activity function exists)
+            log_activity(selected_store, vendor, len(jc_df), len(changes))
             
-            def clean_and_format_upc(u):
-                s = str(u).replace('=', '').replace('"', '').strip()
-                return f'="{s}"'
-
-            raw_upc = final_check["Resolved_UPC"].astype(str)
-            pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+            ready_for_pos = False
+            edited_changes = None
             
-            # Map JC Sales Cost and Pack directly into the POS update
-            pos_out["cost_cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
-            pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
-            
-            # Keep other metadata from the pricebook
-            for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
-                if col in final_check.columns:
-                    pos_out[col] = final_check[col]
-                else:
-                    pos_out[col] = "" 
+            if not changes.empty:
+                st.error(f"{len(changes)} Cost Changes Detected")
+                st.write("**Edit the 'New Price' column to set a custom retail price.**")
+                
+                display_changes = pd.DataFrame()
+                display_changes["Barcode"] = changes["Resolved_UPC"]
+                display_changes["Item"] = changes["DESCRIPTION"]
+                display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
+                display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
+                display_changes["New Price"] = None
+                
+                edited_changes = st.data_editor(
+                    display_changes,
+                    column_config={
+                        "Barcode": st.column_config.TextColumn(disabled=True),
+                        "Item": st.column_config.TextColumn(disabled=True),
+                        "Old Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                        "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                        "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                st.divider()
+                st.caption("When you are finished entering prices, click confirm to build your POS update.")
+                if st.button("Confirm Prices & Generate POS", type="primary"):
+                    st.session_state["jc_pos_ready"] = True
+                    st.session_state["jc_edited_changes"] = edited_changes
+                    st.session_state["jc_final_check"] = final_check
                     
-            final_pos_out = pos_out[pos_cols].copy()
-            
-            st.dataframe(final_pos_out, use_container_width=True)
-            
-            st.download_button(
-                "⬇️ Download POS Update CSV", 
-                to_csv_bytes(final_pos_out), 
-                f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                "text/csv"
-            )
+                if st.session_state.get("jc_pos_ready"):
+                    st.success("Prices confirmed! Ready for download.")
+                    ready_for_pos = True
+                    edited_changes = st.session_state["jc_edited_changes"]
+                    final_check = st.session_state["jc_final_check"]
+            else:
+                st.success("All mapped items match Pricebook costs.")
+                ready_for_pos = True
+                
+            # ==========================================
+            # GENERATE POS UPDATE
+            # ==========================================
+            if ready_for_pos:
+                st.divider()
+                st.subheader("POS Update File")
+                
+                pos_cols = [
+                    "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
+                    "Name", "size", "ebt", "byweight", "Fee Multiplier", 
+                    "cost_qty", "cost_cents", "addstock"
+                ]
+                
+                pos_out = pd.DataFrame()
+                
+                def clean_and_format_upc(u):
+                    s = str(u).replace('=', '').replace('"', '').strip()
+                    return f'="{s}"'
+
+                raw_upc = final_check["Resolved_UPC"].astype(str)
+                pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+                
+                pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
+                pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
+                pos_out["addstock"] = 0 # JC Sales typically acts as a catalog, not stock receipt
+                
+                user_prices = {}
+                if edited_changes is not None and "New Price" in edited_changes.columns:
+                    priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
+                    user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
+
+                final_check["User_New_Price"] = final_check["Resolved_UPC"].map(user_prices)
+
+                # Keep other metadata from the pricebook and override cents if new price set
+                for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
+                    if col == "cents":
+                        base_cents = pd.to_numeric(final_check["cents"], errors='coerce').fillna(0).astype(int)
+                        mask = final_check["User_New_Price"].notna()
+                        base_cents[mask] = (final_check.loc[mask, "User_New_Price"] * 100).astype(int)
+                        pos_out["cents"] = base_cents
+                    elif col in final_check.columns:
+                        pos_out[col] = final_check[col]
+                    else:
+                        pos_out[col] = "" 
+                        
+                final_pos_out = pos_out[pos_cols].copy()
+                
+                num_price_updates = 0
+                if "User_New_Price" in final_check.columns:
+                    num_price_updates = (final_check["User_New_Price"] > 0).sum()
+                    
+                st.caption(f"Ready to update costs for {len(final_pos_out)} items and update price for {num_price_updates} items.")
+                
+                st.download_button(
+                    "⬇️ Download POS Update CSV", 
+                    to_csv_bytes(final_pos_out), 
+                    f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                    "text/csv"
+                )
    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
