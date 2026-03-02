@@ -739,139 +739,132 @@ with tab_invoice:
             raw_items_to_scrape = list(set(list(missing_items_list) + list(mismatched_items_list)))
             items_to_scrape = [i for i in raw_items_to_scrape if i not in st.session_state["ignore_scrape"]]
             
-            if items_to_scrape:
+                        if items_to_scrape:
                 scrape_hash = "_".join(sorted(items_to_scrape))
-                
+
                 # Only run the scraper once per unique batch so we don't spam the website
                 if st.session_state.get("last_scrape_hash") != scrape_hash:
-                    
-                    # --- NEW: Live Progress UI ---
-                    st.write(f"### 🤖 Auto-Scraping {len(items_to_scrape)} Items")
+                    st.write(f"### Auto-Scraping {len(items_to_scrape)} Items")
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    
+
                     import requests
                     from bs4 import BeautifulSoup
-                    import time 
-                    
+                    import time
+                    from urllib.parse import urljoin
+
                     potential_matches = []
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Referer": "https://www.jcsalesweb.com/"
-}
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Referer": "https://www.jcsalesweb.com/",
+                    }
 
-def scrape_jcsales_best_upc(item_num):
-    item_num_str = re.sub(r"\.0$", "", str(item_num).strip())
+                    def scrape_jcsales_best_upc(item_num, pb_upcs):
+                        item_num_str = str(item_num).strip()
+                        item_num_str = re.sub(r"\.0$", "", item_num_str)
 
-    search_url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num_str}"
-    resp = requests.get(search_url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        return None, []
+                        search_url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num_str}"
+                        resp = requests.get(search_url, headers=headers, timeout=15)
+                        if resp.status_code != 200:
+                            return None, []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+                        soup = BeautifulSoup(resp.text, "html.parser")
 
-    product_link = None
-    pattern = re.compile(rf"Item No:\s*{re.escape(item_num_str)}", re.IGNORECASE)
-    item_label = soup.find(string=pattern)
+                        product_link = None
+                        pattern = re.compile(rf"Item No:\s*{re.escape(item_num_str)}", re.IGNORECASE)
+                        item_label = soup.find(string=pattern)
 
-    if item_label:
-        parent = item_label.parent
-        for _ in range(6):
-            if not parent:
-                break
+                        if item_label:
+                            parent = item_label.parent
+                            for _ in range(6):
+                                if not parent:
+                                    break
 
-            if parent.name == "a" and parent.get("href") and "/Catalog/Product/" in parent["href"]:
-                product_link = parent["href"]
-                break
+                                if parent.name == "a" and parent.get("href") and "/Catalog/Product/" in parent["href"]:
+                                    product_link = parent["href"]
+                                    break
 
-            link_in_parent = parent.find("a", href=True)
-            if link_in_parent and "/Catalog/Product/" in link_in_parent["href"]:
-                product_link = link_in_parent["href"]
-                break
+                                link_in_parent = parent.find("a", href=True)
+                                if link_in_parent and "/Catalog/Product/" in link_in_parent["href"]:
+                                    product_link = link_in_parent["href"]
+                                    break
 
-            parent = parent.parent
+                                parent = parent.parent
 
-    if not product_link:
-        return None, []
+                        if not product_link:
+                            return None, []
 
-    if not product_link.startswith("http"):
-        product_link = "https://www.jcsalesweb.com" + product_link
+                        product_url = urljoin("https://www.jcsalesweb.com", product_link)
+                        prod_resp = requests.get(product_url, headers=headers, timeout=15)
+                        if prod_resp.status_code != 200:
+                            return None, []
 
-    prod_resp = requests.get(product_link, headers=headers, timeout=15)
-    if prod_resp.status_code != 200:
-        return None, []
+                        prod_soup = BeautifulSoup(prod_resp.text, "html.parser")
+                        barcode_nodes = prod_soup.find_all(string=re.compile(r"Barcode:", re.IGNORECASE))
 
-    prod_soup = BeautifulSoup(prod_resp.text, "html.parser")
+                        barcodes = []
+                        for node in barcode_nodes:
+                            parent_text = node.parent.get_text(" ", strip=True) if node.parent else str(node)
+                            clean_text = re.sub(r"^.*?Barcode:\s*", "", parent_text, flags=re.IGNORECASE).strip()
 
-    barcode_labels = prod_soup.find_all(string=re.compile(r"Barcode:", re.IGNORECASE))
+                            for code in clean_text.split(","):
+                                norm = _norm_upc_12(code)
+                                if norm and norm not in barcodes:
+                                    barcodes.append(norm)
 
-    barcodes = []
-    for label in barcode_labels:
-        text = label.parent.get_text(" ", strip=True) if label.parent else str(label)
-        clean_text = re.sub(r"^.*?Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
+                            if barcodes:
+                                break
 
-        if clean_text:
-            found_codes = [c.strip() for c in clean_text.split(",") if c.strip()]
-            for code in found_codes:
-                norm_code = _norm_upc_12(code)
-                if norm_code and norm_code not in barcodes:
-                    barcodes.append(norm_code)
+                        if not barcodes:
+                            return None, []
 
-            if barcodes:
-                break
+                        best_upc = next((code for code in barcodes if code in pb_upcs), None)
+                        if not best_upc:
+                            best_upc = barcodes[0]
 
-    if not barcodes:
-        return None, []
+                        return best_upc, barcodes[:6]
 
-    best_upc = next((code for code in barcodes if code in pb_upcs), None)
-    if not best_upc:
-        best_upc = barcodes[0]
+                    for i, item_num in enumerate(items_to_scrape):
+                        item_num_str = re.sub(r"\.0$", "", str(item_num).strip())
+                        status_text.info(f"🔎 Searching {i+1}/{len(items_to_scrape)}: Item **{item_num_str}**...")
 
-    return best_upc, barcodes[:6]
+                        try:
+                            best_upc, found_barcodes = scrape_jcsales_best_upc(item_num_str, pb_upcs)
 
-for i, item_num in enumerate(items_to_scrape):
-    item_num_str = re.sub(r"\.0$", "", str(item_num).strip())
-    status_text.info(f"🔎 Searching {i+1}/{len(items_to_scrape)}: Item **{item_num_str}**...")
+                            if best_upc:
+                                row_match = jc_df[jc_df["ITEM_str"].astype(str).str.strip() == item_num_str]
+                                if row_match.empty:
+                                    status_text.warning(f"⚠️ Found UPC for {item_num_str}, but could not find invoice row.")
+                                else:
+                                    row_data = row_match.iloc[0]
+                                    potential_matches.append({
+                                        "Confirm": True,
+                                        "ITEM": item_num_str,
+                                        "Found UPC": best_upc,
+                                        "Invoice Desc": row_data["DESCRIPTION"],
+                                        "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
+                                        "PACK": row_data["PACK"],
+                                        "COST": row_data["COST"]
+                                    })
+                                    status_text.success(f"✅ Found UPC for **{item_num_str}**")
+                            else:
+                                status_text.error(f"❌ No barcodes found for **{item_num_str}**")
 
-    try:
-        best_upc, found_barcodes = scrape_jcsales_best_upc(item_num_str)
+                        except requests.exceptions.Timeout:
+                            status_text.error(f"⏳ Timeout: JC Sales website is too slow for item **{item_num_str}**.")
+                        except Exception as e:
+                            status_text.error(f"⚠️ Error scraping **{item_num_str}**: {e}")
 
-        if best_upc:
-            row_match = jc_df[jc_df["ITEM_str"].astype(str).str.strip() == item_num_str]
-            if row_match.empty:
-                status_text.warning(f"⚠️ Found UPC for {item_num_str}, but could not find invoice row.")
-            else:
-                row_data = row_match.iloc[0]
-                potential_matches.append({
-                    "Confirm": True,
-                    "ITEM": item_num_str,
-                    "Found UPC": best_upc,
-                    "Invoice Desc": row_data["DESCRIPTION"],
-                    "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
-                    "PACK": row_data["PACK"],
-                    "COST": row_data["COST"]
-                })
-                status_text.success(f"✅ Found UPC for **{item_num_str}**")
-        else:
-            status_text.error(f"❌ No barcodes found for **{item_num_str}**")
+                        progress_bar.progress((i + 1) / len(items_to_scrape))
+                        time.sleep(1.5)
 
-    except requests.exceptions.Timeout:
-        status_text.error(f"⏳ Timeout: JC Sales website is too slow for item **{item_num_str}**.")
-    except Exception as e:
-        status_text.error(f"⚠️ Error scraping **{item_num_str}**: {e}")
-
-    progress_bar.progress((i + 1) / len(items_to_scrape))
-    time.sleep(1.5)
-                            
                     status_text.info("✨ Scraping complete! Preparing review board...")
                     time.sleep(1)
-                    
                     st.session_state["scraped_matches"] = potential_matches
                     st.session_state["last_scrape_hash"] = scrape_hash
-                    
-                    # Hide the progress UI before showing the review board
+
                     status_text.empty()
                     progress_bar.empty()
 
