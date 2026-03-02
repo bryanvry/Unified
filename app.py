@@ -771,10 +771,17 @@ with tab_invoice:
                 
                 final_check = valid_inv.merge(pb_df, left_on="Resolved_UPC", right_on="_norm_upc", how="left")
                 
-                # --- DETECT COST CHANGES ---
-                final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
-                final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors="coerce").fillna(0).astype(int)
-                final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
+                # --- DETECT COST CHANGES (UNIT VS UNIT) ---
+                # 1. Invoice Unit Cost
+                final_check["Inv_Unit_Cents"] = (pd.to_numeric(final_check["UNIT"], errors="coerce").fillna(0) * 100).round().astype(int)
+                
+                # 2. Pricebook Unit Cost (Safe division)
+                safe_pb_qty = pd.to_numeric(final_check["cost_qty"], errors="coerce").fillna(1).replace(0, 1)
+                pb_cost_cents = pd.to_numeric(final_check["cost_cents"], errors="coerce").fillna(0)
+                final_check["PB_Unit_Cents"] = (pb_cost_cents / safe_pb_qty).round().astype(int)
+                
+                # 3. Compare Unit Costs
+                final_check["Diff"] = final_check["Inv_Unit_Cents"] - final_check["PB_Unit_Cents"]
                 
                 changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 
@@ -785,23 +792,26 @@ with tab_invoice:
                 edited_changes = None
                 
                 if not changes.empty:
-                    st.error(f"{len(changes)} Cost Changes Detected")
+                    st.error(f"{len(changes)} Unit Cost Changes Detected")
                     st.write("**Edit the 'New Price' column to set a custom retail price.**")
                     
                     display_changes = pd.DataFrame()
+                    # Added Item Number column first!
+                    display_changes["Item Number"] = changes["ITEM_str"] 
                     display_changes["Barcode"] = changes["Resolved_UPC"]
                     display_changes["Item"] = changes["DESCRIPTION"]
-                    display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
-                    display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
+                    display_changes["Old Unit Cost"] = changes["PB_Unit_Cents"] / 100.0
+                    display_changes["New Unit Cost"] = changes["Inv_Unit_Cents"] / 100.0
                     display_changes["New Price"] = None
                     
                     edited_changes = st.data_editor(
                         display_changes,
                         column_config={
+                            "Item Number": st.column_config.TextColumn(disabled=True),
                             "Barcode": st.column_config.TextColumn(disabled=True),
                             "Item": st.column_config.TextColumn(disabled=True),
-                            "Old Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                            "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "New Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
                         use_container_width=True,
@@ -846,9 +856,10 @@ with tab_invoice:
                     raw_upc = final_check["Resolved_UPC"].astype(str)
                     pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
                     
-                    pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
-                    pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
-                    pos_out["addstock"] = 0 # JC Sales typically acts as a catalog, not stock receipt
+                    # Force POS to use UNIT cost and a cost_qty of 1
+                    pos_out["cost_cents"] = final_check["Inv_Unit_Cents"]
+                    pos_out["cost_qty"] = 1
+                    pos_out["addstock"] = 0 
                     
                     user_prices = {}
                     if edited_changes is not None and "New Price" in edited_changes.columns:
