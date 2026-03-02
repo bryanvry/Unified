@@ -839,12 +839,14 @@ with tab_invoice:
                                     status_text.warning(f"⚠️ Found UPC for {item_num_str}, but could not find invoice row.")
                                 else:
                                     row_data = row_match.iloc[0]
+                                    pricebook_name = pb_names.get(best_upc, "⚠️ Not in Pricebook")
+
                                     potential_matches.append({
-                                        "Confirm": True,
+                                        "Confirm": pricebook_name != "⚠️ Not in Pricebook",
                                         "ITEM": item_num_str,
                                         "Found UPC": best_upc,
                                         "Invoice Desc": row_data["DESCRIPTION"],
-                                        "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
+                                        "Pricebook Name": pricebook_name,
                                         "PACK": row_data["PACK"],
                                         "COST": row_data["COST"]
                                     })
