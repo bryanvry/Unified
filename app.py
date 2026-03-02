@@ -710,12 +710,13 @@ with tab_invoice:
                         st.rerun()
                     else:
                         st.error("Please enter at least one UPC1 to save.")
-                st.stop() # Pause everything until they fix the missing items!
                 
             # ==========================================
             # POPUP 2: NO MATCH (UPC NOT IN PRICEBOOK)
             # ==========================================
-            mapped_inv = jc_df.merge(jc_key, left_on="ITEM_str", right_on="ITEM_str", how="left", suffixes=("", "_db"))
+            # Only attempt to merge and resolve items that actually exist in the DB
+            db_matched_df = jc_df[jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
+            mapped_inv = db_matched_df.merge(jc_key, left_on="ITEM_str", right_on="ITEM_str", how="left", suffixes=("", "_db"))
             pb_upcs = set(pb_df["_norm_upc"])
             
             def resolve_upc(row):
@@ -756,127 +757,132 @@ with tab_invoice:
                         st.rerun()
                     else:
                         st.error("No corrections were entered.")
-                st.stop() # Pause everything until they fix the mappings!
                 
             # ==========================================
             # ALL ITEMS MATCHED: GENERATE POS
             # ==========================================
-            st.success(f"✅ All {len(mapped_inv)} items successfully mapped to the {PRICEBOOK_TABLE}!")
+            # Filter to ONLY items that perfectly resolved so the POS block doesn't crash
+            valid_inv = mapped_inv[mapped_inv["Resolved_UPC"].notna()].copy()
             
-            final_check = mapped_inv.merge(pb_df, left_on="Resolved_UPC", right_on="_norm_upc", how="left")
-            
-            # --- DETECT COST CHANGES ---
-            final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
-            final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors="coerce").fillna(0).astype(int)
-            final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
-            
-            changes = final_check[abs(final_check["Diff"]) > 1].copy()
-            
-            # Log activity (assuming log_activity function exists)
-            log_activity(selected_store, vendor, len(jc_df), len(changes))
-            
-            ready_for_pos = False
-            edited_changes = None
-            
-            if not changes.empty:
-                st.error(f"{len(changes)} Cost Changes Detected")
-                st.write("**Edit the 'New Price' column to set a custom retail price.**")
-                
-                display_changes = pd.DataFrame()
-                display_changes["Barcode"] = changes["Resolved_UPC"]
-                display_changes["Item"] = changes["DESCRIPTION"]
-                display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
-                display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
-                display_changes["New Price"] = None
-                
-                edited_changes = st.data_editor(
-                    display_changes,
-                    column_config={
-                        "Barcode": st.column_config.TextColumn(disabled=True),
-                        "Item": st.column_config.TextColumn(disabled=True),
-                        "Old Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                        "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                        "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
-                    },
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                st.divider()
-                st.caption("When you are finished entering prices, click confirm to build your POS update.")
-                if st.button("Confirm Prices & Generate POS", type="primary"):
-                    st.session_state["jc_pos_ready"] = True
-                    st.session_state["jc_edited_changes"] = edited_changes
-                    st.session_state["jc_final_check"] = final_check
-                    
-                if st.session_state.get("jc_pos_ready"):
-                    st.success("Prices confirmed! Ready for download.")
-                    ready_for_pos = True
-                    edited_changes = st.session_state["jc_edited_changes"]
-                    final_check = st.session_state["jc_final_check"]
+            if valid_inv.empty:
+                st.warning("Waiting for missing items to be mapped...")
             else:
-                st.success("All mapped items match Pricebook costs.")
-                ready_for_pos = True
+                st.success(f"✅ {len(valid_inv)} items successfully mapped to the {PRICEBOOK_TABLE}!")
                 
-            # ==========================================
-            # GENERATE POS UPDATE
-            # ==========================================
-            if ready_for_pos:
-                st.divider()
-                st.subheader("POS Update File")
+                final_check = valid_inv.merge(pb_df, left_on="Resolved_UPC", right_on="_norm_upc", how="left")
                 
-                pos_cols = [
-                    "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
-                    "Name", "size", "ebt", "byweight", "Fee Multiplier", 
-                    "cost_qty", "cost_cents", "addstock"
-                ]
+                # --- DETECT COST CHANGES ---
+                final_check["Inv_Cost_Cents"] = (pd.to_numeric(final_check["COST"], errors="coerce").fillna(0) * 100).astype(int)
+                final_check["PB_Cost_Cents"] = pd.to_numeric(final_check["cost_cents"], errors="coerce").fillna(0).astype(int)
+                final_check["Diff"] = final_check["Inv_Cost_Cents"] - final_check["PB_Cost_Cents"]
                 
-                pos_out = pd.DataFrame()
+                changes = final_check[abs(final_check["Diff"]) > 1].copy()
                 
-                def clean_and_format_upc(u):
-                    s = str(u).replace('=', '').replace('"', '').strip()
-                    return f'="{s}"'
-
-                raw_upc = final_check["Resolved_UPC"].astype(str)
-                pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+                # Log activity
+                log_activity(selected_store, vendor, len(jc_df), len(changes))
                 
-                pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
-                pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
-                pos_out["addstock"] = 0 # JC Sales typically acts as a catalog, not stock receipt
+                ready_for_pos = False
+                edited_changes = None
                 
-                user_prices = {}
-                if edited_changes is not None and "New Price" in edited_changes.columns:
-                    priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
-                    user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
-
-                final_check["User_New_Price"] = final_check["Resolved_UPC"].map(user_prices)
-
-                # Keep other metadata from the pricebook and override cents if new price set
-                for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
-                    if col == "cents":
-                        base_cents = pd.to_numeric(final_check["cents"], errors='coerce').fillna(0).astype(int)
-                        mask = final_check["User_New_Price"].notna()
-                        base_cents[mask] = (final_check.loc[mask, "User_New_Price"] * 100).astype(int)
-                        pos_out["cents"] = base_cents
-                    elif col in final_check.columns:
-                        pos_out[col] = final_check[col]
-                    else:
-                        pos_out[col] = "" 
-                        
-                final_pos_out = pos_out[pos_cols].copy()
-                
-                num_price_updates = 0
-                if "User_New_Price" in final_check.columns:
-                    num_price_updates = (final_check["User_New_Price"] > 0).sum()
+                if not changes.empty:
+                    st.error(f"{len(changes)} Cost Changes Detected")
+                    st.write("**Edit the 'New Price' column to set a custom retail price.**")
                     
-                st.caption(f"Ready to update costs for {len(final_pos_out)} items and update price for {num_price_updates} items.")
-                
-                st.download_button(
-                    "⬇️ Download POS Update CSV", 
-                    to_csv_bytes(final_pos_out), 
-                    f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                    "text/csv"
-                )
+                    display_changes = pd.DataFrame()
+                    display_changes["Barcode"] = changes["Resolved_UPC"]
+                    display_changes["Item"] = changes["DESCRIPTION"]
+                    display_changes["Old Cost"] = changes["PB_Cost_Cents"] / 100.0
+                    display_changes["New Cost"] = changes["Inv_Cost_Cents"] / 100.0
+                    display_changes["New Price"] = None
+                    
+                    edited_changes = st.data_editor(
+                        display_changes,
+                        column_config={
+                            "Barcode": st.column_config.TextColumn(disabled=True),
+                            "Item": st.column_config.TextColumn(disabled=True),
+                            "Old Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    st.divider()
+                    st.caption("When you are finished entering prices, click confirm to build your POS update.")
+                    if st.button("Confirm Prices & Generate POS", type="primary"):
+                        st.session_state["jc_pos_ready"] = True
+                        st.session_state["jc_edited_changes"] = edited_changes
+                        st.session_state["jc_final_check"] = final_check
+                        
+                    if st.session_state.get("jc_pos_ready"):
+                        st.success("Prices confirmed! Ready for download.")
+                        ready_for_pos = True
+                        edited_changes = st.session_state["jc_edited_changes"]
+                        final_check = st.session_state["jc_final_check"]
+                else:
+                    st.success("All mapped items match Pricebook costs.")
+                    ready_for_pos = True
+                    
+                # ==========================================
+                # GENERATE POS UPDATE
+                # ==========================================
+                if ready_for_pos:
+                    st.divider()
+                    st.subheader("POS Update File")
+                    
+                    pos_cols = [
+                        "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
+                        "Name", "size", "ebt", "byweight", "Fee Multiplier", 
+                        "cost_qty", "cost_cents", "addstock"
+                    ]
+                    
+                    pos_out = pd.DataFrame()
+                    
+                    def clean_and_format_upc(u):
+                        s = str(u).replace('=', '').replace('"', '').strip()
+                        return f'="{s}"'
+
+                    raw_upc = final_check["Resolved_UPC"].astype(str)
+                    pos_out["Upc"] = raw_upc.apply(clean_and_format_upc)
+                    
+                    pos_out["cost_cents"] = final_check["Inv_Cost_Cents"]
+                    pos_out["cost_qty"] = pd.to_numeric(final_check["PACK"], errors='coerce').fillna(1).astype(int)
+                    pos_out["addstock"] = 0 # JC Sales typically acts as a catalog, not stock receipt
+                    
+                    user_prices = {}
+                    if edited_changes is not None and "New Price" in edited_changes.columns:
+                        priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
+                        user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
+
+                    final_check["User_New_Price"] = final_check["Resolved_UPC"].map(user_prices)
+
+                    # Keep other metadata from the pricebook and override cents if new price set
+                    for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
+                        if col == "cents":
+                            base_cents = pd.to_numeric(final_check["cents"], errors='coerce').fillna(0).astype(int)
+                            mask = final_check["User_New_Price"].notna()
+                            base_cents[mask] = (final_check.loc[mask, "User_New_Price"] * 100).astype(int)
+                            pos_out["cents"] = base_cents
+                        elif col in final_check.columns:
+                            pos_out[col] = final_check[col]
+                        else:
+                            pos_out[col] = "" 
+                            
+                    final_pos_out = pos_out[pos_cols].copy()
+                    
+                    num_price_updates = 0
+                    if "User_New_Price" in final_check.columns:
+                        num_price_updates = (final_check["User_New_Price"] > 0).sum()
+                        
+                    st.caption(f"Ready to update costs for {len(final_pos_out)} items and update price for {num_price_updates} items.")
+                    
+                    st.download_button(
+                        "⬇️ Download POS Update CSV", 
+                        to_csv_bytes(final_pos_out), 
+                        f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                        "text/csv"
+                    )
    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
