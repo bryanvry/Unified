@@ -898,6 +898,59 @@ with tab_invoice:
                         f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
                         "text/csv"
                     )
+
+                # ==========================================
+                # ALL ITEMS REVIEW TABLE (HIDDEN EXPANDER)
+                # ==========================================
+                st.divider()
+                with st.expander("👀 View All Invoice Items & Retail Math"):
+                    review_df = jc_df.copy()
+                    
+                    # 1. Map to jc_key to get potential UPCs
+                    review_merged = review_df.merge(jc_key, on="ITEM_str", how="left", suffixes=("", "_db"))
+                    
+                    # 2. Resolve UPC against Pricebook to get "Now" or "No Match"
+                    pb_upcs = set(pb_df["_norm_upc"])
+                    pb_now_map = dict(zip(pb_df["_norm_upc"], pd.to_numeric(pb_df["cents"], errors="coerce").fillna(0) / 100.0))
+                    
+                    def get_display_upc_and_now(row):
+                        # If not in jc_key (UPC1 is NaN because of left merge)
+                        if pd.isna(row.get("UPC1")): 
+                            return "", None
+                            
+                        u1 = _norm_upc_12(row.get("UPC1", ""))
+                        u2 = _norm_upc_12(row.get("UPC2", ""))
+                        
+                        if u1 and u1 in pb_upcs: return u1, pb_now_map.get(u1, None)
+                        if u2 and u2 in pb_upcs: return u2, pb_now_map.get(u2, None)
+                        
+                        return "No Match", None
+
+                    # Apply the logic to build the UPC and Now columns
+                    upc_now = review_merged.apply(get_display_upc_and_now, axis=1, result_type="expand")
+                    
+                    # 3. Build the final clean dataframe
+                    review_final = pd.DataFrame()
+                    review_final["Item Number"] = review_merged["ITEM_str"]
+                    review_final["Upc"] = upc_now[0]
+                    review_final["Description"] = review_merged["DESCRIPTION"]
+                    review_final["Unit"] = pd.to_numeric(review_merged["UNIT"], errors="coerce")
+                    review_final["Now"] = upc_now[1]
+                    review_final["Retail"] = review_final["Unit"] * 2
+                    
+                    st.dataframe(
+                        review_final,
+                        column_config={
+                            "Item Number": st.column_config.TextColumn("Item Number"),
+                            "Upc": st.column_config.TextColumn("UPC"),
+                            "Description": st.column_config.TextColumn("Description"),
+                            "Unit": st.column_config.NumberColumn("Unit ($)", format="$%.2f"),
+                            "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f"),
+                            "Retail": st.column_config.NumberColumn("Retail ($)", format="$%.2f")
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
    # --- SG / NV / Breakthru ---
     elif vendor in ["Southern Glazer's", "Nevada Beverage", "Breakthru"]:
         st.info(f"Using **BeerandLiquorKey** Map + **{PRICEBOOK_TABLE}**")
