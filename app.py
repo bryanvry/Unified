@@ -796,12 +796,15 @@ with tab_invoice:
                     st.write("**Edit the 'New Price' column to set a custom retail price.**")
                     
                     display_changes = pd.DataFrame()
-                    # Added Item Number column first!
                     display_changes["Item Number"] = changes["ITEM_str"] 
                     display_changes["Barcode"] = changes["Resolved_UPC"]
                     display_changes["Item"] = changes["DESCRIPTION"]
                     display_changes["Old Unit Cost"] = changes["PB_Unit_Cents"] / 100.0
                     display_changes["New Unit Cost"] = changes["Inv_Unit_Cents"] / 100.0
+                    
+                    # --- NEW: Grab the current retail price from the pricebook! ---
+                    display_changes["Now"] = pd.to_numeric(changes["cents"], errors="coerce").fillna(0) / 100.0
+                    
                     display_changes["New Price"] = None
                     
                     edited_changes = st.data_editor(
@@ -812,6 +815,7 @@ with tab_invoice:
                             "Item": st.column_config.TextColumn(disabled=True),
                             "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
                             "New Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                            "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f", disabled=True),
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
                         use_container_width=True,
