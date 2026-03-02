@@ -62,16 +62,29 @@ if not st.session_state["authenticated"]:
 # ==============================================================================
 
 # --- GLOBAL HELPERS ---
-def _norm_upc_12(u: str) -> str:
-    """Standardize UPC to 12 digits for DB lookups."""
-    s = str(u or "").strip().replace("-", "").replace(" ", "")
+def _norm_upc_12(u) -> str:
+    """Standardize UPC to 12 or 13 digits for DB lookups."""
+    if pd.isna(u): return ""
+    s = str(u).strip()
     s = "".join(ch for ch in s if ch.isdigit())
+    if not s: return ""
+    
+    # 1. Strip excess leading zeros from 14-digit GTINs
+    while len(s) > 13 and s.startswith("0"):
+        s = s[1:]
+        
+    # 2. If it is 13 digits starting with 0, it's a padded UPC-A. Drop the 0.
     if len(s) == 13 and s.startswith("0"):
         s = s[1:]
-    if len(s) > 12:
-        s = s[-12:]
+        
+    # 3. If it's a true EAN-13 (13 digits, no leading zero), keep all 13!
+    if len(s) > 13:
+        s = s[-13:]
+        
+    # 4. If it's under 12 digits, pad it up to 12.
     if len(s) < 12:
         s = s.zfill(12)
+        
     return s
 
 def to_csv_bytes(df):
@@ -407,12 +420,26 @@ with tab_order:
 # ==============================================================================
 with tab_invoice:
     # Helper to normalize UPCs to 12 digits (for matching)
+    # Helper to normalize UPCs to 12 or 13 digits (for matching)
     def _norm_upc_12(u):
         if pd.isna(u): return ""
         s = str(u).strip()
-        digits = "".join(filter(str.isdigit, s))
-        if not digits: return ""
-        return digits[-12:].zfill(12) if len(digits) > 0 else ""
+        s = "".join(ch for ch in s if ch.isdigit())
+        if not s: return ""
+        
+        while len(s) > 13 and s.startswith("0"):
+            s = s[1:]
+            
+        if len(s) == 13 and s.startswith("0"):
+            s = s[1:]
+            
+        if len(s) > 13:
+            s = s[-13:]
+            
+        if len(s) < 12:
+            s = s.zfill(12)
+            
+        return s
 
     vendor_options = ["Unified", "JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"]
     vendor = st.selectbox("Select Vendor", vendor_options)
@@ -696,7 +723,12 @@ with tab_invoice:
             def has_valid_upc(row):
                 u1 = _norm_upc_12(row.get("UPC1", ""))
                 u2 = _norm_upc_12(row.get("UPC2", ""))
-                return (u1 and u1 in pb_upcs) or (u2 and u2 in pb_upcs)
+                
+                # Force strictly True or False
+                valid_u1 = bool(u1 and u1 in pb_upcs)
+                valid_u2 = bool(u2 and u2 in pb_upcs)
+                
+                return valid_u1 or valid_u2
                 
             if not pre_mapped.empty:
                 pre_mapped["Valid"] = pre_mapped.apply(has_valid_upc, axis=1)
