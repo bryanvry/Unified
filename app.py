@@ -903,7 +903,7 @@ with tab_invoice:
                 # ALL ITEMS REVIEW TABLE (HIDDEN EXPANDER)
                 # ==========================================
                 st.divider()
-                with st.expander("👀 View All Invoice Items & Retail Math"):
+                with st.expander("View All Invoice Items & Retail Math"):
                     review_df = jc_df.copy()
                     
                     # 1. Map to jc_key to get potential UPCs
