@@ -754,10 +754,11 @@ with tab_invoice:
                         for item_num in items_to_scrape:
                             try:
                                 url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
-                                resp = requests.get(url, headers=headers, timeout=5)
+                                resp = requests.get(url, headers=headers, timeout=10) # Bumped timeout to be safe
                                 soup = BeautifulSoup(resp.content, "html.parser")
                                 
                                 best_upc = None
+                                fallback_upc = None
                                 barcode_labels = soup.find_all("span", class_="barcode-list")
                                 
                                 # Just grab the first barcode list found on the page!
@@ -768,11 +769,23 @@ with tab_invoice:
                                     
                                     if clean_text:
                                         found_codes = [c.strip() for c in clean_text.split(',')]
+                                        
                                         for code in found_codes:
                                             norm_code = _norm_upc_12(code)
+                                            
+                                            # Prefer a 12 or 13 digit barcode as the fallback 
+                                            # (this prevents it from accidentally picking the short item number)
+                                            if fallback_upc is None and len(norm_code) >= 12:
+                                                fallback_upc = norm_code
+                                                
+                                            # If it perfectly matches the Pricebook, this is the absolute winner!
                                             if norm_code in pb_upcs:
                                                 best_upc = norm_code
                                                 break
+                                                
+                                        # If it didn't find a perfect pricebook match, show the best fallback we have!
+                                        if not best_upc:
+                                            best_upc = fallback_upc if fallback_upc else _norm_upc_12(found_codes[0])
                                                 
                                 if best_upc:
                                     row_data = jc_df[jc_df["ITEM_str"] == item_num].iloc[0]
@@ -781,12 +794,13 @@ with tab_invoice:
                                         "ITEM": item_num,
                                         "Found UPC": best_upc,
                                         "Invoice Desc": row_data["DESCRIPTION"],
-                                        "Pricebook Name": pb_names.get(best_upc, "Unknown"),
+                                        # Show a warning if it scraped successfully but isn't in your PB
+                                        "Pricebook Name": pb_names.get(best_upc, "⚠️ Not in Pricebook"),
                                         "PACK": row_data["PACK"],
                                         "COST": row_data["COST"]
                                     })
                             except Exception as e:
-                                pass 
+                                pass
                                 
                         st.session_state["scraped_matches"] = potential_matches
                         st.session_state["last_scrape_hash"] = scrape_hash
