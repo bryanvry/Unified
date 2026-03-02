@@ -739,7 +739,7 @@ with tab_invoice:
             raw_items_to_scrape = list(set(list(missing_items_list) + list(mismatched_items_list)))
             items_to_scrape = [i for i in raw_items_to_scrape if i not in st.session_state["ignore_scrape"]]
             
-                        if items_to_scrape:
+            if items_to_scrape:
                 scrape_hash = "_".join(sorted(items_to_scrape))
 
                 # Only run the scraper once per unique batch so we don't spam the website
