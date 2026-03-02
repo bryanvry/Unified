@@ -709,131 +709,6 @@ with tab_invoice:
             jc_key["ITEM_str"] = jc_key["ITEM"].astype(str).str.strip()
 
             # ==========================================
-            # 🤖 AUTO-SCRAPER ENGINE
-            # ==========================================
-            pb_upcs = set(pb_df["_norm_upc"])
-            
-            # 1. Find items missing from DB entirely
-            missing_items_list = jc_df[~jc_df["ITEM_str"].isin(jc_key["ITEM_str"])]["ITEM_str"].unique()
-            
-            # 2. Find items in DB, but mapping is bad ("No Match")
-            db_matched_pre = jc_df[jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
-            pre_mapped = db_matched_pre.merge(jc_key, on="ITEM_str", how="left")
-            
-            def has_valid_upc(row):
-                u1 = _norm_upc_12(row.get("UPC1", ""))
-                u2 = _norm_upc_12(row.get("UPC2", ""))
-                
-                # Force strictly True or False
-                valid_u1 = bool(u1 and u1 in pb_upcs)
-                valid_u2 = bool(u2 and u2 in pb_upcs)
-                
-                return valid_u1 or valid_u2
-                
-            if not pre_mapped.empty:
-                pre_mapped["Valid"] = pre_mapped.apply(has_valid_upc, axis=1)
-                mismatched_items_list = pre_mapped[~pre_mapped["Valid"]]["ITEM_str"].unique()
-            else:
-                mismatched_items_list = []
-            
-            items_to_scrape = list(set(list(missing_items_list) + list(mismatched_items_list)))
-            
-            if items_to_scrape:
-                with st.spinner(f"🤖 Auto-Scraping JCSalesWeb to find barcodes for {len(items_to_scrape)} unmatched items..."):
-                    import requests
-                    from bs4 import BeautifulSoup
-                    
-                    new_db_rows = []
-                    update_db_rows = []
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-                    
-                    for item_num in items_to_scrape:
-                        try:
-                            url = f"https://www.jcsalesweb.com/Catalog/Search?query={item_num}"
-                            resp = requests.get(url, headers=headers, timeout=5)
-                            soup = BeautifulSoup(resp.content, "html.parser")
-                            
-                            best_upc = None
-                            
-                            # --- STRATEGY 1: Anchor on the Item Number first ---
-                            # Find all text on the page that matches the exact item number
-                            matching_text_nodes = soup.find_all(string=re.compile(rf"\b{item_num}\b"))
-                            
-                            for text_node in matching_text_nodes:
-                                # Climb up 6 levels to capture the entire "Product Card" HTML block
-                                container = text_node.parent
-                                for _ in range(6):
-                                    if container and container.parent and container.name not in ['body', 'html', 'main']:
-                                        container = container.parent
-                                        
-                                # Look for the barcode list strictly inside this specific product card!
-                                barcode_label = container.find("span", class_="barcode-list")
-                                if barcode_label:
-                                    text = barcode_label.parent.get_text(separator=" ", strip=True)
-                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
-                                    
-                                    if clean_text:
-                                        found_codes = [c.strip() for c in clean_text.split(',')]
-                                        
-                                        # Check if ANY of these barcodes exist in our pricebook
-                                        for code in found_codes:
-                                            norm_code = _norm_upc_12(code)
-                                            if norm_code in pb_upcs:
-                                                best_upc = norm_code
-                                                break
-                                if best_upc: break # Stop if we found a pricebook match
-
-                            # --- STRATEGY 2: The Hidden Shortcut Fallback ---
-                            # Just in case the item number IS secretly in the barcode list (like your 273531 example)
-                            if not best_upc:
-                                barcode_labels = soup.find_all("span", class_="barcode-list")
-                                for label in barcode_labels:
-                                    text = label.parent.get_text(separator=" ", strip=True)
-                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
-                                    if clean_text:
-                                        found_codes = [c.strip() for c in clean_text.split(',')]
-                                        if item_num in found_codes:
-                                            for code in found_codes:
-                                                norm_code = _norm_upc_12(code)
-                                                if norm_code in pb_upcs:
-                                                    best_upc = norm_code
-                                                    break
-                                    if best_upc: break
-
-                            # --- SAVE RESULTS ---
-                            # If we found a valid barcode, queue it for database saving
-                            if best_upc:
-                                if item_num in jc_key["ITEM_str"].values:
-                                    update_db_rows.append({"ITEM": item_num, "UPC1": best_upc})
-                                else:
-                                    row_data = jc_df[jc_df["ITEM_str"] == item_num].iloc[0]
-                                    new_db_rows.append({
-                                        "ITEM": item_num,
-                                        "UPC1": best_upc,
-                                        "UPC2": "",
-                                        "DESCRIPTION": row_data["DESCRIPTION"],
-                                        "PACK": row_data["PACK"],
-                                        "COST": row_data["COST"]
-                                    })
-                        except Exception as e:
-                            pass # If scraping fails for an item, quietly skip it and let the manual popup catch it
-                            
-                    # Apply all fixes to Supabase
-                    if new_db_rows or update_db_rows:
-                        conn = get_db_connection()
-                        with conn.session as session:
-                            if new_db_rows:
-                                pd.DataFrame(new_db_rows).to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
-                            if update_db_rows:
-                                for r in update_db_rows:
-                                    session.execute(text('UPDATE "JCSalesKey" SET "UPC1" = :u WHERE "ITEM" = :i'), {"u": r["UPC1"], "i": r["ITEM"]})
-                            session.commit()
-                        
-                        # Reload the key so the Popups have the fresh, fixed data!
-                        jc_key = load_jcsales_key()
-                        jc_key["ITEM_str"] = jc_key["ITEM"].astype(str).str.strip()
-                        st.success(f"Auto-Scraper successfully matched and saved {len(new_db_rows) + len(update_db_rows)} items directly to the database!")
-            # ==========================================
             # 🤖 AUTO-SCRAPER ENGINE (REVIEW BOARD)
             # ==========================================
             pb_upcs = set(pb_df["_norm_upc"])
@@ -987,6 +862,35 @@ with tab_invoice:
                             st.rerun()
                     
                     st.stop() # Wait for the user to clear the review board before showing the manual POPUP 1
+            # ==========================================
+            # POPUP 1: MISSING ITEM NUMBERS (NOT IN DB)
+            # ==========================================
+            missing_items = jc_df[~jc_df["ITEM_str"].isin(jc_key["ITEM_str"])].copy()
+            
+            if not missing_items.empty:
+                st.warning(f"⚠️ {len(missing_items)} Items are not in your Database (JCSalesKey).")
+                st.caption("Please fill in the missing UPCs below and click 'Save to Database'.")
+                
+                edit_df = pd.DataFrame({
+                    "ITEM": missing_items["ITEM_str"],
+                    "UPC1": "",
+                    "UPC2": "",
+                    "DESCRIPTION": missing_items["DESCRIPTION"],
+                    "PACK": missing_items["PACK"],
+                    "COST": missing_items["COST"]
+                })
+                
+                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="jc_missing_items")
+                
+                if st.button("Save New Items to Database", type="primary"):
+                    to_insert = edited_rows[edited_rows["UPC1"].str.strip() != ""].copy()
+                    if not to_insert.empty:
+                        conn = get_db_connection()
+                        to_insert.to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+                        st.success("Items saved! Re-analyzing invoice...")
+                        st.rerun()
+                    else:
+                        st.error("Please enter at least one UPC1 to save.")
                 
             # ==========================================
             # POPUP 2: NO MATCH (UPC NOT IN PRICEBOOK)
