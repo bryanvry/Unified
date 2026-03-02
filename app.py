@@ -726,17 +726,29 @@ with tab_invoice:
                             
                             if barcode_labels:
                                 for label in barcode_labels:
-                                    text = label.parent.get_text(strip=True)
-                                    clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
-                                    if clean_text:
-                                        found_codes = [c.strip() for c in clean_text.split(',')]
-                                        # Check if ANY of the scraped barcodes are in the Pricebook!
-                                        for code in found_codes:
-                                            norm_code = _norm_upc_12(code)
-                                            if norm_code in pb_upcs:
-                                                best_upc = norm_code
-                                                break
-                                    if best_upc: break # Stop searching if we found a match
+                                    # 1. Grab the entire product box (climbing up the HTML tree)
+                                    # We go up a few levels to make sure we capture the title and item number
+                                    product_box = label.parent.parent.parent.parent
+                                    box_text = product_box.get_text(separator=" ", strip=True)
+                                    
+                                    # 2. VERIFICATION: Does this specific box contain our exact item number?
+                                    # The \b ensures it matches the whole number (so "123" doesn't match "12345")
+                                    if re.search(rf"\b{item_num}\b", box_text):
+                                        
+                                        # It's a match! Now we can safely extract the barcode
+                                        text = label.parent.get_text(strip=True)
+                                        clean_text = re.sub(r"Barcode:\s*", "", text, flags=re.IGNORECASE).strip()
+                                        
+                                        if clean_text:
+                                            found_codes = [c.strip() for c in clean_text.split(',')]
+                                            # Check if ANY of the scraped barcodes are in the Pricebook
+                                            for code in found_codes:
+                                                norm_code = _norm_upc_12(code)
+                                                if norm_code in pb_upcs:
+                                                    best_upc = norm_code
+                                                    break
+                                                    
+                                        if best_upc: break # Stop searching if we found a match inside this box
                             
                             # If we found a valid barcode, queue it for database saving
                             if best_upc:
