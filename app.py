@@ -200,6 +200,33 @@ def load_jcsales_key():
     except Exception as e:
         st.error(f"Error loading JC Sales Key: {e}")
         return pd.DataFrame()
+
+def get_last_upload_time(table_name):
+    """Fetches the last upload timestamp for a given table."""
+    try:
+        conn = get_db_connection()
+        df = conn.query(f"SELECT last_uploaded FROM admin_upload_logs WHERE table_name = '{table_name}'", ttl=0)
+        if not df.empty:
+            # Format to look like: 2026-03-04 02:30 PM
+            return pd.to_datetime(df.iloc[0]['last_uploaded']).strftime("%Y-%m-%d %I:%M %p")
+    except Exception:
+        pass
+    return "Never / Unknown"
+
+def set_last_upload_time(table_name):
+    """Records the current time as the last upload time for a given table."""
+    try:
+        conn = get_db_connection()
+        with conn.session as session:
+            # Insert or update the timestamp for the table
+            session.execute(text('''
+                INSERT INTO admin_upload_logs (table_name, last_uploaded) 
+                VALUES (:tbl, NOW()) 
+                ON CONFLICT (table_name) DO UPDATE SET last_uploaded = NOW();
+            '''), {"tbl": table_name})
+            session.commit()
+    except Exception as e:
+        print(f"Failed to log upload time: {e}")
 # --- HEADER & STORE SELECTOR (Top Right) ---
 col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
 
@@ -1681,10 +1708,13 @@ with tab_admin:
     st.divider()
     # ------------------------
     
+    import time # Needed for the short refresh delay
+    
     col_pb, col_map, col_jc = st.columns(3)
+    
     with col_pb:
         st.subheader(f"Update Pricebook ({selected_store})")
-        st.caption(f"Target: `{PRICEBOOK_TABLE}`")
+        st.caption(f"Target: `{PRICEBOOK_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(PRICEBOOK_TABLE)}**")
         pb_upload = st.file_uploader("Upload Pricebook CSV", type=["csv"], key="pb_admin")
         
         if pb_upload and st.button("Replace Pricebook", type="primary"):
@@ -1710,13 +1740,17 @@ with tab_admin:
                     
                     cols_to_use = [c for c in valid_cols if c in df.columns]
                     df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
+                    
+                    set_last_upload_time(PRICEBOOK_TABLE)
                     st.success(f"Replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
+                    time.sleep(1)
+                    st.rerun() 
             except Exception as e:
                 st.error(f"Error updating pricebook: {e}")
 
     with col_map:
         st.subheader(f"Update Vendor Map ({selected_store})")
-        st.caption(f"Target: `{VENDOR_MAP_TABLE}`")
+        st.caption(f"Target: `{VENDOR_MAP_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(VENDOR_MAP_TABLE)}**")
         
         current_map = load_vendor_map(VENDOR_MAP_TABLE)
         if not current_map.empty:
@@ -1746,13 +1780,17 @@ with tab_admin:
                         session.commit()
                         
                     df[cols_to_load].to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
+                    
+                    set_last_upload_time(VENDOR_MAP_TABLE)
                     st.success(f"Map replaced successfully with {len(df)} rows.")
+                    time.sleep(1)
+                    st.rerun() 
             except Exception as e:
                 st.error(f"Error updating map: {e}")
 
     with col_jc:
         st.subheader("Update JC Sales Key (Global)")
-        st.caption("Target: `JCSalesKey`")
+        st.caption(f"Target: `JCSalesKey`  \n⏳ Last Uploaded: **{get_last_upload_time('JCSalesKey')}**")
         
         current_jc = load_jcsales_key()
         if not current_jc.empty:
@@ -1778,6 +1816,10 @@ with tab_admin:
                     session.commit()
                     
                 df[cols_to_load].to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+                
+                set_last_upload_time("JCSalesKey")
                 st.success(f"JC Sales Key replaced with {len(df)} rows.")
+                time.sleep(1)
+                st.rerun() 
             except Exception as e:
                 st.error(f"Error updating JC Sales Key: {e}")
