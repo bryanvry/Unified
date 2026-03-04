@@ -202,13 +202,21 @@ def load_jcsales_key():
         return pd.DataFrame()
 
 def get_last_upload_time(table_name):
-    """Fetches the last upload timestamp for a given table."""
+    """Fetches the last upload timestamp for a given table and converts to local time."""
     try:
         conn = get_db_connection()
         df = conn.query(f"SELECT last_uploaded FROM admin_upload_logs WHERE table_name = '{table_name}'", ttl=0)
         if not df.empty:
-            # Format to look like: 2026-03-04 02:30 PM
-            return pd.to_datetime(df.iloc[0]['last_uploaded']).strftime("%Y-%m-%d %I:%M %p")
+            # 1. Grab the raw time from the database
+            raw_time = pd.to_datetime(df.iloc[0]['last_uploaded'])
+            
+            # 2. Tell Python this time is UTC, then convert it to Pacific Time
+            if raw_time.tzinfo is None:
+                raw_time = raw_time.tz_localize('UTC')
+            local_time = raw_time.tz_convert('America/Los_Angeles')
+            
+            # 3. Format it beautifully
+            return local_time.strftime("%Y-%m-%d %I:%M %p")
     except Exception:
         pass
     return "Never / Unknown"
