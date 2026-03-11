@@ -265,43 +265,14 @@ tab_order, tab_invoice, tab_search, tab_admin = st.tabs(["Order Management", "In
 with tab_order:
     st.header(f"Orders: {selected_store}")
     
-    col_sales, col_gen = st.columns([1, 1])
+    # --- Interactive Order Builder ---
+    st.subheader("Build Order")
     
-    # --- A. Upload Weekly Sales ---
-    with col_sales:
-        st.subheader("1. Update Sales History")
-        sales_date = st.date_input("Week Ending Date", datetime.today())
-        sales_file = st.file_uploader("Upload itemsales.csv", type=["csv"], key="sales_upload")
+    try:
+        conn = get_db_connection()
         
-        if sales_file and st.button("Save Sales to DB", type="primary"):
-            try:
-                sales_df = pd.read_csv(sales_file, dtype=str)
-                req_cols = {"UPC", "Item", "# of Items", "Sales $"}
-                if not req_cols.issubset(sales_df.columns):
-                    st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
-                else:
-                    db_rows = pd.DataFrame()
-                    db_rows["week_date"] = [sales_date] * len(sales_df)
-                    db_rows["UPC"] = sales_df["UPC"]
-                    db_rows["Item"] = sales_df["Item"]
-                    db_rows["qty_sold"] = pd.to_numeric(sales_df["# of Items"], errors='coerce').fillna(0)
-                    db_rows["Sales_Dollars"] = pd.to_numeric(sales_df["Sales $"].astype(str).str.replace('$','').str.replace(',',''), errors='coerce').fillna(0)
-                    
-                    conn = get_db_connection()
-                    db_rows.to_sql(SALES_TABLE, conn.engine, if_exists='append', index=False)
-                    st.success(f"Added {len(db_rows)} records to {SALES_TABLE}")
-            except Exception as e:
-                st.error(f"Failed to process sales file: {e}")
-
-    # --- B. Interactive Order Builder ---
-    with col_gen:
-        st.subheader("2. Build Order")
-        
-        try:
-            conn = get_db_connection()
-            
-            # 1. Company List
-            companies_df = conn.query(f'SELECT DISTINCT "Company" FROM "{VENDOR_MAP_TABLE}"', ttl=0)
+        # 1. Company List
+        companies_df = conn.query(f'SELECT DISTINCT "Company" FROM "{VENDOR_MAP_TABLE}"', ttl=0)
             if not companies_df.empty:
                 company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
             else:
@@ -1833,42 +1804,67 @@ with tab_admin:
                 st.error(f"Error updating JC Sales Key: {e}")
 
     # =========================================================
-    # 🗑️ MANAGE ITEM SALES DATA
+    # 📊 MANAGE ITEM SALES DATA
     # =========================================================
     st.divider()
-    st.subheader(f"🗑️ Manage Item Sales Data ({selected_store})")
-    st.caption(f"Target: `{SALES_TABLE}` - Delete uploaded sales data for specific dates to prevent duplicates or fix errors.")
+    st.subheader(f"📊 Manage Item Sales Data ({selected_store})")
+    st.caption(f"Target: `{SALES_TABLE}` - Upload new weekly sales or delete existing dates.")
     
-    # Helper to fetch available dates dynamically from the correct store's table
-    def fetch_sales_dates(table_name):
-        try:
-            conn = get_db_connection()
-            # Fetching distinct dates based on the week_date column
-            query = f'SELECT DISTINCT "week_date" FROM "{table_name}" WHERE "week_date" IS NOT NULL ORDER BY "week_date" DESC'
-            df = conn.query(query, ttl=0)
-            if not df.empty:
-                # Format to standard YYYY-MM-DD string for dropdown
-                return pd.to_datetime(df["week_date"]).dt.strftime('%Y-%m-%d').unique().tolist()
-        except Exception as e:
-            pass
-        return []
-
-    available_dates = fetch_sales_dates(SALES_TABLE)
+    col_upload, col_delete = st.columns(2)
     
-    if available_dates:
-        col_del1, col_del2, col_del3 = st.columns([1, 1, 2])
+    # --- LEFT SIDE: UPLOAD SALES ---
+    with col_upload:
+        st.markdown("**1. Upload Weekly Sales**")
+        sales_date = st.date_input("Week Ending Date", datetime.today())
+        sales_file = st.file_uploader("Upload itemsales.csv", type=["csv"], key="sales_upload")
         
-        with col_del1:
+        if sales_file and st.button("Save Sales to DB", type="primary"):
+            try:
+                sales_df = pd.read_csv(sales_file, dtype=str)
+                req_cols = {"UPC", "Item", "# of Items", "Sales $"}
+                if not req_cols.issubset(sales_df.columns):
+                    st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
+                else:
+                    db_rows = pd.DataFrame()
+                    db_rows["week_date"] = [sales_date] * len(sales_df)
+                    db_rows["UPC"] = sales_df["UPC"]
+                    db_rows["Item"] = sales_df["Item"]
+                    db_rows["qty_sold"] = pd.to_numeric(sales_df["# of Items"], errors='coerce').fillna(0)
+                    db_rows["Sales_Dollars"] = pd.to_numeric(sales_df["Sales $"].astype(str).str.replace('$','').str.replace(',',''), errors='coerce').fillna(0)
+                    
+                    conn = get_db_connection()
+                    db_rows.to_sql(SALES_TABLE, conn.engine, if_exists='append', index=False)
+                    st.success(f"✅ Added {len(db_rows)} records to {SALES_TABLE}!")
+                    time.sleep(1.5)
+                    st.rerun() # Refresh so the dropdown on the right updates instantly!
+            except Exception as e:
+                st.error(f"Failed to process sales file: {e}")
+
+    # --- RIGHT SIDE: DELETE SALES ---
+    with col_delete:
+        st.markdown("**2. Delete Sales Data**")
+        
+        def fetch_sales_dates(table_name):
+            try:
+                conn = get_db_connection()
+                query = f'SELECT DISTINCT "week_date" FROM "{table_name}" WHERE "week_date" IS NOT NULL ORDER BY "week_date" DESC'
+                df = conn.query(query, ttl=0)
+                if not df.empty:
+                    return pd.to_datetime(df["week_date"]).dt.strftime('%Y-%m-%d').unique().tolist()
+            except Exception as e:
+                pass
+            return []
+
+        available_dates = fetch_sales_dates(SALES_TABLE)
+        
+        if available_dates:
             date_to_delete = st.selectbox("Select Date to Delete", available_dates)
             
-        with col_del2:
-            st.write("") # Spacing to align with the dropdown
-            st.write("")
+            st.write("") # Spacing
             if st.button(f"Delete Sales for {date_to_delete}", type="primary"):
                 try:
                     conn = get_db_connection()
                     with conn.session as session:
-                        # Deleting the exact date from whichever store is selected
                         session.execute(
                             text(f'DELETE FROM "{SALES_TABLE}" WHERE "week_date" = :d'), 
                             {"d": date_to_delete}
@@ -1877,8 +1873,8 @@ with tab_admin:
                         
                     st.success(f"✅ Successfully deleted all sales data for {date_to_delete} from {selected_store}!")
                     time.sleep(1.5)
-                    st.rerun() # Refresh the page to update the dropdown list
+                    st.rerun() 
                 except Exception as e:
                     st.error(f"Error deleting data: {e}")
-    else:
-        st.info(f"No item sales dates found in the database for {selected_store}.")
+        else:
+            st.info(f"No item sales dates found in the database for {selected_store}.")
