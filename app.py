@@ -698,7 +698,7 @@ with tab_invoice:
                 metrics = unmatched.apply(calc_unmatched_retail, axis=1, result_type='expand')
                 
                 # Build the display table
-                disp_unmatched = unmatched[["UPC", "Description", "+Cost", "New_Pack"]].copy()
+                disp_unmatched = unmatched[["UPC", "Description", "New_Pack", "+Cost"]].copy()
                 disp_unmatched["Unit"] = metrics[0]
                 disp_unmatched["Retail"] = metrics[1]
                 
