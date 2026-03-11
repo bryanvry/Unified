@@ -284,7 +284,6 @@ with tab_order:
         # Button to Load Data into Session State
         if st.button(f"Load {target_company} Items"):
             
-            # --- UPDATED: SELECT * to natively grab the new 'type' column if it exists ---
             map_query = f"""
                 SELECT * FROM "{VENDOR_MAP_TABLE}" 
                 WHERE "Company" = :company_name
@@ -314,7 +313,6 @@ with tab_order:
                 elif "Name_y" in merged.columns and "Name" not in merged.columns:
                     merged = merged.rename(columns={"Name_y": "Name"})
                 
-                # --- UPDATED: Pivot Sales & Shrink Headers ---
                 sales_cols_display = []
                 if not sales_hist.empty:
                     sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
@@ -331,7 +329,6 @@ with tab_order:
                     sales_cols = sorted_dates[-15:]
                     sales_pivot = sales_pivot[sales_cols]
                     
-                    # Convert '2026-03-01' to '03/01' to save massive screen space
                     rename_dict = {col: pd.to_datetime(col).strftime('%m/%d') for col in sales_cols}
                     sales_pivot = sales_pivot.rename(columns=rename_dict)
                     sales_cols_display = list(rename_dict.values())
@@ -346,20 +343,25 @@ with tab_order:
                 
                 merged["Order"] = 0
                 
-                # --- UPDATED: Safely include 'type' and Sort natively ---
                 base_cols = ["Full Barcode", "type", "Name", "Size", "PACK"]
                 available_base = [c for c in base_cols if c in merged.columns]
                 
                 final_cols = available_base + sales_cols_display + ["Stock", "Order"]
                 final_merged = merged[final_cols].copy()
                 
-                # Sort: Because 'B' (Beer) comes before 'L' (Liquor), alphabetical sort works flawlessly here!
+                # --- STRICT CASE-INSENSITIVE ALPHABETICAL SORT ---
+                # We create a temporary lowercase name column to force perfect alphabetical sorting
+                final_merged["_sort_name"] = final_merged["Name"].astype(str).str.strip().str.lower()
+                
                 if "type" in final_merged.columns:
-                    final_merged["type"] = final_merged["type"].fillna("Z_Other") # Pushes blanks/unknowns to the bottom
-                    final_merged = final_merged.sort_values(by=["type", "Name"], ascending=[True, True])
-                    final_merged["type"] = final_merged["type"].replace("Z_Other", "") # Clean it up for display
+                    final_merged["type"] = final_merged["type"].fillna("Z_Other") 
+                    final_merged = final_merged.sort_values(by=["type", "_sort_name"], ascending=[True, True])
+                    final_merged["type"] = final_merged["type"].replace("Z_Other", "") 
                 else:
-                    final_merged = final_merged.sort_values(by="Name", ascending=True)
+                    final_merged = final_merged.sort_values(by="_sort_name", ascending=True)
+                    
+                # Drop the temp column so it doesn't clutter the data
+                final_merged = final_merged.drop(columns=["_sort_name"])
                 
                 st.session_state['order_df'] = final_merged
                 st.session_state['active_company'] = target_company
@@ -376,24 +378,23 @@ with tab_order:
         all_columns = st.session_state['order_df'].columns.tolist()
         locked_columns = [col for col in all_columns if col != "Order"]
         
-        # --- NEW: Build dynamic column config to squeeze sales dates ---
         col_configs = {
             "Order": st.column_config.NumberColumn("Order Qty", help="Enter cases to order", min_value=0, step=1, required=True)
         }
         
-        # Physically shrink all the sales columns
         for sc in st.session_state.get('sales_cols_display', []):
             col_configs[sc] = st.column_config.NumberColumn(sc, width="small")
             
+        # --- HIDE THE TYPE COLUMN FROM THE UI ---
         if "type" in all_columns:
-            col_configs["type"] = st.column_config.TextColumn("Type", width="small")
+            col_configs["type"] = None 
         
         edited_df = st.data_editor(
             st.session_state['order_df'],
             use_container_width=True,
             height=600,
             disabled=locked_columns,
-            column_config=col_configs, # Inject the squished columns!
+            column_config=col_configs, 
             hide_index=True
         )
         
@@ -404,14 +405,19 @@ with tab_order:
             if final_order.empty:
                 st.warning("No items ordered (Order Qty is 0 for all rows).")
             else:
-                # Re-apply the Beer -> Liquor sort so the exported Excel is beautifully organized
+                # --- PERFECT ALPHABETICAL SORTING FOR THE EXPORTED EXCEL ---
+                final_order["_sort_name"] = final_order["Name"].astype(str).str.strip().str.lower()
+                
                 if "type" in final_order.columns:
                     final_order["type"] = final_order["type"].replace("", "Z_Other")
-                    final_order = final_order.sort_values(by=["type", "Name"], ascending=[True, True])
+                    final_order = final_order.sort_values(by=["type", "_sort_name"], ascending=[True, True])
                     final_order["type"] = final_order["type"].replace("Z_Other", "")
                 else:
-                    final_order = final_order.sort_values(by="Name", ascending=True)
+                    final_order = final_order.sort_values(by="_sort_name", ascending=True)
+                    
+                final_order = final_order.drop(columns=["_sort_name"])
                 
+                # Keep 'type' in the final export so your sales reps can see what's Beer vs Liquor!
                 output_cols = ["type", "Name", "Size", "Order"]
                 valid_cols = [c for c in output_cols if c in final_order.columns]
                 
