@@ -679,7 +679,45 @@ with tab_invoice:
             # Show Unmatched Items
             if not unmatched.empty:
                 st.warning(f"{len(unmatched)} items not found in Pricebook.")
-                st.dataframe(unmatched[["UPC", "Description", "+Cost"]])
+                
+                # Fetch the correct margin based on the selected store
+                margin_divisor = 0.7 if selected_store == "Rancho" else 0.6
+                
+                def calc_unmatched_retail(row):
+                    case_cost = row["+Cost"] if pd.notna(row["+Cost"]) else 0.0
+                    pack = row["New_Pack"] if row["New_Pack"] > 0 else 1
+                    unit_cost = case_cost / pack
+                    
+                    target_retail = unit_cost / margin_divisor
+                    retail_val = np.ceil(target_retail * 10) / 10.0 - 0.01
+                    if retail_val < 0: retail_val = 0
+                    
+                    return unit_cost, retail_val
+
+                # Calculate the math for the unmatched items
+                metrics = unmatched.apply(calc_unmatched_retail, axis=1, result_type='expand')
+                
+                # Build the display table
+                disp_unmatched = unmatched[["UPC", "Description", "+Cost", "New_Pack"]].copy()
+                disp_unmatched["Unit"] = metrics[0]
+                disp_unmatched["Retail"] = metrics[1]
+                
+                # Rename the columns to look clean
+                disp_unmatched = disp_unmatched.rename(columns={
+                    "+Cost": "Case Cost",
+                    "New_Pack": "Pack"
+                })
+                
+                st.dataframe(
+                    disp_unmatched,
+                    column_config={
+                        "Case Cost": st.column_config.NumberColumn(format="$%.2f"),
+                        "Unit": st.column_config.NumberColumn(format="$%.2f"),
+                        "Retail": st.column_config.NumberColumn(format="$%.2f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
 
     # --- JC SALES (INTERACTIVE DATABASE ROUTE) ---
     elif vendor == "JC Sales":
