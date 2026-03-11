@@ -284,14 +284,12 @@ with tab_order:
         # Button to Load Data into Session State
         if st.button(f"Load {target_company} Items"):
             
-            # --- SECURITY FIX: Parameterized Query (No f-string) ---
+            # --- UPDATED: SELECT * to natively grab the new 'type' column if it exists ---
             map_query = f"""
-                SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
-                FROM "{VENDOR_MAP_TABLE}" 
+                SELECT * FROM "{VENDOR_MAP_TABLE}" 
                 WHERE "Company" = :company_name
             """
             vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
-            # -------------------------------------------------------
 
             if vendor_df.empty:
                 st.warning(f"No items found for {target_company}.")
@@ -299,13 +297,9 @@ with tab_order:
             else:
                 vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
                 
-                # Fetch Pricebook & Sales
                 pb_df = load_pricebook(PRICEBOOK_TABLE)
-                
-                # Look back 24 weeks to ensure we get at least 15 weeks of valid data
                 start_date = datetime.today() - timedelta(weeks=24) 
                 
-                # Note: {SALES_TABLE} is safe here because users can't edit that variable
                 sales_query = f"""
                     SELECT "UPC", "week_date", "qty_sold" 
                     FROM "{SALES_TABLE}" 
@@ -313,23 +307,18 @@ with tab_order:
                 """
                 sales_hist = conn.query(sales_query, params={"start_date": start_date.strftime('%Y-%m-%d')}, ttl=0)
                 
-                # Merge Map + Pricebook
                 merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
                 
-                # Handle Name Collision
                 if "Name_x" in merged.columns:
                     merged = merged.rename(columns={"Name_x": "Name"})
                 elif "Name_y" in merged.columns and "Name" not in merged.columns:
                     merged = merged.rename(columns={"Name_y": "Name"})
                 
-                # Pivot Sales (Ascending Order: Oldest -> Newest)
-                sales_cols = []
+                # --- UPDATED: Pivot Sales & Shrink Headers ---
+                sales_cols_display = []
                 if not sales_hist.empty:
                     sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
-                    
-                    # --- NEW: Convert date objects to strings to prevent JSON crash ---
                     sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
-                    # ------------------------------------------------------------------
                     
                     sales_pivot = sales_hist.pivot_table(
                         index="_upc_norm", 
@@ -338,34 +327,43 @@ with tab_order:
                         aggfunc="sum"
                     ).fillna(0)
                     
-                    # Sort Oldest to Newest
                     sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
-                    
-                    # Keep last 15 weeks
                     sales_cols = sorted_dates[-15:]
                     sales_pivot = sales_pivot[sales_cols]
                     
+                    # Convert '2026-03-01' to '03/01' to save massive screen space
+                    rename_dict = {col: pd.to_datetime(col).strftime('%m/%d') for col in sales_cols}
+                    sales_pivot = sales_pivot.rename(columns=rename_dict)
+                    sales_cols_display = list(rename_dict.values())
+                    
                     merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
 
-                # Logic: Stock
                 if "setstock" in merged.columns:
                     clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
                     merged["Stock"] = pd.to_numeric(clean_stock, errors='coerce').fillna(0)
                 else:
                     merged["Stock"] = 0
                 
-                # Logic: Initialize Order Column
                 merged["Order"] = 0
                 
-                # Final Columns (REMOVED: "Invoice UPC" and "0")
-                base_cols = ["Full Barcode", "Name", "Size", "PACK"]
+                # --- UPDATED: Safely include 'type' and Sort natively ---
+                base_cols = ["Full Barcode", "type", "Name", "Size", "PACK"]
                 available_base = [c for c in base_cols if c in merged.columns]
                 
-                final_cols = available_base + sales_cols + ["Stock", "Order"]
+                final_cols = available_base + sales_cols_display + ["Stock", "Order"]
+                final_merged = merged[final_cols].copy()
                 
-                # Save to Session State
-                st.session_state['order_df'] = merged[final_cols].copy()
+                # Sort: Because 'B' (Beer) comes before 'L' (Liquor), alphabetical sort works flawlessly here!
+                if "type" in final_merged.columns:
+                    final_merged["type"] = final_merged["type"].fillna("Z_Other") # Pushes blanks/unknowns to the bottom
+                    final_merged = final_merged.sort_values(by=["type", "Name"], ascending=[True, True])
+                    final_merged["type"] = final_merged["type"].replace("Z_Other", "") # Clean it up for display
+                else:
+                    final_merged = final_merged.sort_values(by="Name", ascending=True)
+                
+                st.session_state['order_df'] = final_merged
                 st.session_state['active_company'] = target_company
+                st.session_state['sales_cols_display'] = sales_cols_display 
 
     except Exception as e:
         st.error(f"System Error: {e}")
@@ -375,41 +373,46 @@ with tab_order:
         st.divider()
         st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
         
-        # --- Lock all columns EXCEPT 'Order' ---
         all_columns = st.session_state['order_df'].columns.tolist()
         locked_columns = [col for col in all_columns if col != "Order"]
         
-        # Editable Dataframe
+        # --- NEW: Build dynamic column config to squeeze sales dates ---
+        col_configs = {
+            "Order": st.column_config.NumberColumn("Order Qty", help="Enter cases to order", min_value=0, step=1, required=True)
+        }
+        
+        # Physically shrink all the sales columns
+        for sc in st.session_state.get('sales_cols_display', []):
+            col_configs[sc] = st.column_config.NumberColumn(sc, width="small")
+            
+        if "type" in all_columns:
+            col_configs["type"] = st.column_config.TextColumn("Type", width="small")
+        
         edited_df = st.data_editor(
             st.session_state['order_df'],
             use_container_width=True,
             height=600,
-            disabled=locked_columns, # Locks everything except 'Order'
-            column_config={
-                "Order": st.column_config.NumberColumn(
-                    "Order Qty",
-                    help="Enter cases to order",
-                    min_value=0,
-                    step=1,
-                    required=True
-                )
-            },
+            disabled=locked_columns,
+            column_config=col_configs, # Inject the squished columns!
             hide_index=True
         )
         
         # 3. Finish & Download
         if st.button("Finish & Download Order"):
-            # Filter: Order > 0
             final_order = edited_df[edited_df["Order"] > 0].copy()
             
             if final_order.empty:
                 st.warning("No items ordered (Order Qty is 0 for all rows).")
             else:
-                # Sort Alphabetically by Name
-                final_order = final_order.sort_values(by="Name", ascending=True)
+                # Re-apply the Beer -> Liquor sort so the exported Excel is beautifully organized
+                if "type" in final_order.columns:
+                    final_order["type"] = final_order["type"].replace("", "Z_Other")
+                    final_order = final_order.sort_values(by=["type", "Name"], ascending=[True, True])
+                    final_order["type"] = final_order["type"].replace("Z_Other", "")
+                else:
+                    final_order = final_order.sort_values(by="Name", ascending=True)
                 
-                # Select only requested columns
-                output_cols = ["Name", "Size", "Order"]
+                output_cols = ["type", "Name", "Size", "Order"]
                 valid_cols = [c for c in output_cols if c in final_order.columns]
                 
                 download_df = final_order[valid_cols]
@@ -1358,7 +1361,7 @@ with tab_invoice:
                 elif vendor == "Nevada Beverage":
                     company_db_name = "Nevada"
 
-                # --- FIX 2: Reorder columns and add "Size" ---
+                # --- FIX 2: Reorder columns, add "Size" and "type" ---
                 edit_df = pd.DataFrame({
                     "Full Barcode": "",
                     "Invoice UPC": missing["_display_id"], 
@@ -1366,10 +1369,23 @@ with tab_invoice:
                     "Name": missing["Item Name"],
                     "Size": "",
                     "PACK": 1,
-                    "Company": company_db_name
+                    "Company": company_db_name,
+                    "type": "" # <-- NEW: Type column added here!
                 })
                 
-                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="editor_missing")
+                # --- UPGRADED: Added a dropdown specifically for the 'type' column ---
+                edited_rows = st.data_editor(
+                    edit_df, 
+                    num_rows="dynamic", 
+                    key="editor_missing",
+                    column_config={
+                        "type": st.column_config.SelectboxColumn(
+                            "Type",
+                            help="Select Beer or Liquor (Leave blank for Rancho)",
+                            options=["Beer", "Liquor", ""]
+                        )
+                    }
+                )
                 
                 if st.button("Save New Items to Map"):
                     to_insert = edited_rows[edited_rows["Full Barcode"].astype(str).str.len() > 3].copy()
@@ -1378,9 +1394,12 @@ with tab_invoice:
                         conn = get_db_connection()
                         to_insert["Invoice UPC"] = to_insert["Invoice UPC"].astype(str)
                         to_insert["Full Barcode"] = to_insert["Full Barcode"].astype(str)
+                        
+                        # Save the new row (including the selected type) straight to the database!
                         to_insert.to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
                         
                         st.success("Items successfully mapped! Re-analyzing invoice...")
+                        time.sleep(1)
                         st.rerun() 
                     else:
                         st.error("No valid Barcodes were entered.")
@@ -1792,7 +1811,7 @@ with tab_admin:
                     st.error("File missing 'Full Barcode' or 'Invoice UPC'.")
                 else:
                     conn = get_db_connection()
-                    target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company"]
+                    target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company", "type"]
                     cols_to_load = [c for c in target_cols if c in df.columns]
                     
                     with conn.session as session:
