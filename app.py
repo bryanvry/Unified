@@ -1810,6 +1810,16 @@ with tab_admin:
                 if "Full Barcode" not in df.columns or "Invoice UPC" not in df.columns:
                     st.error("File missing 'Full Barcode' or 'Invoice UPC'.")
                 else:
+                    # --- NEW: Automatically drop duplicate Invoice UPCs before sending to DB ---
+                    # We keep the "last" one so the most recent data overrides the older duplicate
+                    original_count = len(df)
+                    df = df.drop_duplicates(subset=["Invoice UPC"], keep="last")
+                    dropped_count = original_count - len(df)
+                    
+                    if dropped_count > 0:
+                        st.warning(f"🧹 Removed {dropped_count} duplicate Invoice UPCs from your upload.")
+                    # --------------------------------------------------------------------------
+
                     conn = get_db_connection()
                     target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company", "type"]
                     cols_to_load = [c for c in target_cols if c in df.columns]
@@ -1821,12 +1831,11 @@ with tab_admin:
                     df[cols_to_load].to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
                     
                     set_last_upload_time(VENDOR_MAP_TABLE)
-                    st.success(f"Map replaced successfully with {len(df)} rows.")
-                    time.sleep(1)
+                    st.success(f"Map replaced successfully with {len(df)} unique rows.")
+                    time.sleep(2)
                     st.rerun() 
             except Exception as e:
                 st.error(f"Error updating map: {e}")
-
     with col_jc:
         st.subheader("Update JC Sales Key (Global)")
         st.caption(f"Target: `JCSalesKey`  \n⏳ Last Uploaded: **{get_last_upload_time('JCSalesKey')}**")
