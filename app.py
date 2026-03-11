@@ -378,17 +378,23 @@ with tab_order:
         all_columns = st.session_state['order_df'].columns.tolist()
         locked_columns = [col for col in all_columns if col != "Order"]
         
+        # --- UPGRADED: Force 'Name' to eat all extra space, and shrink the rest ---
         col_configs = {
-            "Order": st.column_config.NumberColumn("Order Qty", help="Enter cases to order", min_value=0, step=1, required=True)
+            "Order": st.column_config.NumberColumn("Order Qty", help="Enter cases to order", min_value=0, step=1, required=True),
+            "Name": st.column_config.TextColumn("Name", width="large"),
+            "Size": st.column_config.TextColumn("Size", width="small"),
+            "PACK": st.column_config.NumberColumn("Pack", width="small"),
+            "Stock": st.column_config.NumberColumn("Stock", width="small")
         }
         
+        # Shrink all the sales date columns
         for sc in st.session_state.get('sales_cols_display', []):
             col_configs[sc] = st.column_config.NumberColumn(sc, width="small")
             
         # --- HIDE THE TYPE COLUMN FROM THE UI ---
         if "type" in all_columns:
             col_configs["type"] = None 
-        
+            
         edited_df = st.data_editor(
             st.session_state['order_df'],
             use_container_width=True,
