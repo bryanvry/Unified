@@ -563,10 +563,12 @@ with tab_invoice:
                 
                 # --- B. DISPLAY MAIN TABLE ---
                 matched["New"] = None
-                display_cols = ["UPC", "Brand", "Description", "+Cost", "Unit Cost", "Now", "Retail String", "New"]
+                
+                # ADDED "Cost" to the list of columns to display before "+Cost"
+                display_cols = ["UPC", "Brand", "Description", "Cost", "+Cost", "Unit Cost", "Now", "Retail String", "New"]
                 
                 final_view = matched[display_cols].rename(columns={
-                    "+Cost": "Case Cost",
+                    "+Cost": "Net Cost", 
                     "Unit Cost": "Unit",
                     "Retail String": "Retail"
                 })
@@ -578,7 +580,8 @@ with tab_invoice:
                         "UPC": st.column_config.TextColumn(disabled=True),
                         "Brand": st.column_config.TextColumn(disabled=True),
                         "Description": st.column_config.TextColumn(disabled=True),
-                        "Case Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                        "Cost": st.column_config.NumberColumn("Cost ($)", format="$%.2f", disabled=True), # NEW: Base Cost
+                        "Net Cost": st.column_config.NumberColumn("Net Cost ($)", format="$%.2f", disabled=True), # UPDATED: Net Cost
                         "Unit": st.column_config.NumberColumn(format="$%.2f", disabled=True),
                         "Now": st.column_config.NumberColumn(format="$%.2f", help="Current Pricebook Price", disabled=True),
                         "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.", disabled=True),
