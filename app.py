@@ -1831,3 +1831,54 @@ with tab_admin:
                 st.rerun() 
             except Exception as e:
                 st.error(f"Error updating JC Sales Key: {e}")
+
+    # =========================================================
+    # 🗑️ MANAGE ITEM SALES DATA
+    # =========================================================
+    st.divider()
+    st.subheader(f"🗑️ Manage Item Sales Data ({selected_store})")
+    st.caption(f"Target: `{SALES_TABLE}` - Delete uploaded sales data for specific dates to prevent duplicates or fix errors.")
+    
+    # Helper to fetch available dates dynamically from the correct store's table
+    def fetch_sales_dates(table_name):
+        try:
+            conn = get_db_connection()
+            # Fetching distinct dates based on the week_date column
+            query = f'SELECT DISTINCT "week_date" FROM "{table_name}" WHERE "week_date" IS NOT NULL ORDER BY "week_date" DESC'
+            df = conn.query(query, ttl=0)
+            if not df.empty:
+                # Format to standard YYYY-MM-DD string for dropdown
+                return pd.to_datetime(df["week_date"]).dt.strftime('%Y-%m-%d').unique().tolist()
+        except Exception as e:
+            pass
+        return []
+
+    available_dates = fetch_sales_dates(SALES_TABLE)
+    
+    if available_dates:
+        col_del1, col_del2, col_del3 = st.columns([1, 1, 2])
+        
+        with col_del1:
+            date_to_delete = st.selectbox("Select Date to Delete", available_dates)
+            
+        with col_del2:
+            st.write("") # Spacing to align with the dropdown
+            st.write("")
+            if st.button(f"Delete Sales for {date_to_delete}", type="primary"):
+                try:
+                    conn = get_db_connection()
+                    with conn.session as session:
+                        # Deleting the exact date from whichever store is selected
+                        session.execute(
+                            text(f'DELETE FROM "{SALES_TABLE}" WHERE "week_date" = :d'), 
+                            {"d": date_to_delete}
+                        )
+                        session.commit()
+                        
+                    st.success(f"✅ Successfully deleted all sales data for {date_to_delete} from {selected_store}!")
+                    time.sleep(1.5)
+                    st.rerun() # Refresh the page to update the dropdown list
+                except Exception as e:
+                    st.error(f"Error deleting data: {e}")
+    else:
+        st.info(f"No item sales dates found in the database for {selected_store}.")
