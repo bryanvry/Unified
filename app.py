@@ -273,103 +273,104 @@ with tab_order:
         
         # 1. Company List
         companies_df = conn.query(f'SELECT DISTINCT "Company" FROM "{VENDOR_MAP_TABLE}"', ttl=0)
-            if not companies_df.empty:
-                company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
+        
+        if not companies_df.empty:
+            company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
+        else:
+            company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"]
+        
+        target_company = st.selectbox("Select Company", company_options)
+        
+        # Button to Load Data into Session State
+        if st.button(f"Load {target_company} Items"):
+            
+            # --- SECURITY FIX: Parameterized Query (No f-string) ---
+            map_query = f"""
+                SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
+                FROM "{VENDOR_MAP_TABLE}" 
+                WHERE "Company" = :company_name
+            """
+            vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
+            # -------------------------------------------------------
+
+            if vendor_df.empty:
+                st.warning(f"No items found for {target_company}.")
+                st.session_state['order_df'] = None
             else:
-                company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"]
-            
-            target_company = st.selectbox("Select Company", company_options)
-            
-            # Button to Load Data into Session State
-            if st.button(f"Load {target_company} Items"):
+                vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
                 
-                # --- SECURITY FIX: Parameterized Query (No f-string) ---
-                map_query = f"""
-                    SELECT "Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company" 
-                    FROM "{VENDOR_MAP_TABLE}" 
-                    WHERE "Company" = :company_name
+                # Fetch Pricebook & Sales
+                pb_df = load_pricebook(PRICEBOOK_TABLE)
+                
+                # Look back 24 weeks to ensure we get at least 15 weeks of valid data
+                start_date = datetime.today() - timedelta(weeks=24) 
+                
+                # Note: {SALES_TABLE} is safe here because users can't edit that variable
+                sales_query = f"""
+                    SELECT "UPC", "week_date", "qty_sold" 
+                    FROM "{SALES_TABLE}" 
+                    WHERE "week_date" >= :start_date
                 """
-                vendor_df = conn.query(map_query, params={"company_name": target_company}, ttl=0)
-                # -------------------------------------------------------
+                sales_hist = conn.query(sales_query, params={"start_date": start_date.strftime('%Y-%m-%d')}, ttl=0)
+                
+                # Merge Map + Pricebook
+                merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
+                
+                # Handle Name Collision
+                if "Name_x" in merged.columns:
+                    merged = merged.rename(columns={"Name_x": "Name"})
+                elif "Name_y" in merged.columns and "Name" not in merged.columns:
+                    merged = merged.rename(columns={"Name_y": "Name"})
+                
+                # Pivot Sales (Ascending Order: Oldest -> Newest)
+                sales_cols = []
+                if not sales_hist.empty:
+                    sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
+                    
+                    # --- NEW: Convert date objects to strings to prevent JSON crash ---
+                    sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
+                    # ------------------------------------------------------------------
+                    
+                    sales_pivot = sales_hist.pivot_table(
+                        index="_upc_norm", 
+                        columns="week_date", 
+                        values="qty_sold", 
+                        aggfunc="sum"
+                    ).fillna(0)
+                    
+                    # Sort Oldest to Newest
+                    sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
+                    
+                    # Keep last 15 weeks
+                    sales_cols = sorted_dates[-15:]
+                    sales_pivot = sales_pivot[sales_cols]
+                    
+                    merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
 
-                if vendor_df.empty:
-                    st.warning(f"No items found for {target_company}.")
-                    st.session_state['order_df'] = None
+                # Logic: Stock
+                if "setstock" in merged.columns:
+                    clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
+                    merged["Stock"] = pd.to_numeric(clean_stock, errors='coerce').fillna(0)
                 else:
-                    vendor_df["_key_norm"] = vendor_df["Full Barcode"].astype(str).apply(_norm_upc_12)
-                    
-                    # Fetch Pricebook & Sales
-                    pb_df = load_pricebook(PRICEBOOK_TABLE)
-                    
-                    # Look back 24 weeks to ensure we get at least 15 weeks of valid data
-                    start_date = datetime.today() - timedelta(weeks=24) 
-                    
-                    # Note: {SALES_TABLE} is safe here because users can't edit that variable
-                    sales_query = f"""
-                        SELECT "UPC", "week_date", "qty_sold" 
-                        FROM "{SALES_TABLE}" 
-                        WHERE "week_date" >= :start_date
-                    """
-                    sales_hist = conn.query(sales_query, params={"start_date": start_date.strftime('%Y-%m-%d')}, ttl=0)
-                    
-                    # Merge Map + Pricebook
-                    merged = vendor_df.merge(pb_df, left_on="_key_norm", right_on="_norm_upc", how="left")
-                    
-                    # Handle Name Collision
-                    if "Name_x" in merged.columns:
-                        merged = merged.rename(columns={"Name_x": "Name"})
-                    elif "Name_y" in merged.columns and "Name" not in merged.columns:
-                        merged = merged.rename(columns={"Name_y": "Name"})
-                    
-                    # Pivot Sales (Ascending Order: Oldest -> Newest)
-                    sales_cols = []
-                    if not sales_hist.empty:
-                        sales_hist["_upc_norm"] = sales_hist["UPC"].astype(str).apply(_norm_upc_12)
-                        
-                        # --- NEW: Convert date objects to strings to prevent JSON crash ---
-                        sales_hist["week_date"] = pd.to_datetime(sales_hist["week_date"]).dt.strftime('%Y-%m-%d')
-                        # ------------------------------------------------------------------
-                        
-                        sales_pivot = sales_hist.pivot_table(
-                            index="_upc_norm", 
-                            columns="week_date", 
-                            values="qty_sold", 
-                            aggfunc="sum"
-                        ).fillna(0)
-                        
-                        # Sort Oldest to Newest
-                        sorted_dates = sorted(sales_pivot.columns, key=lambda x: str(x), reverse=False)
-                        
-                        # Keep last 15 weeks
-                        sales_cols = sorted_dates[-15:]
-                        sales_pivot = sales_pivot[sales_cols]
-                        
-                        merged = merged.merge(sales_pivot, left_on="_key_norm", right_index=True, how="left")
+                    merged["Stock"] = 0
+                
+                # Logic: Initialize Order Column
+                merged["Order"] = 0
+                
+                # Final Columns (REMOVED: "Invoice UPC" and "0")
+                base_cols = ["Full Barcode", "Name", "Size", "PACK"]
+                available_base = [c for c in base_cols if c in merged.columns]
+                
+                final_cols = available_base + sales_cols + ["Stock", "Order"]
+                
+                # Save to Session State
+                st.session_state['order_df'] = merged[final_cols].copy()
+                st.session_state['active_company'] = target_company
 
-                    # Logic: Stock
-                    if "setstock" in merged.columns:
-                        clean_stock = merged["setstock"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
-                        merged["Stock"] = pd.to_numeric(clean_stock, errors='coerce').fillna(0)
-                    else:
-                        merged["Stock"] = 0
-                    
-                    # Logic: Initialize Order Column
-                    merged["Order"] = 0
-                    
-                    # Final Columns (REMOVED: "Invoice UPC" and "0")
-                    base_cols = ["Full Barcode", "Name", "Size", "PACK"]
-                    available_base = [c for c in base_cols if c in merged.columns]
-                    
-                    final_cols = available_base + sales_cols + ["Stock", "Order"]
-                    
-                    # Save to Session State
-                    st.session_state['order_df'] = merged[final_cols].copy()
-                    st.session_state['active_company'] = target_company
+    except Exception as e:
+        st.error(f"System Error: {e}")
 
-        except Exception as e:
-            st.error(f"System Error: {e}")
-
-    # 2. Render Interactive Table (Outside col_gen for full width)
+    # 2. Render Interactive Table
     if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
         st.divider()
         st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
@@ -392,7 +393,6 @@ with tab_order:
                     step=1,
                     required=True
                 )
-                # Removed the emoji column configs for Stock and PACK
             },
             hide_index=True
         )
