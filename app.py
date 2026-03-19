@@ -4,6 +4,7 @@ import numpy as np
 import re
 import os
 import base64
+import html
 from io import BytesIO
 import psutil
 import xlsxwriter
@@ -107,6 +108,28 @@ def _format_sales_header(date_value) -> str:
         return f"{dt.month}/{dt.day}"
     except Exception:
         return str(date_value)
+
+def render_refresh_logo(image_path: str, width: int = 250):
+    """Render a header logo that reloads the current page when clicked."""
+    current_url = getattr(getattr(st, "context", None), "url", None)
+    if isinstance(current_url, str) and current_url.startswith(("http://", "https://")):
+        try:
+            with open(image_path, 'rb') as img_f:
+                img_b64 = base64.b64encode(img_f.read()).decode('utf-8')
+
+            st.markdown(
+                f"""
+                <a href="{html.escape(current_url, quote=True)}" target="_self" style="display:inline-block; line-height:0;">
+                    <img src="data:image/png;base64,{img_b64}" alt="LFM Process" style="width:{width}px; display:block;" />
+                </a>
+                """,
+                unsafe_allow_html=True,
+            )
+            return
+        except Exception:
+            pass
+
+    st.image(image_path, width=width)
 
 def to_xlsx_bytes(dfs_dict):
     output = BytesIO()
@@ -257,7 +280,7 @@ def set_last_upload_time(table_name):
 col_title, col_store = st.columns([6, 2]) # Give the segmented control room without crowding the logo
 
 with col_title:
-    st.image(LOGO_PATH, width=250)
+    render_refresh_logo(LOGO_PATH, width=250)
 
 with col_store:
     selected_store = st.segmented_control(
