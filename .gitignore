@@ -1,0 +1,11 @@
+# Ignore the entire .streamlit folder
+.streamlit/
+
+# Alternatively, if you want to keep config.toml but hide secrets:
+# .streamlit/secrets.toml
+
+# Common Python ignores
+__pycache__/
+*.pyc
+venv/
+.env

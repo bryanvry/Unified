@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import os
+import base64
 from io import BytesIO
 import psutil
 import xlsxwriter
@@ -33,18 +34,27 @@ if "authenticated" not in st.session_state:
 
 # 1. THE LOGIN SCREEN
 if not st.session_state["authenticated"]:
-    # Center the login box
-    col1, col2, col3 = st.columns([1, 2, 1])
+    # Center the login box (wider center column so large fixed-width logo can fit)
+    col1, col2, col3 = st.columns([1, 6, 1])
     
     with col2:
         st.write("")
         st.write("")
         
         # --- Centered Logo on Login Screen ---
-        # We use nested columns here to force the logo perfectly into the middle
-        logo_col1, logo_col2, logo_col3 = st.columns([1, 2, 1])
-        with logo_col2:
-            st.image(LOGO_PATH, use_column_width=True)
+        # Embed the image as base64 and render centered HTML so width is respected
+        try:
+            with open(LOGO_PATH, 'rb') as _img_f:
+                _b64 = base64.b64encode(_img_f.read()).decode('utf-8')
+            _html = f"""
+            <div style="text-align:center;">
+                <img src="data:image/png;base64,{_b64}" style="width:400px; display:block; margin-left:auto; margin-right:auto;" />
+            </div>
+            """
+            st.markdown(_html, unsafe_allow_html=True)
+        except Exception:
+            # Fallback to st.image if embedding fails
+            st.image(LOGO_PATH, width=400)
         
         
         entered_key = st.text_input("Passkey", type="password", placeholder="Enter passkey...")
@@ -89,6 +99,14 @@ def _norm_upc_12(u) -> str:
 
 def to_csv_bytes(df):
     return df.to_csv(index=False).encode('utf-8')
+
+def _format_sales_header(date_value) -> str:
+    """Render compact M/D headers for weekly sales columns."""
+    try:
+        dt = pd.to_datetime(date_value)
+        return f"{dt.month}/{dt.day}"
+    except Exception:
+        return str(date_value)
 
 def to_xlsx_bytes(dfs_dict):
     output = BytesIO()
@@ -236,14 +254,20 @@ def set_last_upload_time(table_name):
     except Exception as e:
         print(f"Failed to log upload time: {e}")
 # --- HEADER & STORE SELECTOR (Top Right) ---
-col_title, col_store = st.columns([7, 1]) # 7:1 ratio pushes selector to the right
+col_title, col_store = st.columns([6, 2]) # Give the segmented control room without crowding the logo
 
 with col_title:
     st.image(LOGO_PATH, width=250)
 
 with col_store:
-    selected_store = st.selectbox("Store", ["Twain", "Rancho"], label_visibility="collapsed")
-    st.caption(f"📍 **{selected_store}**")
+    selected_store = st.segmented_control(
+        "Store",
+        ["Twain", "Rancho"],
+        default="Twain",
+        key="store_selector",
+        label_visibility="collapsed",
+        width="stretch",
+    )
 
 # Map selection to Table Names
 if selected_store == "Twain":
@@ -255,14 +279,23 @@ else:
     SALES_TABLE = "salesrancho1"
     VENDOR_MAP_TABLE = "BeerandLiquorKeyRancho"
 
+# --- MAIN APP NAVIGATION ---
+nav_left, nav_center, nav_right = st.columns([1, 3, 1])
 
-# --- MAIN APP TABS ---
-tab_order, tab_invoice, tab_search, tab_admin = st.tabs(["Order Management", "Invoice Processing", "🔍 Item Search", "Admin / Uploads"])
+with nav_center:
+    current_page_title = st.segmented_control(
+        "Navigation",
+        ["Order Management", "Invoice Processing", "Item Search", "Admin / Uploads"],
+        default="Order Management",
+        key="main_navigation",
+        label_visibility="collapsed",
+        width="stretch",
+    )
 
 # ==============================================================================
 # TAB 1: ORDER MANAGEMENT
 # ==============================================================================
-with tab_order:
+if current_page_title == "Order Management":
     st.header(f"Orders: {selected_store}")
     
     # --- Interactive Order Builder ---
@@ -329,7 +362,7 @@ with tab_order:
                     sales_cols = sorted_dates[-15:]
                     sales_pivot = sales_pivot[sales_cols]
                     
-                    rename_dict = {col: pd.to_datetime(col).strftime('%m/%d') for col in sales_cols}
+                    rename_dict = {col: _format_sales_header(col) for col in sales_cols}
                     sales_pivot = sales_pivot.rename(columns=rename_dict)
                     sales_cols_display = list(rename_dict.values())
                     
@@ -348,6 +381,15 @@ with tab_order:
                 
                 final_cols = available_base + sales_cols_display + ["Stock", "Order"]
                 final_merged = merged[final_cols].copy()
+
+                # Sales history is whole-number weekly movement, so keep it compact.
+                for sales_col in sales_cols_display:
+                    if sales_col in final_merged.columns:
+                        final_merged[sales_col] = (
+                            pd.to_numeric(final_merged[sales_col], errors='coerce')
+                            .fillna(0)
+                            .astype(int)
+                        )
                 
                 # --- STRICT CASE-INSENSITIVE ALPHABETICAL SORT ---
                 # We create a temporary lowercase name column to force perfect alphabetical sorting
@@ -383,7 +425,7 @@ with tab_order:
         }
         
         for sc in st.session_state.get('sales_cols_display', []):
-            col_configs[sc] = st.column_config.NumberColumn(sc, width="small")
+            col_configs[sc] = st.column_config.NumberColumn(sc, format="%d")
             
         # --- HIDE THE TYPE COLUMN FROM THE UI ---
         if "type" in all_columns:
@@ -427,13 +469,14 @@ with tab_order:
                     label=f"⬇️ Download {st.session_state['active_company']} Order",
                     data=to_xlsx_bytes({st.session_state['active_company']: download_df}),
                     file_name=f"ORDER_{st.session_state['active_company']}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    on_click="ignore"
                 )
                 st.success(f"Ready! Contains {len(download_df)} items.")
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
-with tab_invoice:
+if current_page_title == "Invoice Processing":
     # Helper to normalize UPCs to 12 digits (for matching)
     # Helper to normalize UPCs to 12 or 13 digits (for matching)
     def _norm_upc_12(u):
@@ -679,12 +722,26 @@ with tab_invoice:
                     dl_col1, dl_col2 = st.columns(2)
                     
                     with dl_col1:
-                        st.download_button("⬇️ Download POS Update CSV", to_csv_bytes(final_pos_out), f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", "text/csv", use_container_width=True)
+                        st.download_button(
+                            "⬇️ Download POS Update CSV",
+                            data=to_csv_bytes(final_pos_out),
+                            file_name=f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv",
+                            mime="text/csv",
+                            width="stretch",
+                            on_click="ignore"
+                        )
                     
                     with dl_col2:
                         edited_items_only = final_edited[final_edited["New"].notna() & (final_edited["New"] > 0)].copy()
                         if not edited_items_only.empty:
-                            st.download_button("🏷️ Download Price Labels (Excel)", data=generate_barcode_excel(edited_items_only), file_name=f"Price_Labels_{datetime.today().strftime('%Y-%m-%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                            st.download_button(
+                                "🏷️ Download Price Labels (Excel)",
+                                data=generate_barcode_excel(edited_items_only),
+                                file_name=f"Price_Labels_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                width="stretch",
+                                on_click="ignore"
+                            )
                         else:
                             st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", use_container_width=True)
             
@@ -1210,9 +1267,10 @@ with tab_invoice:
                     
                     st.download_button(
                         "⬇️ Download POS Update CSV", 
-                        to_csv_bytes(final_pos_out), 
-                        f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                        "text/csv"
+                        data=to_csv_bytes(final_pos_out), 
+                        file_name=f"POS_Update_JCSales_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                        mime="text/csv",
+                        on_click="ignore"
                     )
 
                 # ==========================================
@@ -1561,9 +1619,10 @@ with tab_invoice:
                     
                     st.download_button(
                         "⬇️ Download POS Update CSV", 
-                        to_csv_bytes(final_pos_out), 
-                        f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
-                        "text/csv"
+                        data=to_csv_bytes(final_pos_out), 
+                        file_name=f"POS_Update_{vendor}_{datetime.today().strftime('%Y-%m-%d')}.csv", 
+                        mime="text/csv",
+                        on_click="ignore"
                     )
     # --- COSTCO ---
     elif vendor == "Costco":
@@ -1616,7 +1675,12 @@ with tab_invoice:
                         res_df = pd.DataFrame(results)
                         st.success(f"Processed {len(res_df)} items.")
                         st.dataframe(res_df)
-                        st.download_button("⬇️ Download Costco Report", to_xlsx_bytes({"Costco": res_df}), "Costco_Report.xlsx")
+                        st.download_button(
+                            "⬇️ Download Costco Report",
+                            data=to_xlsx_bytes({"Costco": res_df}),
+                            file_name="Costco_Report.xlsx",
+                            on_click="ignore"
+                        )
                         
                 except Exception as e:
                     st.error(f"Error processing master/receipt: {e}")
@@ -1682,7 +1746,7 @@ def get_full_search_data(store):
     return base_display, sales_cols
 
 # --- TAB UI ---
-with tab_search:
+if current_page_title == "Item Search":
     st.header(f"Live Pricebook Search: {selected_store}")
     
     # Silently load the DB into RAM (takes ~1-2 secs on first load, instant after)
@@ -1740,7 +1804,7 @@ with tab_search:
 # ==============================================================================
 # TAB 4: ADMIN / UPLOADS
 # ==============================================================================
-with tab_admin:
+if current_page_title == "Admin / Uploads":
     st.header("Database Administration")
     
     # --- LIVE RAM MONITOR ---
@@ -1805,7 +1869,8 @@ with tab_admin:
                 data=to_xlsx_bytes({"VendorMap": export_map}),
                 file_name=f"VendorMap_{selected_store}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch",
+                on_click="ignore"
             )
         
         map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
@@ -1853,7 +1918,8 @@ with tab_admin:
                 data=to_xlsx_bytes({"JCSalesKey": current_jc}),
                 file_name=f"JCSalesKey_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch",
+                on_click="ignore"
             )
             
         jc_upload = st.file_uploader("Upload JC Sales Key xlsx/csv", type=["xlsx", "csv"], key="jc_admin")
