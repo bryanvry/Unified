@@ -819,15 +819,15 @@ if current_page_title == "Invoice Processing":
             st.session_state["analyze_jc"] = False
             st.session_state["current_jc_vendor"] = vendor
             
-        jc_text = st.text_area("Paste JC Sales Text (Select All in PDF -> Copy -> Paste)", height=250)
+        jc_upload = st.file_uploader("Upload JC Sales Invoice (PDF)", type=["pdf"], key="jc_invoice")
         
-        if not jc_text:
+        if not jc_upload:
             st.session_state["analyze_jc"] = False
             
         if st.button("Analyze JC Sales", type="primary"):
             st.session_state["analyze_jc"] = True
             
-        if st.session_state.get("analyze_jc", False) and jc_text:
+        if st.session_state.get("analyze_jc", False) and jc_upload:
             jc_key = load_jcsales_key()
             pb_df = load_pricebook(PRICEBOOK_TABLE)
             
@@ -835,10 +835,13 @@ if current_page_title == "Invoice Processing":
                 st.error("JCSalesKey is empty. Please upload it in the Admin tab.")
                 st.stop()
                 
-            jc_df, _ = JCSalesParser().parse(jc_text)
+            jc_df, jc_invoice_number = JCSalesParser().parse(jc_upload)
             if jc_df.empty:
-                st.error("No items parsed from text.")
+                st.error("No items parsed from the uploaded PDF.")
                 st.stop()
+                
+            if jc_invoice_number:
+                st.caption(f"Invoice: {jc_invoice_number}")
                 
             # Clean items for mapping
             jc_df["ITEM_str"] = jc_df["ITEM"].astype(str).str.strip()
@@ -878,7 +881,7 @@ if current_page_title == "Invoice Processing":
             if items_to_scrape:
                 scrape_hash = "_".join(sorted(items_to_scrape))
 
-                # Only run the scraper once per unique batch so we don't spam the website
+                # Only run the scraper once per unique batch to avoid duplicate work during reruns
                 if st.session_state.get("last_scrape_hash") != scrape_hash:
                     st.write(f"### Auto-Scraping {len(items_to_scrape)} Items")
                     progress_bar = st.progress(0)
@@ -886,7 +889,6 @@ if current_page_title == "Invoice Processing":
 
                     import requests
                     from bs4 import BeautifulSoup
-                    import time
                     from urllib.parse import urljoin
 
                     potential_matches = []
@@ -996,10 +998,8 @@ if current_page_title == "Invoice Processing":
                             status_text.error(f"⚠️ Error scraping **{item_num_str}**: {e}")
 
                         progress_bar.progress((i + 1) / len(items_to_scrape))
-                        time.sleep(1.5)
 
                     status_text.info("✨ Scraping complete! Preparing review board...")
-                    time.sleep(1)
                     st.session_state["scraped_matches"] = potential_matches
                     st.session_state["last_scrape_hash"] = scrape_hash
 
@@ -1095,7 +1095,11 @@ if current_page_title == "Invoice Processing":
                     "COST": missing_items["COST"]
                 })
                 
-                edited_rows = st.data_editor(edit_df, num_rows="dynamic", key="jc_missing_items")
+                edited_rows = st.data_editor(
+                    edit_df,
+                    hide_index=True,
+                    key="jc_missing_items"
+                )
                 
                 if st.button("Save New Items to Database", type="primary"):
                     to_insert = edited_rows[edited_rows["UPC1"].str.strip() != ""].copy()
@@ -1189,33 +1193,44 @@ if current_page_title == "Invoice Processing":
                 
                 if not changes.empty:
                     st.error(f"{len(changes)} Unit Cost Changes Detected")
-                    st.write("**Edit the 'New Price' column to set a custom retail price.**")
+                    st.write("**Edit the 'New Price' column to set a custom retail price. Uncheck any row you want excluded from the POS update file.**")
                     
-                    display_changes = pd.DataFrame()
-                    display_changes["Item Number"] = changes["ITEM_str"] 
-                    display_changes["Barcode"] = changes["Resolved_UPC"]
-                    display_changes["Item"] = changes["DESCRIPTION"]
-                    display_changes["Old Unit Cost"] = changes["PB_Unit_Cents"] / 100.0
-                    display_changes["New Unit Cost"] = changes["Inv_Unit_Cents"] / 100.0
-                    
-                    # --- NEW: Grab the current retail price from the pricebook! ---
-                    display_changes["Now"] = pd.to_numeric(changes["cents"], errors="coerce").fillna(0) / 100.0
-                    
-                    display_changes["New Price"] = None
+                    change_signature = str(
+                        pd.util.hash_pandas_object(
+                            changes[["ITEM_str", "Resolved_UPC", "PB_Unit_Cents", "Inv_Unit_Cents"]].astype(str),
+                            index=False
+                        ).sum()
+                    )
+                    if st.session_state.get("jc_changes_signature") != change_signature:
+                        st.session_state["jc_changes_signature"] = change_signature
+                        st.session_state.pop("jc_pos_ready", None)
+                        st.session_state.pop("jc_edited_changes", None)
+                        st.session_state.pop("jc_final_check", None)
+
+                    display_changes = pd.DataFrame({
+                        "_include": [True] * len(changes),
+                        "Item Number": changes["ITEM_str"].astype(str).tolist(),
+                        "Barcode": changes["Resolved_UPC"].astype(str).tolist(),
+                        "Item": changes["DESCRIPTION"].astype(str).tolist(),
+                        "Old Unit Cost": (changes["PB_Unit_Cents"] / 100.0).tolist(),
+                        "New Unit Cost": (changes["Inv_Unit_Cents"] / 100.0).tolist(),
+                        "Now": (pd.to_numeric(changes["cents"], errors="coerce").fillna(0) / 100.0).tolist(),
+                        "New Price": [None] * len(changes),
+                    })
                     
                     edited_changes = st.data_editor(
                         display_changes,
                         column_config={
-                            "Item Number": st.column_config.TextColumn(disabled=True),
-                            "Barcode": st.column_config.TextColumn(disabled=True),
-                            "Item": st.column_config.TextColumn(disabled=True),
-                            "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                            "New Unit Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                            "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f", disabled=True),
+                            "_include": st.column_config.CheckboxColumn("", default=True, width="small"),
+                            "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                            "New Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                            "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f"),
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
+                        disabled=["Item Number", "Barcode", "Item", "Old Unit Cost", "New Unit Cost", "Now"],
                         use_container_width=True,
-                        hide_index=True
+                        hide_index=True,
+                        key=f"jc_price_changes_{change_signature}"
                     )
                     
                     st.divider()
@@ -1244,9 +1259,36 @@ if current_page_title == "Invoice Processing":
                     pos_cols = [
                         "Upc", "Department", "qty", "cents", "incltaxes", "inclfees", 
                         "Name", "size", "ebt", "byweight", "Fee Multiplier", 
-                        "cost_qty", "cost_cents", "addstock"
+                        "cost_qty", "cost_cents"
                     ]
-                    
+
+                    excluded_items = set()
+                    if edited_changes is not None and "_include" in edited_changes.columns:
+                        excluded_items = set(
+                            edited_changes.loc[~edited_changes["_include"].fillna(True), "Item Number"]
+                            .astype(str)
+                            .str.strip()
+                        )
+
+                    if excluded_items:
+                        final_check = final_check[
+                            ~final_check["ITEM_str"].astype(str).str.strip().isin(excluded_items)
+                        ].copy()
+
+                    final_check = final_check.reset_index(drop=True)
+
+                    user_prices = {}
+                    if edited_changes is not None and "New Price" in edited_changes.columns:
+                        priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
+                        if "_include" in priced_items.columns:
+                            priced_items = priced_items[priced_items["_include"].fillna(True)]
+                        user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
+
+                    if final_check.empty:
+                        st.warning("No JC Sales items are selected for the POS update file.")
+
+                    final_check["User_New_Price"] = final_check["Resolved_UPC"].map(user_prices)
+
                     pos_out = pd.DataFrame()
                     
                     def clean_and_format_upc(u):
@@ -1259,14 +1301,6 @@ if current_page_title == "Invoice Processing":
                     # Force POS to use UNIT cost and a cost_qty of 1
                     pos_out["cost_cents"] = final_check["Inv_Unit_Cents"]
                     pos_out["cost_qty"] = 1
-                    pos_out["addstock"] = 0 
-                    
-                    user_prices = {}
-                    if edited_changes is not None and "New Price" in edited_changes.columns:
-                        priced_items = edited_changes[edited_changes["New Price"].notna() & (edited_changes["New Price"] > 0)]
-                        user_prices = dict(zip(priced_items["Barcode"], priced_items["New Price"]))
-
-                    final_check["User_New_Price"] = final_check["Resolved_UPC"].map(user_prices)
 
                     # Keep other metadata from the pricebook and override cents if new price set
                     for col in ["Department", "qty", "cents", "incltaxes", "inclfees", "ebt", "byweight", "Fee Multiplier", "size", "Name"]:
