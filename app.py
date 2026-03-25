@@ -101,6 +101,12 @@ def _norm_upc_12(u) -> str:
 def to_csv_bytes(df):
     return df.to_csv(index=False).encode('utf-8')
 
+def calculate_jc_retail(unit_cost, store):
+    """Calculate JC Sales retail from unit cost using store-specific margins."""
+    unit_cost = pd.to_numeric(unit_cost, errors="coerce")
+    divisor = 0.6 if store == "Rancho" else 0.5
+    return unit_cost / divisor
+
 def _format_sales_header(date_value) -> str:
     """Render compact M/D headers for weekly sales columns."""
     try:
@@ -709,14 +715,15 @@ if current_page_title == "Invoice Processing":
                         return f'="{s}"'
 
                     pos_out["Upc"] = final_matched["Upc"].apply(clean_and_format_upc)
-                    pos_out["cost_cents"] = final_matched["New_Cost_Cents"]
-                    pos_out["cost_qty"] = final_matched["New_Pack"]
+                    pos_out["cost_cents"] = final_matched["New_Unit_Cents"].round().astype(int)
+                    pos_out["cost_qty"] = 1
                     
                     qty_col = next((c for c in final_matched.columns if c in ["Case Qty", "Case Quantity", "Cases", "Qty"]), None)
                     total_actual_cases = 0
                     if qty_col:
                         cases = pd.to_numeric(final_matched[qty_col], errors='coerce').fillna(0)
-                        pos_out["addstock"] = (cases * pos_out["cost_qty"]).astype(int)
+                        stock_pack = pd.to_numeric(final_matched["New_Pack"], errors='coerce').fillna(1).astype(int)
+                        pos_out["addstock"] = (cases * stock_pack).astype(int)
                         # NEW: Capture the actual case count before it multiplies into units!
                         total_actual_cases = int(cases.sum())
                     else:
@@ -1215,6 +1222,7 @@ if current_page_title == "Invoice Processing":
                         "Old Unit Cost": (changes["PB_Unit_Cents"] / 100.0).tolist(),
                         "New Unit Cost": (changes["Inv_Unit_Cents"] / 100.0).tolist(),
                         "Now": (pd.to_numeric(changes["cents"], errors="coerce").fillna(0) / 100.0).tolist(),
+                        "Retail": calculate_jc_retail(changes["Inv_Unit_Cents"] / 100.0, selected_store).tolist(),
                         "New Price": [None] * len(changes),
                     })
                     
@@ -1225,9 +1233,10 @@ if current_page_title == "Invoice Processing":
                             "Old Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
                             "New Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
                             "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f"),
+                            "Retail": st.column_config.NumberColumn("Retail ($)", format="$%.2f"),
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
-                        disabled=["Item Number", "Barcode", "Item", "Old Unit Cost", "New Unit Cost", "Now"],
+                        disabled=["Item Number", "Barcode", "Item", "Old Unit Cost", "New Unit Cost", "Now", "Retail"],
                         use_container_width=True,
                         hide_index=True,
                         key=f"jc_price_changes_{change_signature}"
@@ -1367,7 +1376,7 @@ if current_page_title == "Invoice Processing":
                     review_final["Description"] = review_merged["DESCRIPTION"]
                     review_final["Unit"] = pd.to_numeric(review_merged["UNIT"], errors="coerce")
                     review_final["Now"] = upc_now[1]
-                    review_final["Retail"] = review_final["Unit"] * 2
+                    review_final["Retail"] = calculate_jc_retail(review_final["Unit"], selected_store)
                     
                     st.dataframe(
                         review_final,

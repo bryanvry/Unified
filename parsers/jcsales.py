@@ -10,8 +10,9 @@ import pdfplumber
 WANT_COLS = ["ITEM", "DESCRIPTION", "PACK", "COST", "UNIT"]
 _MONEY = r"\$?\d[\d,]*\.\d{2}"
 _MONEY_RE = re.compile(_MONEY)
+_TYPE_CODE = r"(?:[A-Z]{1,3}\s+)?"
 _HEAD_RE = re.compile(
-    r"^\s*(?P<linenum>\d+)\s+(?:[A-Z]\s+)?(?P<item>\d{4,8})\s+(?P<rest>.+?)\s*$",
+    rf"^\s*(?P<linenum>\d+)\s+{_TYPE_CODE}(?P<item>\d{{4,8}})\s+(?P<rest>.+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -20,7 +21,7 @@ _LINE_PATTERNS = [
         rf"""
         ^\s*
         (?P<linenum>\d+)\s+
-        (?:[A-Z]\s+)?
+        {_TYPE_CODE}
         (?P<item>\d{{4,8}})\s+
         (?P<desc>.+?)\s+
         (?P<rqty>\d+)\s+
@@ -39,7 +40,7 @@ _LINE_PATTERNS = [
         rf"""
         ^\s*
         (?P<linenum>\d+)\s+
-        (?:[A-Z]\s+)?
+        {_TYPE_CODE}
         (?P<item>\d{{4,8}})\s+
         (?P<desc>.+?)\s+
         (?P<rqty>\d+)\s+
@@ -58,7 +59,7 @@ _LINE_PATTERNS = [
         rf"""
         ^\s*
         (?P<linenum>\d+)\s+
-        (?:[A-Z]\s+)?
+        {_TYPE_CODE}
         (?P<item>\d{{4,8}})\s+
         (?P<desc>.+?)\s+
         (?P<pack>\d+)\s+
