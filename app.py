@@ -21,7 +21,7 @@ from ui_theme import apply_brand_theme, render_sidebar_navigation, render_worksp
 # --- CONFIGURATION ---
 st.set_page_config(
     page_title="LFM Process",
-    page_icon="logo.png",
+    page_icon="assets/favicon_sun.png",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -290,17 +290,17 @@ def set_last_upload_time(table_name):
         print(f"Failed to log upload time: {e}")
 # --- APP CHROME ---
 PAGE_DETAILS = {
-    "Order Management": {
-        "title": "Live orders",
-        "subtitle": "Build store orders from mapped vendor items and recent sales history.",
+    "Item Search": {
+        "title": "Pricebook search",
+        "subtitle": "Search the live pricebook with recent sales and inventory context for the active store.",
     },
     "Invoice Processing": {
         "title": "Invoice processing",
         "subtitle": "Upload vendor invoices, review matches, and generate the export files your team needs.",
     },
-    "Item Search": {
-        "title": "Pricebook search",
-        "subtitle": "Search the live pricebook with recent sales and inventory context for the active store.",
+    "Order Management": {
+        "title": "Live orders",
+        "subtitle": "Build store orders from mapped vendor items and recent sales history.",
     },
     "Admin / Uploads": {
         "title": "Admin controls",
