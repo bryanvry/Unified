@@ -1961,210 +1961,241 @@ if current_page_title == "Admin / Uploads":
     import time # Needed for the short refresh delay
     
     col_pb, col_map, col_jc = st.columns(3)
-    
+
     with col_pb:
-        st.markdown('<div class="section-kicker">Pricebook</div>', unsafe_allow_html=True)
-        st.caption(f"Target: `{PRICEBOOK_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(PRICEBOOK_TABLE)}**")
-        pb_upload = st.file_uploader("Upload Pricebook CSV", type=["csv"], key="pb_admin")
-        
-        if pb_upload and st.button("Replace Pricebook", type="primary"):
-            try:
-                df = pd.read_csv(pb_upload, dtype=str)
-                df.columns = [c.strip() for c in df.columns]
-                
-                upc_col = next((c for c in df.columns if c.lower() == 'upc'), None)
-                if not upc_col:
-                    st.error("CSV must have a 'Upc' column.")
-                else:
-                    df = df.rename(columns={upc_col: "Upc"})
-                    conn = get_db_connection()
-                    
-                    with conn.session as session:
-                        session.execute(text(f'TRUNCATE TABLE "{PRICEBOOK_TABLE}";'))
-                        session.commit()
-                    
-                    valid_cols = [
-                        "Upc", "Department", "qty", "cents", "setstock", "cost_qty", "cost_cents", "Name",
-                        "incltaxes", "inclfees", "size", "ebt", "byweight", "Fee Multiplier"
-                    ]
-                    
-                    cols_to_use = [c for c in valid_cols if c in df.columns]
-                    df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
-                    
-                    set_last_upload_time(PRICEBOOK_TABLE)
-                    st.success(f"Replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
-                    time.sleep(1)
-                    st.rerun() 
-            except Exception as e:
-                st.error(f"Error updating pricebook: {e}")
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="section-kicker">Pricebook</div>
+                <div class="note-bar" style="margin:0.6rem 0 0.8rem 0;">
+                    <div style="font-size:0.72rem;font-weight:800;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted);margin-bottom:0.22rem;">Target table</div>
+                    <code>{PRICEBOOK_TABLE}</code><br>
+                    <span style="font-size:0.82rem;color:var(--muted);">Last upload: <strong style="color:var(--ink);">{get_last_upload_time(PRICEBOOK_TABLE)}</strong></span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            pb_upload = st.file_uploader("Upload Pricebook CSV", type=["csv"], key="pb_admin")
+
+            if pb_upload and st.button("Replace Pricebook", type="primary", width="stretch"):
+                try:
+                    df = pd.read_csv(pb_upload, dtype=str)
+                    df.columns = [c.strip() for c in df.columns]
+
+                    upc_col = next((c for c in df.columns if c.lower() == 'upc'), None)
+                    if not upc_col:
+                        st.error("CSV must have a 'Upc' column.")
+                    else:
+                        df = df.rename(columns={upc_col: "Upc"})
+                        conn = get_db_connection()
+
+                        with conn.session as session:
+                            session.execute(text(f'TRUNCATE TABLE "{PRICEBOOK_TABLE}";'))
+                            session.commit()
+
+                        valid_cols = [
+                            "Upc", "Department", "qty", "cents", "setstock", "cost_qty", "cost_cents", "Name",
+                            "incltaxes", "inclfees", "size", "ebt", "byweight", "Fee Multiplier"
+                        ]
+
+                        cols_to_use = [c for c in valid_cols if c in df.columns]
+                        df[cols_to_use].to_sql(PRICEBOOK_TABLE, conn.engine, if_exists='append', index=False)
+
+                        set_last_upload_time(PRICEBOOK_TABLE)
+                        st.success(f"Replaced {len(df)} rows in {PRICEBOOK_TABLE}.")
+                        time.sleep(1)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error updating pricebook: {e}")
 
     with col_map:
-        st.markdown('<div class="section-kicker">Vendor Map</div>', unsafe_allow_html=True)
-        st.caption(f"Target: `{VENDOR_MAP_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(VENDOR_MAP_TABLE)}**")
-        
-        current_map = load_vendor_map(VENDOR_MAP_TABLE)
-        if not current_map.empty:
-            export_map = current_map.drop(columns=["_inv_upc_norm"], errors="ignore")
-            st.download_button(
-                label=f"⬇️ Download Current {selected_store} Map",
-                data=to_xlsx_bytes({"VendorMap": export_map}),
-                file_name=f"VendorMap_{selected_store}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-                on_click="ignore"
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="section-kicker">Vendor Map</div>
+                <div class="note-bar" style="margin:0.6rem 0 0.8rem 0;">
+                    <div style="font-size:0.72rem;font-weight:800;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted);margin-bottom:0.22rem;">Target table</div>
+                    <code>{VENDOR_MAP_TABLE}</code><br>
+                    <span style="font-size:0.82rem;color:var(--muted);">Last upload: <strong style="color:var(--ink);">{get_last_upload_time(VENDOR_MAP_TABLE)}</strong></span>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-        
-        map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
-        
-        if map_upload and st.button("Replace Map", type="primary"):
-            try:
-                df = pd.read_excel(map_upload, dtype=str)
-                if "Full Barcode" not in df.columns or "Invoice UPC" not in df.columns:
-                    st.error("File missing 'Full Barcode' or 'Invoice UPC'.")
-                else:
-                    # --- NEW: Automatically drop duplicate Invoice UPCs before sending to DB ---
-                    # We keep the "last" one so the most recent data overrides the older duplicate
-                    original_count = len(df)
-                    df = df.drop_duplicates(subset=["Invoice UPC"], keep="last")
-                    dropped_count = original_count - len(df)
-                    
-                    if dropped_count > 0:
-                        st.warning(f"🧹 Removed {dropped_count} duplicate Invoice UPCs from your upload.")
-                    # --------------------------------------------------------------------------
+            current_map = load_vendor_map(VENDOR_MAP_TABLE)
+            if not current_map.empty:
+                export_map = current_map.drop(columns=["_inv_upc_norm"], errors="ignore")
+                st.download_button(
+                    label=f"Download Current {selected_store} Map",
+                    data=to_xlsx_bytes({"VendorMap": export_map}),
+                    file_name=f"VendorMap_{selected_store}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                    on_click="ignore"
+                )
+
+            map_upload = st.file_uploader("Upload Beer & Liquor Master xlsx", type=["xlsx"], key="map_admin")
+
+            if map_upload and st.button("Replace Map", type="primary", width="stretch"):
+                try:
+                    df = pd.read_excel(map_upload, dtype=str)
+                    if "Full Barcode" not in df.columns or "Invoice UPC" not in df.columns:
+                        st.error("File missing 'Full Barcode' or 'Invoice UPC'.")
+                    else:
+                        # --- NEW: Automatically drop duplicate Invoice UPCs before sending to DB ---
+                        # We keep the "last" one so the most recent data overrides the older duplicate
+                        original_count = len(df)
+                        df = df.drop_duplicates(subset=["Invoice UPC"], keep="last")
+                        dropped_count = original_count - len(df)
+
+                        if dropped_count > 0:
+                            st.warning(f"Removed {dropped_count} duplicate Invoice UPCs from your upload.")
+                        # --------------------------------------------------------------------------
+
+                        conn = get_db_connection()
+                        target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company", "type"]
+                        cols_to_load = [c for c in target_cols if c in df.columns]
+
+                        with conn.session as session:
+                            session.execute(text(f'TRUNCATE TABLE "{VENDOR_MAP_TABLE}";'))
+                            session.commit()
+
+                        df[cols_to_load].to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
+
+                        set_last_upload_time(VENDOR_MAP_TABLE)
+                        st.success(f"Map replaced successfully with {len(df)} unique rows.")
+                        time.sleep(2)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error updating map: {e}")
+
+    with col_jc:
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="section-kicker">JC Sales Key</div>
+                <div class="note-bar" style="margin:0.6rem 0 0.8rem 0;">
+                    <div style="font-size:0.72rem;font-weight:800;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted);margin-bottom:0.22rem;">Target table</div>
+                    <code>JCSalesKey</code><br>
+                    <span style="font-size:0.82rem;color:var(--muted);">Last upload: <strong style="color:var(--ink);">{get_last_upload_time('JCSalesKey')}</strong></span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            current_jc = load_jcsales_key()
+            if not current_jc.empty:
+                st.download_button(
+                    label="Download Current JC Sales Key",
+                    data=to_xlsx_bytes({"JCSalesKey": current_jc}),
+                    file_name=f"JCSalesKey_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                    on_click="ignore"
+                )
+
+            jc_upload = st.file_uploader("Upload JC Sales Key xlsx/csv", type=["xlsx", "csv"], key="jc_admin")
+
+            if jc_upload and st.button("Replace JC Sales Key", type="primary", width="stretch"):
+                try:
+                    df = pd.read_excel(jc_upload, dtype=str) if jc_upload.name.endswith('.xlsx') else pd.read_csv(jc_upload, dtype=str)
+                    target_cols = ["ITEM", "UPC1", "UPC2", "DESCRIPTION", "PACK", "COST"]
+                    cols_to_load = [c for c in target_cols if c in df.columns]
 
                     conn = get_db_connection()
-                    target_cols = ["Full Barcode", "Invoice UPC", "0", "Name", "Size", "PACK", "Company", "type"]
-                    cols_to_load = [c for c in target_cols if c in df.columns]
-                    
                     with conn.session as session:
-                        session.execute(text(f'TRUNCATE TABLE "{VENDOR_MAP_TABLE}";'))
+                        session.execute(text('TRUNCATE TABLE "JCSalesKey";'))
                         session.commit()
-                        
-                    df[cols_to_load].to_sql(VENDOR_MAP_TABLE, conn.engine, if_exists='append', index=False)
-                    
-                    set_last_upload_time(VENDOR_MAP_TABLE)
-                    st.success(f"Map replaced successfully with {len(df)} unique rows.")
-                    time.sleep(2)
-                    st.rerun() 
-            except Exception as e:
-                st.error(f"Error updating map: {e}")
-    with col_jc:
-        st.markdown('<div class="section-kicker">JC Sales Key</div>', unsafe_allow_html=True)
-        st.caption(f"Target: `JCSalesKey`  \n⏳ Last Uploaded: **{get_last_upload_time('JCSalesKey')}**")
-        
-        current_jc = load_jcsales_key()
-        if not current_jc.empty:
-            st.download_button(
-                label="⬇️ Download Current JC Sales Key",
-                data=to_xlsx_bytes({"JCSalesKey": current_jc}),
-                file_name=f"JCSalesKey_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-                on_click="ignore"
-            )
-            
-        jc_upload = st.file_uploader("Upload JC Sales Key xlsx/csv", type=["xlsx", "csv"], key="jc_admin")
-        
-        if jc_upload and st.button("Replace JC Sales Key", type="primary"):
-            try:
-                df = pd.read_excel(jc_upload, dtype=str) if jc_upload.name.endswith('.xlsx') else pd.read_csv(jc_upload, dtype=str)
-                target_cols = ["ITEM", "UPC1", "UPC2", "DESCRIPTION", "PACK", "COST"]
-                cols_to_load = [c for c in target_cols if c in df.columns]
-                
-                conn = get_db_connection()
-                with conn.session as session:
-                    session.execute(text('TRUNCATE TABLE "JCSalesKey";'))
-                    session.commit()
-                    
-                df[cols_to_load].to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
-                
-                set_last_upload_time("JCSalesKey")
-                st.success(f"JC Sales Key replaced with {len(df)} rows.")
-                time.sleep(1)
-                st.rerun() 
-            except Exception as e:
-                st.error(f"Error updating JC Sales Key: {e}")
+
+                    df[cols_to_load].to_sql("JCSalesKey", conn.engine, if_exists='append', index=False)
+
+                    set_last_upload_time("JCSalesKey")
+                    st.success(f"JC Sales Key replaced with {len(df)} rows.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error updating JC Sales Key: {e}")
 
     # =========================================================
-    # 📊 MANAGE ITEM SALES DATA
+    # MANAGE ITEM SALES DATA
     # =========================================================
-    st.divider()
     st.markdown(
-        """
-        <div class="section-kicker">Sales Data</div>
-        <div class="section-copy" style="margin-bottom:0.35rem;">
+        f"""
+        <div class="section-kicker" style="margin-top:1.2rem;">Sales Data</div>
+        <div class="section-copy" style="margin:0.3rem 0 0.75rem 0;">
             Upload new weekly sales files or remove existing sales dates for the active store.
+            &nbsp;<code style="font-size:0.8rem;">{SALES_TABLE}</code>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.caption(f"Target: `{SALES_TABLE}`")
-    
+
     col_upload, col_delete = st.columns(2)
-    
+
     # --- LEFT SIDE: UPLOAD SALES ---
     with col_upload:
-        st.markdown("**1. Upload Weekly Sales**")
-        sales_date = st.date_input("Week Ending Date", datetime.today())
-        sales_file = st.file_uploader("Upload itemsales.csv", type=["csv"], key="sales_upload")
-        
-        if sales_file and st.button("Save Sales to DB", type="primary"):
-            try:
-                sales_df = pd.read_csv(sales_file, dtype=str)
-                req_cols = {"UPC", "Item", "# of Items", "Sales $"}
-                if not req_cols.issubset(sales_df.columns):
-                    st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
-                else:
-                    db_rows = pd.DataFrame()
-                    db_rows["week_date"] = [sales_date] * len(sales_df)
-                    db_rows["UPC"] = sales_df["UPC"]
-                    db_rows["Item"] = sales_df["Item"]
-                    db_rows["qty_sold"] = pd.to_numeric(sales_df["# of Items"], errors='coerce').fillna(0)
-                    db_rows["Sales_Dollars"] = pd.to_numeric(sales_df["Sales $"].astype(str).str.replace('$','').str.replace(',',''), errors='coerce').fillna(0)
-                    
-                    conn = get_db_connection()
-                    db_rows.to_sql(SALES_TABLE, conn.engine, if_exists='append', index=False)
-                    st.success(f"✅ Added {len(db_rows)} records to {SALES_TABLE}!")
-                    time.sleep(1.5)
-                    st.rerun() # Refresh so the dropdown on the right updates instantly!
-            except Exception as e:
-                st.error(f"Failed to process sales file: {e}")
+        with st.container(border=True):
+            st.markdown('<div class="section-kicker">Upload Weekly Sales</div>', unsafe_allow_html=True)
+            sales_date = st.date_input("Week Ending Date", datetime.today())
+            sales_file = st.file_uploader("Upload itemsales.csv", type=["csv"], key="sales_upload")
+
+            if sales_file and st.button("Save Sales to DB", type="primary", width="stretch"):
+                try:
+                    sales_df = pd.read_csv(sales_file, dtype=str)
+                    req_cols = {"UPC", "Item", "# of Items", "Sales $"}
+                    if not req_cols.issubset(sales_df.columns):
+                        st.error(f"CSV missing columns. Found: {list(sales_df.columns)}")
+                    else:
+                        db_rows = pd.DataFrame()
+                        db_rows["week_date"] = [sales_date] * len(sales_df)
+                        db_rows["UPC"] = sales_df["UPC"]
+                        db_rows["Item"] = sales_df["Item"]
+                        db_rows["qty_sold"] = pd.to_numeric(sales_df["# of Items"], errors='coerce').fillna(0)
+                        db_rows["Sales_Dollars"] = pd.to_numeric(sales_df["Sales $"].astype(str).str.replace('$','').str.replace(',',''), errors='coerce').fillna(0)
+
+                        conn = get_db_connection()
+                        db_rows.to_sql(SALES_TABLE, conn.engine, if_exists='append', index=False)
+                        st.success(f"Added {len(db_rows)} records to {SALES_TABLE}.")
+                        time.sleep(1.5)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to process sales file: {e}")
 
     # --- RIGHT SIDE: DELETE SALES ---
     with col_delete:
-        st.markdown("**2. Delete Sales Data**")
-        
-        def fetch_sales_dates(table_name):
-            try:
-                conn = get_db_connection()
-                query = f'SELECT DISTINCT "week_date" FROM "{table_name}" WHERE "week_date" IS NOT NULL ORDER BY "week_date" DESC'
-                df = conn.query(query, ttl=0)
-                if not df.empty:
-                    return pd.to_datetime(df["week_date"]).dt.strftime('%Y-%m-%d').unique().tolist()
-            except Exception as e:
-                pass
-            return []
+        with st.container(border=True):
+            st.markdown('<div class="section-kicker">Delete Sales Data</div>', unsafe_allow_html=True)
 
-        available_dates = fetch_sales_dates(SALES_TABLE)
-        
-        if available_dates:
-            date_to_delete = st.selectbox("Select Date to Delete", available_dates)
-            
-            st.write("") # Spacing
-            if st.button(f"Delete Sales for {date_to_delete}", type="primary"):
+            def fetch_sales_dates(table_name):
                 try:
                     conn = get_db_connection()
-                    with conn.session as session:
-                        session.execute(
-                            text(f'DELETE FROM "{SALES_TABLE}" WHERE "week_date" = :d'), 
-                            {"d": date_to_delete}
-                        )
-                        session.commit()
-                        
-                    st.success(f"✅ Successfully deleted all sales data for {date_to_delete} from {selected_store}!")
-                    time.sleep(1.5)
-                    st.rerun() 
-                except Exception as e:
-                    st.error(f"Error deleting data: {e}")
-        else:
-            st.info(f"No item sales dates found in the database for {selected_store}.")
+                    query = f'SELECT DISTINCT "week_date" FROM "{table_name}" WHERE "week_date" IS NOT NULL ORDER BY "week_date" DESC'
+                    df = conn.query(query, ttl=0)
+                    if not df.empty:
+                        return pd.to_datetime(df["week_date"]).dt.strftime('%Y-%m-%d').unique().tolist()
+                except Exception:
+                    pass
+                return []
+
+            available_dates = fetch_sales_dates(SALES_TABLE)
+
+            if available_dates:
+                date_to_delete = st.selectbox("Select Date to Delete", available_dates)
+                if st.button(f"Delete Sales for {date_to_delete}", type="primary", width="stretch"):
+                    try:
+                        conn = get_db_connection()
+                        with conn.session as session:
+                            session.execute(
+                                text(f'DELETE FROM "{SALES_TABLE}" WHERE "week_date" = :d'),
+                                {"d": date_to_delete}
+                            )
+                            session.commit()
+
+                        st.success(f"Deleted all sales data for {date_to_delete} from {selected_store}.")
+                        time.sleep(1.5)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error deleting data: {e}")
+            else:
+                st.markdown(
+                    f'<div class="empty-state">No sales dates found in the database for <strong>{selected_store}</strong>.</div>',
+                    unsafe_allow_html=True,
+                )

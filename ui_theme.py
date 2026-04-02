@@ -319,8 +319,8 @@ code {
 }
 
 [data-testid="stSidebar"] .stRadio [role="radiogroup"] label:has(input:checked) {
-    background: rgba(255, 255, 255, 0.98);
-    border-color: rgba(184, 17, 32, 0.14);
+    background: linear-gradient(90deg, rgba(184, 17, 32, 0.06) 0%, rgba(255, 255, 255, 0.98) 100%);
+    border-color: rgba(184, 17, 32, 0.18);
     box-shadow:
         inset 3px 0 0 var(--red),
         0 12px 24px rgba(15, 23, 42, 0.06);
@@ -529,12 +529,25 @@ div[data-baseweb="popover"] [role="option"],
 .header-chip,
 .fact-chip,
 .meta-chip {
+    position: relative;
+    overflow: hidden;
     min-height: 92px;
     border-radius: var(--radius-lg);
     padding: 0.92rem 0.98rem;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(245, 248, 252, 0.94));
     box-shadow: var(--shadow-sm);
     border: 1px solid var(--line-soft);
+}
+
+.header-chip::before,
+.fact-chip::before,
+.meta-chip::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--red) 0%, var(--gold) 52%, var(--olive) 100%);
+    opacity: 0.85;
 }
 
 .header-chip-compact {
@@ -673,7 +686,7 @@ div[data-baseweb="popover"] [role="option"],
     position: absolute;
     inset: 0 auto 0 0;
     width: 4px;
-    background: rgba(18, 24, 40, 0.08);
+    background: linear-gradient(180deg, var(--gold) 0%, rgba(202, 152, 72, 0.4) 100%);
 }
 
 .metric-card.tone-success::before {
@@ -823,10 +836,13 @@ div[data-baseweb="popover"] [role="option"],
 
 .empty-state {
     border-radius: 22px;
-    padding: 1rem 1.05rem;
+    padding: 2.4rem 1.05rem;
     background: rgba(255, 255, 255, 0.72);
     border: 1px dashed rgba(18, 24, 40, 0.10);
     color: var(--muted);
+    text-align: center;
+    font-size: 0.95rem;
+    line-height: 1.6;
 }
 
 div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -909,6 +925,7 @@ div[data-testid="stAlert"][kind="warning"] {
     background: rgba(236, 240, 245, 0.9);
     border: 1px solid var(--line-soft);
     box-shadow: var(--shadow-sm);
+    margin-bottom: 1.1rem;
 }
 
 .stTabs [data-baseweb="tab"] {
@@ -958,7 +975,9 @@ div[data-baseweb="button-group"] button:hover {
 div[data-baseweb="button-group"] button[aria-pressed="true"] {
     background: rgba(255, 255, 255, 0.98) !important;
     color: var(--red) !important;
-    box-shadow: inset 0 0 0 1px rgba(184, 17, 32, 0.08) !important;
+    box-shadow:
+        inset 0 0 0 1px rgba(184, 17, 32, 0.08),
+        inset 0 -2px 0 var(--red) !important;
 }
 
 div[data-baseweb="button-group"] button[aria-pressed="true"]:hover {
@@ -1024,10 +1043,16 @@ div[data-testid="stFileUploader"] {
 
 div[data-testid="stFileUploaderDropzone"] {
     border-radius: 24px;
-    border: 1px solid var(--line-soft);
+    border: 1px dashed var(--line);
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(245, 248, 252, 0.94));
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92);
     padding: 0.85rem 0.95rem;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+div[data-testid="stFileUploaderDropzone"]:hover {
+    border-color: rgba(184, 17, 32, 0.30);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(253, 245, 245, 0.92));
 }
 
 div[data-testid="stFileUploaderDropzone"] section,
