@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import os
-import base64
-import html
+from html import escape
 from io import BytesIO
 import psutil
 import xlsxwriter
@@ -14,63 +13,20 @@ from barcode.writer import ImageWriter
 from datetime import datetime, timedelta
 from sqlalchemy import text
 
+from auth_gate import render_session_sidebar, require_login
 # ===== vendor parsers =====
 from parsers import SouthernGlazersParser, NevadaBeverageParser, BreakthruParser, JCSalesParser, UnifiedParser, CostcoParser
+from ui_theme import apply_brand_theme, render_sidebar_navigation, render_workspace_header
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="LFM Process", page_icon="🧾", layout="wide")
-
-# ==============================================================================
-# --- AUTHENTICATION GATE & LOGO ---
-# ==============================================================================
-MASTER_PASSKEY = st.secrets["APP_PASSKEY"]
-
-# Dynamically build the exact path to the logo file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(current_dir, "logo.png")
-
-# Initialize session state for authentication
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-# 1. THE LOGIN SCREEN
-if not st.session_state["authenticated"]:
-    # Center the login box (wider center column so large fixed-width logo can fit)
-    col1, col2, col3 = st.columns([1, 6, 1])
-    
-    with col2:
-        st.write("")
-        st.write("")
-        
-        # --- Centered Logo on Login Screen ---
-        # Embed the image as base64 and render centered HTML so width is respected
-        try:
-            with open(LOGO_PATH, 'rb') as _img_f:
-                _b64 = base64.b64encode(_img_f.read()).decode('utf-8')
-            _html = f"""
-            <div style="text-align:center;">
-                <img src="data:image/png;base64,{_b64}" style="width:400px; display:block; margin-left:auto; margin-right:auto;" />
-            </div>
-            """
-            st.markdown(_html, unsafe_allow_html=True)
-        except Exception:
-            # Fallback to st.image if embedding fails
-            st.image(LOGO_PATH, width=400)
-        
-        
-        entered_key = st.text_input("Passkey", type="password", placeholder="Enter passkey...")
-        
-        if st.button("Login", use_container_width=True):
-            if entered_key == MASTER_PASSKEY:
-                st.session_state["authenticated"] = True
-                st.rerun() 
-            else:
-                st.error("❌ Incorrect passkey. Please try again.")
-                
-    st.stop() # Prevents the rest of the app from loading
-
-
-# ==============================================================================
+st.set_page_config(
+    page_title="LFM Process",
+    page_icon="logo.png",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+apply_brand_theme()
+require_login("LFM Process")
 
 # --- GLOBAL HELPERS ---
 def _norm_upc_12(u) -> str:
@@ -115,27 +71,77 @@ def _format_sales_header(date_value) -> str:
     except Exception:
         return str(date_value)
 
-def render_refresh_logo(image_path: str, width: int = 250):
-    """Render a header logo that reloads the current page when clicked."""
-    current_url = getattr(getattr(st, "context", None), "url", None)
-    if isinstance(current_url, str) and current_url.startswith(("http://", "https://")):
-        try:
-            with open(image_path, 'rb') as img_f:
-                img_b64 = base64.b64encode(img_f.read()).decode('utf-8')
 
-            st.markdown(
-                f"""
-                <a href="{html.escape(current_url, quote=True)}" target="_self" style="display:inline-block; line-height:0;">
-                    <img src="data:image/png;base64,{img_b64}" alt="LFM Process" style="width:{width}px; display:block;" />
-                </a>
-                """,
-                unsafe_allow_html=True,
+def _format_search_cell(value: object, column: str, sales_cols: set[str]) -> str:
+    if value is None or pd.isna(value):
+        return ""
+
+    if column in {"Cost", "Price"}:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric):
+            return ""
+        return f"${numeric:.2f}"
+
+    if column in sales_cols:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric):
+            return "0"
+        return str(int(numeric))
+
+    return str(value)
+
+
+def render_compact_search_results_table(display_df: pd.DataFrame, sales_cols: list[str]) -> None:
+    sales_col_set = set(sales_cols)
+    width_map = {
+        "UPC": "7.25rem",
+        "Item Name": "11.5rem",
+        "Size": "4.75rem",
+        "Cost": "5rem",
+        "Price": "5rem",
+    }
+
+    colgroup = "".join(
+        f'<col style="width:{width_map.get(column, "3.2rem")}">'
+        for column in display_df.columns
+    )
+    header_cells = "".join(
+        (
+            f'<th class="search-results-num">{escape(_format_sales_header(column))}</th>'
+            if column in sales_col_set
+            else f"<th>{escape({'Cost': 'Unit Cost', 'Price': 'Retail Price'}.get(column, column))}</th>"
+        )
+        for column in display_df.columns
+    )
+
+    body_rows: list[str] = []
+    for _, row in display_df.iterrows():
+        cells: list[str] = []
+        for column in display_df.columns:
+            cell_text = _format_search_cell(row[column], column, sales_col_set)
+            title_text = escape(cell_text, quote=True)
+            class_name = "search-results-num" if column in sales_col_set or column in {"Cost", "Price"} else ""
+            cells.append(
+                f'<td class="{class_name}" title="{title_text}">{escape(cell_text)}</td>'
             )
-            return
-        except Exception:
-            pass
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
 
-    st.image(image_path, width=width)
+    st.markdown(
+        f"""
+        <div class="search-results-table-wrap">
+            <table class="search-results-table">
+                <colgroup>{colgroup}</colgroup>
+                <thead>
+                    <tr>{header_cells}</tr>
+                </thead>
+                <tbody>
+                    {''.join(body_rows)}
+                </tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 def to_xlsx_bytes(dfs_dict):
     output = BytesIO()
@@ -282,21 +288,29 @@ def set_last_upload_time(table_name):
             session.commit()
     except Exception as e:
         print(f"Failed to log upload time: {e}")
-# --- HEADER & STORE SELECTOR (Top Right) ---
-col_title, col_store = st.columns([6, 2]) # Give the segmented control room without crowding the logo
+# --- APP CHROME ---
+PAGE_DETAILS = {
+    "Order Management": {
+        "title": "Live orders",
+        "subtitle": "Build store orders from mapped vendor items and recent sales history.",
+    },
+    "Invoice Processing": {
+        "title": "Invoice processing",
+        "subtitle": "Upload vendor invoices, review matches, and generate the export files your team needs.",
+    },
+    "Item Search": {
+        "title": "Pricebook search",
+        "subtitle": "Search the live pricebook with recent sales and inventory context for the active store.",
+    },
+    "Admin / Uploads": {
+        "title": "Admin controls",
+        "subtitle": "Manage source uploads, mappings, sales history, and operational data for the workspace.",
+    },
+}
+STORE_OPTIONS = ["Twain", "Rancho"]
 
-with col_title:
-    render_refresh_logo(LOGO_PATH, width=250)
-
-with col_store:
-    selected_store = st.segmented_control(
-        "Store",
-        ["Twain", "Rancho"],
-        default="Twain",
-        key="store_selector",
-        label_visibility="collapsed",
-        width="stretch",
-    )
+current_page_title, selected_store = render_sidebar_navigation(list(PAGE_DETAILS), STORE_OPTIONS)
+render_session_sidebar()
 
 # Map selection to Table Names
 if selected_store == "Twain":
@@ -308,18 +322,14 @@ else:
     SALES_TABLE = "salesrancho1"
     VENDOR_MAP_TABLE = "BeerandLiquorKeyRancho"
 
-# --- MAIN APP NAVIGATION ---
-nav_left, nav_center, nav_right = st.columns([1, 3, 1])
-
-with nav_center:
-    current_page_title = st.segmented_control(
-        "Navigation",
-        ["Order Management", "Invoice Processing", "Item Search", "Admin / Uploads"],
-        default="Order Management",
-        key="main_navigation",
-        label_visibility="collapsed",
-        width="stretch",
-    )
+page_details = PAGE_DETAILS[current_page_title]
+render_workspace_header(
+    page_details["title"],
+    page_details["subtitle"],
+    [
+        ("Selected store", selected_store),
+    ],
+)
 
 # ==============================================================================
 # TAB 1: ORDER MANAGEMENT
@@ -408,7 +418,7 @@ if current_page_title == "Order Management":
                 base_cols = ["Full Barcode", "type", "Name", "Size", "PACK"]
                 available_base = [c for c in base_cols if c in merged.columns]
                 
-                final_cols = available_base + sales_cols_display + ["Stock", "Order"]
+                final_cols = available_base + ["Stock"] + sales_cols_display + ["Order"]
                 final_merged = merged[final_cols].copy()
 
                 # Sales history is whole-number weekly movement, so keep it compact.
@@ -443,65 +453,92 @@ if current_page_title == "Order Management":
 
     # 2. Render Interactive Table
     if 'order_df' in st.session_state and st.session_state['order_df'] is not None:
-        st.divider()
-        st.write(f"**Building Order for: {st.session_state.get('active_company')}**")
-        
         all_columns = st.session_state['order_df'].columns.tolist()
         locked_columns = [col for col in all_columns if col != "Order"]
+        active_company = str(st.session_state.get('active_company') or "")
+        order_df = st.session_state['order_df']
         
         col_configs = {
-            "Order": st.column_config.NumberColumn("Order Qty", help="Enter cases to order", min_value=0, step=1, required=True)
+            "Full Barcode": st.column_config.TextColumn("UPC"),
+            "Name": st.column_config.TextColumn("Item Name"),
+            "Size": st.column_config.TextColumn("Size"),
+            "PACK": st.column_config.TextColumn("Pack", width=45),
+            "Stock": st.column_config.NumberColumn("Stock", format="%d", width=40),
+            "Order": st.column_config.NumberColumn("Order", help="Enter cases to order", min_value=0, step=1, required=True, width=50),
         }
         
         for sc in st.session_state.get('sales_cols_display', []):
-            col_configs[sc] = st.column_config.NumberColumn(sc, format="%d")
+            col_configs[sc] = st.column_config.NumberColumn(sc, format="%d", width=40)
             
         # --- HIDE THE TYPE COLUMN FROM THE UI ---
         if "type" in all_columns:
             col_configs["type"] = None 
-        
-        edited_df = st.data_editor(
-            st.session_state['order_df'],
-            use_container_width=True,
-            height=600,
-            disabled=locked_columns,
-            column_config=col_configs, 
-            hide_index=True
-        )
-        
-        # 3. Finish & Download
-        if st.button("Finish & Download Order"):
-            final_order = edited_df[edited_df["Order"] > 0].copy()
-            
-            if final_order.empty:
-                st.warning("No items ordered (Order Qty is 0 for all rows).")
-            else:
-                # --- PERFECT ALPHABETICAL SORTING FOR THE EXPORTED EXCEL ---
-                final_order["_sort_name"] = final_order["Name"].astype(str).str.strip().str.lower()
-                
-                if "type" in final_order.columns:
-                    final_order["type"] = final_order["type"].replace("", "Z_Other")
-                    final_order = final_order.sort_values(by=["type", "_sort_name"], ascending=[True, True])
-                    final_order["type"] = final_order["type"].replace("Z_Other", "")
-                else:
-                    final_order = final_order.sort_values(by="_sort_name", ascending=True)
-                    
-                final_order = final_order.drop(columns=["_sort_name"])
-                
-                # Keep 'type' in the final export so your sales reps can see what's Beer vs Liquor!
-                output_cols = ["type", "Name", "Size", "Order"]
-                valid_cols = [c for c in output_cols if c in final_order.columns]
-                
-                download_df = final_order[valid_cols]
-                
-                st.download_button(
-                    label=f"⬇️ Download {st.session_state['active_company']} Order",
-                    data=to_xlsx_bytes({st.session_state['active_company']: download_df}),
-                    file_name=f"ORDER_{st.session_state['active_company']}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    on_click="ignore"
+
+        with st.container(border=True):
+            toolbar_col, meta_col = st.columns([1.4, 1], gap="medium")
+            with toolbar_col:
+                st.markdown(
+                    """
+                    <div class="section-kicker">Order Workspace</div>
+                    <div class="panel-note">
+                        Review recent weekly movement and enter case quantities in the highlighted order column.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.success(f"Ready! Contains {len(download_df)} items.")
+            with meta_col:
+                st.markdown(
+                    f"""
+                    <div class="pill-row order-workspace-pills">
+                        <div class="pill"><strong>Company</strong> {escape(active_company)}</div>
+                        <div class="pill"><strong>Items</strong> {len(order_df):,}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            edited_df = st.data_editor(
+                order_df,
+                width="stretch",
+                height=600,
+                disabled=locked_columns,
+                column_config=col_configs, 
+                hide_index=True
+            )
+            
+            # 3. Finish & Download
+            if st.button("Finish & Download Order"):
+                final_order = edited_df[edited_df["Order"] > 0].copy()
+                
+                if final_order.empty:
+                    st.warning("No items ordered (Order Qty is 0 for all rows).")
+                else:
+                    # --- PERFECT ALPHABETICAL SORTING FOR THE EXPORTED EXCEL ---
+                    final_order["_sort_name"] = final_order["Name"].astype(str).str.strip().str.lower()
+                    
+                    if "type" in final_order.columns:
+                        final_order["type"] = final_order["type"].replace("", "Z_Other")
+                        final_order = final_order.sort_values(by=["type", "_sort_name"], ascending=[True, True])
+                        final_order["type"] = final_order["type"].replace("Z_Other", "")
+                    else:
+                        final_order = final_order.sort_values(by="_sort_name", ascending=True)
+                        
+                    final_order = final_order.drop(columns=["_sort_name"])
+                    
+                    # Keep 'type' in the final export so your sales reps can see what's Beer vs Liquor!
+                    output_cols = ["type", "Name", "Size", "Order"]
+                    valid_cols = [c for c in output_cols if c in final_order.columns]
+                    
+                    download_df = final_order[valid_cols]
+                    
+                    st.download_button(
+                        label=f"⬇️ Download {active_company} Order",
+                        data=to_xlsx_bytes({active_company: download_df}),
+                        file_name=f"ORDER_{active_company}_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        on_click="ignore"
+                    )
+                    st.success(f"Ready! Contains {len(download_df)} items.")
 # ==============================================================================
 # TAB 2: INVOICE PROCESSING
 # ==============================================================================
@@ -668,7 +705,7 @@ if current_page_title == "Invoice Processing":
                         "Retail": st.column_config.TextColumn(help=f"Calculated Retail ({margin_label} Margin). * indicates cost change.", disabled=True),
                         "New": st.column_config.NumberColumn("New ($)", format="$%.2f", min_value=0.0)
                     },
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     height=450
                 )
@@ -773,7 +810,7 @@ if current_page_title == "Invoice Processing":
                                 on_click="ignore"
                             )
                         else:
-                            st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", use_container_width=True)
+                            st.button("🏷️ Download Price Labels (Excel)", disabled=True, help="Set a 'New' price to generate labels", width="stretch")
             
             # Show Unmatched Items
             if not unmatched.empty:
@@ -815,7 +852,7 @@ if current_page_title == "Invoice Processing":
                         "Retail": st.column_config.NumberColumn(format="$%.2f")
                     },
                     hide_index=True,
-                    use_container_width=True
+                    width="stretch"
                 )
 
     # --- JC SALES (INTERACTIVE DATABASE ROUTE) ---
@@ -1237,7 +1274,7 @@ if current_page_title == "Invoice Processing":
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
                         disabled=["Item Number", "Barcode", "Item", "Old Unit Cost", "New Unit Cost", "Now", "Retail"],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         key=f"jc_price_changes_{change_signature}"
                     )
@@ -1388,7 +1425,7 @@ if current_page_title == "Invoice Processing":
                             "Now": st.column_config.NumberColumn("Now ($)", format="$%.2f"),
                             "Retail": st.column_config.NumberColumn("Retail ($)", format="$%.2f")
                         },
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True
                     )
    # --- SG / NV / Breakthru ---
@@ -1475,7 +1512,7 @@ if current_page_title == "Invoice Processing":
             """)
 
             st.subheader("Invoice Items Found")
-            st.dataframe(inv_df, use_container_width=True)
+            st.dataframe(inv_df, width="stretch")
             
             if not missing.empty:
                 st.warning(f"⚠️ {len(missing)} items are not in your Database Map.")
@@ -1581,7 +1618,7 @@ if current_page_title == "Invoice Processing":
                             "New Cost": st.column_config.NumberColumn(format="$%.2f", disabled=True),
                             "New Price": st.column_config.NumberColumn("New Price ($)", format="$%.2f", min_value=0.0)
                         },
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True
                     )
                     
@@ -1854,19 +1891,7 @@ if current_page_title == "Item Search":
             display_df = filtered_df[cols_to_show]
             
             st.success(f"Found {len(display_df)} items.")
-            
-            st.dataframe(
-                display_df,
-                column_config={
-                    "UPC": st.column_config.TextColumn("UPC"),
-                    "Item Name": st.column_config.TextColumn("Item Name"),
-                    "Size": st.column_config.TextColumn("Size"),
-                    "Cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
-                    "Price": st.column_config.NumberColumn("Retail Price", format="$%.2f")
-                },
-                hide_index=True,
-                use_container_width=True
-            )
+            render_compact_search_results_table(display_df, available_sales_cols[-num_weeks:])
 # ==============================================================================
 # TAB 4: ADMIN / UPLOADS
 # ==============================================================================
