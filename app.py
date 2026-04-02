@@ -335,11 +335,6 @@ render_workspace_header(
 # TAB 1: ORDER MANAGEMENT
 # ==============================================================================
 if current_page_title == "Order Management":
-    st.header(f"Orders: {selected_store}")
-    
-    # --- Interactive Order Builder ---
-    st.subheader("Build Order")
-    
     try:
         conn = get_db_connection()
         
@@ -350,11 +345,28 @@ if current_page_title == "Order Management":
             company_options = sorted([str(c) for c in companies_df["Company"].unique() if c is not None and str(c).strip() != 'nan'])
         else:
             company_options = ["Breakthru", "Southern Glazer's", "Nevada Beverage"]
-        
-        target_company = st.selectbox("Select Company", company_options)
-        
+
+        with st.container(border=True):
+            st.markdown(
+                """
+                <div class="section-kicker">Order Builder</div>
+                <div class="section-copy" style="margin-bottom:0.9rem;">
+                    Choose a company to load its mapped item list for the active store, then enter case quantities in the
+                    order column below.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            control_col, action_col = st.columns([1.65, 0.55], gap="medium")
+            with control_col:
+                target_company = st.selectbox("Select Company", company_options)
+            with action_col:
+                st.markdown("<div style='height:1.9rem;'></div>", unsafe_allow_html=True)
+                load_items = st.button(f"Load {target_company} Items", width="stretch")
+
         # Button to Load Data into Session State
-        if st.button(f"Load {target_company} Items"):
+        if load_items:
             
             map_query = f"""
                 SELECT * FROM "{VENDOR_MAP_TABLE}" 
@@ -418,7 +430,7 @@ if current_page_title == "Order Management":
                 base_cols = ["Full Barcode", "type", "Name", "Size", "PACK"]
                 available_base = [c for c in base_cols if c in merged.columns]
                 
-                final_cols = available_base + ["Stock"] + sales_cols_display + ["Order"]
+                final_cols = available_base + sales_cols_display + ["Stock", "Order"]
                 final_merged = merged[final_cols].copy()
 
                 # Sales history is whole-number weekly movement, so keep it compact.
@@ -566,7 +578,18 @@ if current_page_title == "Invoice Processing":
         return s
 
     vendor_options = ["Unified", "JC Sales", "Southern Glazer's", "Nevada Beverage", "Breakthru", "Costco"]
-    vendor = st.selectbox("Select Vendor", vendor_options)
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="section-kicker">Processing Console</div>
+            <div class="section-copy" style="margin-bottom:0.9rem;">
+                Choose a vendor, upload invoice files for the active store, then review matched items and export the
+                update files your team needs.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        vendor = st.selectbox("Select Vendor", vendor_options)
     
     # --- UNIFIED / JC SALES ---
     if vendor == "Unified":
@@ -1729,8 +1752,15 @@ if current_page_title == "Invoice Processing":
                     )
     # --- COSTCO ---
     elif vendor == "Costco":
-        st.header("Costco Processor")
-        st.markdown("**Note:** Upload your Costco Master List manually.")
+        st.markdown(
+            """
+            <div class="section-kicker">Costco Tools</div>
+            <div class="section-copy" style="margin-bottom:0.75rem;">
+                Upload the Costco master list and paste the receipt text to calculate item quantities and unit costs.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         
         costco_master = st.file_uploader("Upload Costco Master List (XLSX)", type=["xlsx"], key="costco_master")
         costco_text = st.text_area("Paste Costco Receipt Text", height=200, key="costco_text")
@@ -1850,25 +1880,35 @@ def get_full_search_data(store):
 
 # --- TAB UI ---
 if current_page_title == "Item Search":
-    st.header(f"Live Pricebook Search: {selected_store}")
-    
     # Silently load the DB into RAM (takes ~1-2 secs on first load, instant after)
     full_db, available_sales_cols = get_full_search_data(selected_store)
     max_available_weeks = len(available_sales_cols) if available_sales_cols else 1
 
-    col_search, col_weeks = st.columns([3, 1])
-    
-    with col_search:
-        # Use st_keyup to detect every single keystroke instantly!
-        search_query = st_keyup("Search by UPC or Item Name", placeholder="Start typing...", key="live_search")
-        
-    with col_weeks:
-        num_weeks = st.number_input(
-            "Sales Weeks to Show", 
-            min_value=1, 
-            max_value=max_available_weeks, 
-            value=min(15, max_available_weeks)
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="section-kicker">Search Workspace</div>
+            <div class="section-copy" style="margin-bottom:0.9rem;">
+                Search the live pricebook instantly, then compare current pricing with recent weekly movement for the
+                active store.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+
+        col_search, col_weeks = st.columns([3, 1])
+        
+        with col_search:
+            # Use st_keyup to detect every single keystroke instantly!
+            search_query = st_keyup("Search by UPC or Item Name", placeholder="Start typing...", key="live_search")
+            
+        with col_weeks:
+            num_weeks = st.number_input(
+                "Sales Weeks to Show", 
+                min_value=1, 
+                max_value=max_available_weeks, 
+                value=min(15, max_available_weeks)
+            )
 
     # Only show the table if they typed something
     if search_query:
@@ -1896,16 +1936,26 @@ if current_page_title == "Item Search":
 # TAB 4: ADMIN / UPLOADS
 # ==============================================================================
 if current_page_title == "Admin / Uploads":
-    st.header("Database Administration")
-    
     # --- LIVE RAM MONITOR ---
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     ram_mb = mem_info.rss / (1024 * 1024) # Convert bytes to Megabytes
-    
-    # Display it beautifully
-    st.metric("⚡ Current App RAM Usage", f"{ram_mb:.2f} MB")
-    st.divider()
+
+    with st.container(border=True):
+        intro_col, metric_col = st.columns([1.5, 0.7], gap="large")
+        with intro_col:
+            st.markdown(
+                """
+                <div class="section-kicker">Admin Console</div>
+                <div class="section-copy">
+                    Manage the live pricebook, vendor mappings, JC Sales key, and weekly sales data that power the
+                    workspace.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with metric_col:
+            st.metric("App RAM", f"{ram_mb:.2f} MB")
     # ------------------------
     
     import time # Needed for the short refresh delay
@@ -1913,7 +1963,7 @@ if current_page_title == "Admin / Uploads":
     col_pb, col_map, col_jc = st.columns(3)
     
     with col_pb:
-        st.subheader(f"Update Pricebook ({selected_store})")
+        st.markdown('<div class="section-kicker">Pricebook</div>', unsafe_allow_html=True)
         st.caption(f"Target: `{PRICEBOOK_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(PRICEBOOK_TABLE)}**")
         pb_upload = st.file_uploader("Upload Pricebook CSV", type=["csv"], key="pb_admin")
         
@@ -1949,7 +1999,7 @@ if current_page_title == "Admin / Uploads":
                 st.error(f"Error updating pricebook: {e}")
 
     with col_map:
-        st.subheader(f"Update Vendor Map ({selected_store})")
+        st.markdown('<div class="section-kicker">Vendor Map</div>', unsafe_allow_html=True)
         st.caption(f"Target: `{VENDOR_MAP_TABLE}`  \n⏳ Last Uploaded: **{get_last_upload_time(VENDOR_MAP_TABLE)}**")
         
         current_map = load_vendor_map(VENDOR_MAP_TABLE)
@@ -1999,7 +2049,7 @@ if current_page_title == "Admin / Uploads":
             except Exception as e:
                 st.error(f"Error updating map: {e}")
     with col_jc:
-        st.subheader("Update JC Sales Key (Global)")
+        st.markdown('<div class="section-kicker">JC Sales Key</div>', unsafe_allow_html=True)
         st.caption(f"Target: `JCSalesKey`  \n⏳ Last Uploaded: **{get_last_upload_time('JCSalesKey')}**")
         
         current_jc = load_jcsales_key()
@@ -2039,8 +2089,16 @@ if current_page_title == "Admin / Uploads":
     # 📊 MANAGE ITEM SALES DATA
     # =========================================================
     st.divider()
-    st.subheader(f"📊 Manage Item Sales Data ({selected_store})")
-    st.caption(f"Target: `{SALES_TABLE}` - Upload new weekly sales or delete existing dates.")
+    st.markdown(
+        """
+        <div class="section-kicker">Sales Data</div>
+        <div class="section-copy" style="margin-bottom:0.35rem;">
+            Upload new weekly sales files or remove existing sales dates for the active store.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Target: `{SALES_TABLE}`")
     
     col_upload, col_delete = st.columns(2)
     
